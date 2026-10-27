@@ -15,14 +15,6 @@ import { runSpan, type Hook } from "../effects/spans.ts";
 export interface IsolateResult { value: unknown; logs: string[]; jail: string; }
 
 const workerPath = fileURLToPath(new URL("./isolate-worker.ts", import.meta.url));
-// Probe for real: sandbox-exec exists on macOS but sandbox_apply fails when the
-// parent already runs inside a sandbox (nested sandboxes are denied).
-const hasSandboxExec = process.platform === "darwin"
-  && spawnSync("sandbox-exec", ["-p", "(version 1)(allow default)", "/usr/bin/true"]).status === 0;
-// Reads: only what Node needs to start (/usr, /System, runtime paths are allowed by
-// file-read* on system dirs via (allow file-read*) would defeat the point, so reads
-// are limited to the worker file's directory tree is too fragile; instead deny
-// network + writes + exec, and let Node --permission deny file reads from JS.
 import { dirname } from "node:path";
 const readableRoots = ["/usr", "/System", "/Library", "/dev", "/private/var", dirname(dirname(process.execPath)), dirname(workerPath)];
 const SANDBOX_PROFILE = `(version 1)
@@ -36,6 +28,12 @@ const SANDBOX_PROFILE = `(version 1)
 (allow file-read* ${readableRoots.map((r) => `(subpath "${r}")`).join(" ")})
 (allow file-write-data (literal "/dev/null"))
 (deny network*)`;
+
+// Probe for real: sandbox-exec exists on macOS but sandbox_apply fails when the
+// parent already runs inside a sandbox (nested sandboxes are denied), or when the
+// restricted profile aborts under hardened runtime.
+const hasSandboxExec = process.platform === "darwin"
+  && spawnSync("sandbox-exec", ["-p", SANDBOX_PROFILE, process.execPath, "-e", ""]).status === 0;
 
 export async function runInIsolate(
   code: string,
