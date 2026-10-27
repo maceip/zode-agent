@@ -1,0 +1,197 @@
+.cordis-mermaid {
+  --mermaid-max-height: 520px;
+  margin: 14px 0 16px;
+  overflow: hidden;
+  color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--border) 78%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel-solid) 88%, white);
+}
+
+.cordis-mermaid figcaption {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 9px 3px;
+  color: var(--muted);
+  font: 500 11px/1.2 var(--sans);
+}
+
+.cordis-mermaid figcaption button {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--muted);
+  border: 0;
+  border-radius: 7px;
+  outline: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.cordis-mermaid figcaption button:hover,
+.cordis-mermaid figcaption button:focus-visible {
+  color: var(--text);
+  background: color-mix(in srgb, white 62%, transparent);
+}
+
+.cordis-mermaid figcaption button:focus-visible {
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
+
+.cordis-mermaid-stage {
+  min-height: 116px;
+  max-height: var(--mermaid-max-height);
+  display: grid;
+  overflow: auto;
+  padding: 14px 18px 20px;
+  place-items: center;
+}
+
+.cordis-mermaid-svg {
+  width: 100%;
+  min-width: min-content;
+  transition: opacity 140ms ease;
+}
+
+.cordis-mermaid.is-updating .cordis-mermaid-svg { opacity: 0.7; }
+
+.cordis-mermaid-svg > svg {
+  width: auto;
+  max-width: 100%;
+  height: auto;
+  max-height: calc(var(--mermaid-max-height) - 72px);
+  display: block;
+  margin: 0 auto;
+}
+
+.cordis-mermaid-loading {
+  color: var(--muted-light);
+  font: 500 12px/1.4 var(--sans);
+}
+
+.cordis-mermaid-error {
+  padding: 12px 14px 16px;
+  color: var(--muted);
+  font: 500 12px/1.45 var(--sans);
+}
+
+.cordis-mermaid-error details { margin-top: 8px; }
+.cordis-mermaid-error summary { cursor: pointer; }
+
+.activity-markdown .cordis-mermaid-error pre {
+  max-height: 220px;
+  margin: 10px 0 0;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-soft) 78%, transparent);
+}
+
+.activity-markdown .cordis-mermaid-error code {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: 500 12px/1.55 var(--mono);
+  white-space: pre;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cordis-mermaid-svg { transition: none; }
+}
+
+.cordis-mermaid-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.cordis-mermaid figcaption button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.cordis-mermaid-overlay {
+  z-index: 140;
+  padding: var(--space-3);
+  background: color-mix(in srgb, var(--canvas) 35%, transparent);
+}
+
+.cordis-mermaid-expanded {
+  /* About half of the window area; leave the surrounding chat visible. */
+  width: 70%;
+  height: 70%;
+  min-width: min(100%, calc(var(--control-button) * 9));
+  min-height: min(100%, calc(var(--control-button) * 9));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  --alto-floating-panel-background: var(--panel-solid);
+}
+
+.cordis-mermaid-expanded-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  flex: none;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-soft);
+  font: var(--weight-medium) var(--type-label) / var(--line-control) var(--sans);
+}
+
+.cordis-mermaid-expanded-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-left: auto;
+}
+
+.cordis-mermaid-expanded-controls output {
+  min-width: 5ch;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.cordis-mermaid-expanded-controls .cordis-mermaid-fit {
+  padding-inline: var(--space-3);
+}
+
+.cordis-mermaid-expanded-viewport {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  /* Match the renderer’s light diagram palette in either application theme. */
+  color-scheme: light;
+  background: Canvas;
+}
+
+.cordis-mermaid-expanded-viewport:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.cordis-mermaid-expanded-canvas {
+  min-width: 100%;
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+}
+
+.cordis-mermaid-expanded-svg,
+.cordis-mermaid-expanded-svg > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  max-height: none;
+}
+
+.cordis-mermaid-expanded-svg > svg { max-width: none !important; }

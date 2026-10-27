@@ -1,0 +1,36 @@
+{
+  "name": "@botiverse/oar-cli",
+  "version": "0.74.0",
+  "description": "Command-line interface for controlling and observing agent runtimes with OAR",
+  "type": "module",
+  "bin": {
+    "oar": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "!dist/.tsbuildinfo",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsrs -p tsconfig.build.json",
+    "typecheck": "pnpm --filter @botiverse/oar build && tsrs --noEmit",
+    "prepack": "pnpm --filter @botiverse/oar build && pnpm run build"
+  },
+  "dependencies": {
+    "@botiverse/oar": "workspace:*",
+    "@cursor/sdk": "1.0.40",
+    "commander": "^12.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botiverse/oar.git",
+    "directory": "packages/cli"
+  },
+  "license": "Apache-2.0"
+}

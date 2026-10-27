@@ -1,0 +1,163 @@
+//! Tests for the 1 → 2 AI-provider unification migration.
+
+use super::*;
+use crate::config::schema::{LocalAiConfig, LocalAiUsage};
+use crate::config::Config;
+
+fn make_legacy_config_local_on() -> Config {
+    let mut c = Config::default();
+    c.local_ai = LocalAiConfig {
+        runtime_enabled: true,
+        chat_model_id: "llama3.1:8b".into(),
+        embedding_model_id: "bge-m3".into(),
+        usage: LocalAiUsage {
+            embeddings: true,
+            heartbeat: true,
+            subconscious: true,
+        },
+        ..LocalAiConfig::default()
+    };
+    c
+}
+
+#[test]
+fn empty_config_does_not_seed_a_hosted_entry_in_core() {
+    let mut c = Config::default();
+    let stats = run(&mut c).expect("migration must succeed");
+
+    assert_eq!(stats.cloud_providers_seeded, 0);
+    assert!(c.cloud_providers.is_empty());
+}
+
+#[test]
+fn core_migration_leaves_primary_cloud_unset_without_a_hosted_entry() {
+    let mut c = Config::default();
+    let stats = run(&mut c).expect("migration must succeed");
+
+    assert!(!stats.primary_cloud_set);
+    assert_eq!(c.primary_cloud, None);
+}
+
+#[test]
+fn legacy_inference_url_becomes_custom_entry() {
+    let mut c = Config::default();
+    c.inference_url = Some("https://api.example.com/v1".into());
+    c.model_routes
+        .push(crate::config::schema::ModelRouteConfig {
+            hint: "reasoning".into(),
+            model: "gpt-4o".into(),
+        });
+
+    let stats = run(&mut c).expect("migration must succeed");
+
+    assert_eq!(stats.cloud_providers_seeded, 1);
+    let custom = c
+        .cloud_providers
+        .iter()
+        .find(|e| e.slug == "custom")
+        .expect("custom entry must be seeded");
+    assert_eq!(custom.endpoint, "https://api.example.com/v1");
+    assert_eq!(custom.default_model.as_deref(), Some("gpt-4o"));
+    assert_eq!(
+        c.primary_cloud.as_deref(),
+        Some(custom.id.as_str()),
+        "legacy custom inference must remain the default cloud target after migration"
+    );
+}
+
+#[test]
+fn managed_inference_url_does_not_seed_custom() {
+    let mut c = Config::default();
+    // The installed host resolved its managed hosts onto the config.
+    c.resolved_endpoints.managed_hosts = vec![".managed.test".into()];
+    c.inference_url = Some("https://api.managed.test/v1".into());
+    let _ = run(&mut c).expect("migration must succeed");
+    // Hosted entries are installed by TinyHumans, not the core migration.
+    assert!(c.cloud_providers.is_empty());
+}
+
+#[test]
+fn without_managed_hosts_every_inference_url_is_custom() {
+    // With no host registered nothing is a managed endpoint, so the same URL
+    // is migrated as a user-supplied one.
+    let mut c = Config::default();
+    c.inference_url = Some("https://api.managed.test/v1".into());
+    let _ = run(&mut c).expect("migration must succeed");
+    assert_eq!(c.cloud_providers.len(), 1);
+    assert_eq!(c.cloud_providers[0].slug, "custom");
+}
+
+#[test]
+fn embeddings_provider_derived_from_legacy_usage() {
+    let mut c = make_legacy_config_local_on();
+    let stats = run(&mut c).expect("migration must succeed");
+    // memory + embeddings.
+    assert_eq!(stats.workload_fields_filled, 2);
+    assert_eq!(c.embeddings_provider.as_deref(), Some("ollama:bge-m3"));
+}
+
+#[test]
+fn retired_background_usage_flags_derive_no_route() {
+    // `usage.heartbeat` / `usage.subconscious` are on in the fixture, but the
+    // loops they routed are gone: the migration must not turn them into a
+    // workload route, and the serialized config must carry no such field.
+    let mut c = make_legacy_config_local_on();
+    let _ = run(&mut c).unwrap();
+    let serialized = toml::to_string(&c).unwrap();
+    assert!(!serialized.contains("heartbeat_provider"), "{serialized}");
+    assert!(
+        !serialized.contains("subconscious_provider"),
+        "{serialized}"
+    );
+}
+
+#[test]
+fn memory_provider_cloud_when_llm_backend_cloud() {
+    let mut c = Config::default();
+    // default backend is Cloud
+    let _ = run(&mut c).unwrap();
+    assert_eq!(c.memory_provider.as_deref(), Some("cloud"));
+}
+
+#[test]
+fn chat_workload_providers_left_unset() {
+    let mut c = make_legacy_config_local_on();
+    let _ = run(&mut c).unwrap();
+    // Reasoning/agentic/coding have no legacy equivalent — they stay None
+    // and the factory defaults them to "openhuman" at runtime.
+    assert_eq!(c.reasoning_provider, None);
+    assert_eq!(c.agentic_provider, None);
+    assert_eq!(c.coding_provider, None);
+}
+
+#[test]
+fn idempotent_second_run_is_noop() {
+    let mut c = make_legacy_config_local_on();
+    let first = run(&mut c).expect("first run must succeed");
+    let providers_after_first = c.cloud_providers.len();
+    let primary_after_first = c.primary_cloud.clone();
+
+    let second = run(&mut c).expect("second run must succeed");
+
+    // Second run must not seed extras nor flip any field.
+    assert_eq!(second.cloud_providers_seeded, 0);
+    assert!(!second.primary_cloud_set);
+    assert_eq!(second.workload_fields_filled, 0);
+    assert_eq!(c.cloud_providers.len(), providers_after_first);
+    assert_eq!(c.primary_cloud, primary_after_first);
+
+    // Sanity: stats from the first run say we did do work.
+    assert_eq!(first.cloud_providers_seeded, 0);
+    assert!(!first.primary_cloud_set);
+    assert!(first.workload_fields_filled >= 1);
+}
+
+#[test]
+fn runtime_disabled_falls_back_to_cloud_even_with_usage_flags() {
+    let mut c = make_legacy_config_local_on();
+    c.local_ai.runtime_enabled = false;
+    let _ = run(&mut c).unwrap();
+    // With runtime off, every workload routes to cloud regardless of usage.*
+    assert_eq!(c.embeddings_provider.as_deref(), Some("cloud"));
+    assert_eq!(c.memory_provider.as_deref(), Some("cloud"));
+}

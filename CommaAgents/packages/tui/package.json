@@ -1,0 +1,68 @@
+{
+  "name": "@comma-agents/tui",
+  "version": "2.0.0-rc.1",
+  "description": "Terminal UI for CommaAgents that connects to the daemon via WebSocket",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "bin": {
+    "comma-agents-tui": "dist/main.js"
+  },
+  "scripts": {
+    "start": "bun --inspect-wait=127.0.0.1:6499/tui run src/main.tsx",
+    "build": "bun run ../../scripts/build-public-package.ts tui",
+    "prepack": "bun run build",
+    "generate:frames": "bun run src/components/TitleIcon/icon-generator/generator.ts",
+    "test": "bun test --coverage",
+    "test:e2e": "COMMA_TUI_E2E=1 bun test ../../examples/e2e/tui --max-concurrency=1",
+    "typecheck": "tsc --noEmit -p tsconfig.typecheck.json",
+    "lint": "bunx @biomejs/biome check src",
+    "lint:fix": "bunx @biomejs/biome check --write src",
+    "format": "bunx @biomejs/biome format --write src",
+    "docs": "bun run --cwd docs dev",
+    "docs:build": "bun run --cwd docs build"
+  },
+  "dependencies": {
+    "@amandaghassaei/stl-parser": "1.7.0",
+    "@comma-agents/core": "2.0.0-rc.1",
+    "@comma-agents/daemon": "2.0.0-rc.1",
+    "@shikijs/cli": "^4.0.2",
+    "chalk": "5.6.2",
+    "cli-table3": "0.6.5",
+    "gl-matrix": "3.4.4",
+    "ink": "7.0.1",
+    "ink-select-input": "6.2.0",
+    "ink-spinner": "5.0.0",
+    "ink-text-input": "6.0.0",
+    "marked": "18.0.3",
+    "react": "19.2.5",
+    "react-devtools-core": "7.0.1",
+    "react-router": "^7.15.0",
+    "shiki": "4.0.2",
+    "string-width": "8.2.0",
+    "word-wrap": "1.2.5",
+    "yargs": "17.7.2"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/yargs": "17.0.33",
+    "ink-testing-library": "4.0.0",
+    "typescript": "6.0.2"
+  },
+  "engines": { "bun": ">=1.3.0" },
+  "publishConfig": { "access": "public", "tag": "next" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CloAI/CommaAgents.git",
+    "directory": "packages/tui"
+  },
+  "author": "CloAI",
+  "license": "MIT"
+}

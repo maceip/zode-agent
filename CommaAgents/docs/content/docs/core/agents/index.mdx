@@ -1,0 +1,68 @@
+---
+title: Agents
+description: Agent types, configuration, and factory functions.
+---
+
+Agents are the foundation of Comma Agents. They provide the connection between your application and the language models available today, offering a clean base API abstraction that is both straightforward to understand and easy to integrate into any project.
+
+The primary goal of an agent is to give you a consistent, minimal interface for calling models — send a message, get a result.
+
+The secondary goal is to expose a hook and lifecycle layer that gives you fine-grained control over agent behavior. Hooks let you intercept, observe, and transform messages at every stage of a call (including distinguishing initial calls from subsequent ones). This makes it possible to build general-purpose interaction patterns that can be configured, saved, and shared across projects, giving teams repeatable agent modules for rapid prototyping and growth.
+
+## Quick Start
+
+Create an agent, call it, and print the result:
+
+```ts
+import { createAgent } from "@comma-agents/core";
+
+const agent = createAgent({
+  name: "greeter",
+  model: "openai/gpt-4o",
+  systemPrompt: "You are a friendly assistant. Keep responses concise.",
+});
+
+const result = await agent.call("What is the Fibonacci sequence?");
+
+console.log(result.text);
+console.log(`Prompt tokens: ${result.usage.promptTokens}`);
+console.log(`Completion tokens: ${result.usage.completionTokens}`);
+```
+
+**Model strings** support explicit `"providerID/modelID"` or bare model IDs like `"gpt-4o"` — the provider is auto-resolved from the catalog using available credentials. See [Model Resolution](/docs/core/model).
+
+**Provider options** enable provider-specific features (Anthropic extended thinking, OpenAI reasoning effort). **Model options** control generation parameters (temperature, max output tokens, seed). Both are set on the agent config and forwarded to every call. See [createAgent](/docs/core/agents/create-agent) for details.
+
+Agents maintain conversation history automatically. A follow-up call sees everything that came before:
+
+```ts
+const followUp = await agent.call("Can you give me the first 10 numbers?");
+console.log(followUp.text);
+
+// Clear history when you want a fresh start.
+agent.reset();
+```
+
+`createUserAgent` creates a human-in-the-loop agent that collects input from the console instead of calling an LLM. Pair it with an LLM agent to build interactive workflows:
+
+```ts
+import { createAgent, createUserAgent } from "@comma-agents/core";
+
+const user = createUserAgent({
+  name: "user",
+  requireInput: true,
+});
+
+const writer = createAgent({
+  name: "writer",
+  model: "openai/gpt-4o",
+  systemPrompt: "Write concise, well-structured prose based on the user's request.",
+});
+
+// Collect a topic from the user, then pass it to the LLM agent.
+const input = await user.call("What would you like me to write about?");
+const result = await writer.call(input.text);
+console.log(result.text);
+```
+
+By default, input is read from stdin (works in both Node.js and Bun). You can pass a custom `inputCollector` function to collect input from other sources, such as a WebSocket or UI.

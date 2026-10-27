@@ -1,0 +1,149 @@
+.shell-box:has(> .scrollback-minimap) { position: relative; }
+
+.shell-box:has(> .scrollback-minimap) > .conversation-stage > .conversation-feed {
+  padding-left: max(48px, calc((100% - 780px) / 2));
+}
+
+.workspace-pane-conversation:has(> .scrollback-minimap) > .conversation-stage > .conversation-feed {
+  padding-left: max(48px, calc((100% - 720px) / 2));
+}
+
+.scrollback-minimap {
+  position: absolute;
+  z-index: 5;
+  left: 7px;
+  width: 38px;
+  min-height: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+
+.scrollback-minimap.is-visible { opacity: 1; }
+
+.scrollback-track {
+  width: 38px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 3px;
+  padding: 5px 0;
+  pointer-events: auto;
+  -webkit-mask-image: linear-gradient(to bottom, transparent, black 3%, black 97%, transparent);
+  mask-image: linear-gradient(to bottom, transparent, black 3%, black 97%, transparent);
+}
+
+.scrollback-tick {
+  width: 34px;
+  height: 9px;
+  min-height: 9px;
+  flex: 0 0 9px;
+  display: flex;
+  align-items: center;
+  padding: 0 0 0 4px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.scrollback-tick::after {
+  content: "";
+  width: var(--scrollback-tick-width, 7px);
+  height: 2px;
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--muted) 42%, transparent);
+  transition: width 100ms ease, height 100ms ease, background 100ms ease;
+}
+
+.scrollback-tick:hover::after,
+.scrollback-tick:focus-visible::after {
+  width: max(16px, var(--scrollback-tick-width, 7px));
+  background: color-mix(in srgb, var(--text) 58%, transparent);
+}
+
+.scrollback-preview {
+  position: absolute;
+  left: 46px;
+  width: min(340px, calc(100cqw - 62px));
+  min-width: 0;
+  overflow: hidden;
+  padding: 10px 12px;
+  color: var(--text);
+  border: 1px solid color-mix(in srgb, var(--border) 82%, white);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel) 96%, white);
+  box-shadow: 0 10px 24px rgba(32, 35, 48, 0.09), 0 1px 4px rgba(32, 35, 48, 0.04);
+  pointer-events: none;
+  -webkit-backdrop-filter: blur(24px) saturate(112%);
+  backdrop-filter: blur(24px) saturate(112%);
+}
+
+.scrollback-preview strong,
+.scrollback-preview p {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+}
+
+.scrollback-preview strong {
+  color: var(--text-strong);
+  font-size: 12.5px;
+  font-weight: 540;
+  line-height: 1.4;
+  -webkit-line-clamp: 1;
+}
+
+.scrollback-preview p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.45;
+  -webkit-line-clamp: 2;
+}
+
+@container conversation-column (max-width: 680px) {
+  .scrollback-minimap {
+    left: 4px;
+    width: 24px;
+  }
+
+  .scrollback-track { width: 24px; }
+
+  .scrollback-tick {
+    width: 22px;
+    padding-left: 2px;
+  }
+
+  .scrollback-tick:hover::after,
+  .scrollback-tick:focus-visible::after {
+    width: max(12px, var(--scrollback-tick-width, 6px));
+  }
+
+  .scrollback-preview {
+    left: 28px;
+    width: min(300px, calc(100cqw - 40px));
+  }
+
+  .shell-box:has(> .scrollback-minimap) > .conversation-stage > .conversation-feed {
+    padding-left: max(30px, calc((100% - 780px) / 2));
+  }
+
+  .workspace-pane-conversation:has(> .scrollback-minimap) > .conversation-stage > .conversation-feed {
+    padding-left: max(30px, calc((100% - 720px) / 2));
+  }
+}
+
+@container conversation-column (max-width: 440px) {
+  .scrollback-minimap { display: none; }
+
+  .shell-box:has(> .scrollback-minimap) > .conversation-stage > .conversation-feed {
+    padding-left: max(14px, calc((100% - 780px) / 2));
+  }
+
+  .workspace-pane-conversation:has(> .scrollback-minimap) > .conversation-stage > .conversation-feed {
+    padding-left: max(14px, calc((100% - 720px) / 2));
+  }
+}

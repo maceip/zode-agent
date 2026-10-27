@@ -1,0 +1,193 @@
+/* Shared geometry and interaction states for pane-owned toolbars. Feature
+   styles should only describe content that is unique to that pane. */
+:where(.alto-toolbar),
+:where(.alto-pane-toolbar),
+:where(.alto-toolbar-title),
+:where(.alto-toolbar-actions),
+:where(.alto-toolbar-group),
+:where(.alto-toolbar-modes),
+:where(.alto-toolbar-picker) {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+:where(.alto-toolbar) {
+  --alto-toolbar-control-size: var(--control-compact);
+  --alto-toolbar-font-size: var(--type-control);
+  gap: var(--space-2);
+}
+
+:where(.alto-pane-toolbar) {
+  --alto-toolbar-control-size: var(--control-compact);
+  --alto-toolbar-font-size: var(--type-control);
+  --alto-pane-header-padding: 0 var(--alto-pane-toolbar-end-padding, 160px) 0 var(--space-3);
+  --alto-pane-header-border: var(--border-soft);
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+:where(.alto-toolbar-title) {
+  flex: 1 1 auto;
+  gap: 7px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--type-control);
+  font-weight: var(--weight-medium);
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.alto-toolbar-title > span) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:where(.alto-toolbar-title > small) {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: var(--weight-medium);
+}
+
+:where(.alto-toolbar-actions) {
+  flex: 0 0 auto;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+:where(.alto-toolbar-group),
+:where(.alto-toolbar-modes) {
+  flex: 0 0 auto;
+  gap: var(--space-2);
+}
+
+.alto-toolbar-modes > button {
+  min-width: 0;
+  height: var(--alto-toolbar-control-size);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 10px;
+  color: var(--muted);
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  font-family: var(--sans);
+  font-size: var(--alto-toolbar-font-size);
+  font-weight: var(--weight-regular);
+  line-height: var(--line-control);
+  cursor: pointer;
+  transition: color 140ms ease, background 140ms ease;
+}
+
+.alto-toolbar-modes > button:hover {
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+.alto-toolbar-modes > button.is-active {
+  color: var(--muted);
+}
+
+.alto-toolbar-modes > button:first-child.is-active {
+  background: var(--panel-soft);
+}
+
+.alto-toolbar-modes > button:focus-visible {
+  outline: 2px solid var(--accent-focus);
+  outline-offset: -2px;
+}
+
+:where(.alto-toolbar-picker) {
+  position: relative;
+  flex: 0 1 230px;
+  min-width: 110px;
+  height: var(--alto-toolbar-control-size);
+  color: var(--muted);
+}
+
+:where(.alto-toolbar-picker > svg) {
+  position: absolute;
+  z-index: 1;
+  right: 10px;
+  width: calc(var(--control-compact) / 2);
+  height: calc(var(--control-compact) / 2);
+  pointer-events: none;
+}
+
+:where(.alto-toolbar-picker.has-leading-icon > svg:first-child:not(:last-child)) {
+  right: auto;
+  left: 10px;
+}
+
+.alto-toolbar-picker > select {
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0 24px 0 10px;
+  overflow: hidden;
+  appearance: none;
+  color: var(--muted);
+  border: 0;
+  border-radius: var(--radius-pill);
+  outline: 0;
+  background: transparent;
+  font-family: var(--sans);
+  font-size: var(--alto-toolbar-font-size);
+  font-weight: var(--weight-regular);
+  line-height: var(--line-control);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 140ms ease, background 140ms ease;
+}
+
+.alto-toolbar-picker.has-leading-icon > select {
+  padding-left: 30px;
+}
+
+.alto-toolbar-picker:hover > select {
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel-soft) 64%, transparent);
+}
+
+.alto-toolbar-picker:focus-within > select {
+  color: var(--text);
+  background: var(--panel-soft);
+  box-shadow: inset 0 0 0 2px var(--accent-focus);
+}
+
+:where(.alto-toolbar, .alto-pane-toolbar) .alto-icon-button {
+  --alto-icon-button-size: var(--alto-toolbar-control-size);
+  --alto-icon-button-radius: var(--radius-pill);
+  --alto-icon-button-hover-color: var(--text);
+  color: var(--muted);
+}
+
+:where(.alto-toolbar, .alto-pane-toolbar) .alto-icon-button svg {
+  width: calc(var(--control-compact) / 2);
+  height: calc(var(--control-compact) / 2);
+}
+
+:where(.alto-toolbar, .alto-pane-toolbar) .alto-icon-button:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+:where(.alto-toolbar, .alto-pane-toolbar) .alto-icon-button[aria-pressed="true"]:not(:disabled) {
+  color: var(--muted);
+  background: transparent;
+}
+
+:where(.alto-toolbar, .alto-pane-toolbar) .alto-icon-button[aria-pressed="true"]:hover:not(:disabled) {
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+@container conversation-column (max-width: 420px) {
+  :where(.alto-pane-toolbar) :where(.alto-toolbar-title) {
+    display: none;
+  }
+}

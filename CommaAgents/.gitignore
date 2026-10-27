@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Bun
+bun.lockb
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+
+# Logs
+*.log
+.rlprompter/
+
+# Docs (Next.js)
+docs/.next/
+docs/.source/
+docs/out/
+
+# Docs (Next.js)
+packages/tui/docs/.next/
+packages/tui/docs/.source/
+packages/tui/docs/out/
+
+# Storybook
+packages/tui-storybook/storybook-static/assets

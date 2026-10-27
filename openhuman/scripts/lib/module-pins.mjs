@@ -1,0 +1,621 @@
+// Pure parsing and decision logic for the module-pin gates (openhuman#5727).
+//
+// Everything here is a pure function over strings so it can be tested without a
+// git tree; the two CLIs in scripts/ci/ own the git calls and the process exit.
+// See scripts/ci/check-module-pins.mjs for what the gate is for.
+
+import { posix } from "node:path";
+import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+
+/**
+ * Read a Rust module and the source fragments it brings in with `include!`.
+ *
+ * Large registry and module-client files are split into sibling fragments to
+ * keep source files reviewable. The pin gate still needs to inspect the module
+ * as Rust sees it, not just its small entrypoint. Keeping the reader callback
+ * injectable preserves this module's pure, fixture-friendly design.
+ */
+export function expandRustIncludes(entryPath, readSource, seen = new Set()) {
+  const normalized = posix.normalize(entryPath);
+  if (seen.has(normalized)) {
+    throw new Error(`recursive Rust include detected at ${normalized}`);
+  }
+
+  const nextSeen = new Set(seen).add(normalized);
+  const source = readSource(normalized);
+  const directory = posix.dirname(normalized);
+  const included = [...source.matchAll(/include!\(\s*"([^"]+)"\s*\);/g)].map(
+    (match) =>
+      expandRustIncludes(posix.join(directory, match[1]), readSource, nextSeen),
+  );
+  return [source, ...included].join("\n");
+}
+
+/**
+ * The record names listed in `pub const ALL`, in order.
+ *
+ * Line comments are stripped BEFORE splitting on commas, not filtered out after.
+ * Splitting first puts a standalone `// …` line and the record beneath it in the
+ * SAME token, so filtering tokens that begin with `//` discarded the record with
+ * the comment. `ALL` carries no comments today, so this was latent rather than
+ * live — but the records it lists are heavily commented individually, the list is
+ * where a "why is this one eager" note would naturally go, and a dropped record
+ * reads downstream as "missing from PIN_MAP": the gate would fail CI while
+ * pointing at the wrong thing entirely. Raised by CodeRabbit on #5812.
+ */
+export function parseAllList(src) {
+  const block = src.match(
+    /pub const ALL: &\[ModuleRecord\] = &\[([\s\S]*?)\];/,
+  );
+  if (!block) throw new Error("registry.rs: could not find `pub const ALL`");
+  return (
+    block[1]
+      .replace(/\/\/[^\n]*/g, "")
+      // `#[cfg(feature = "…")]` on an element: the record is still in `ALL` for
+      // the builds that carry its optional contract crate, so it is still pinned.
+      .replace(/#\[[^\]]*\]/g, "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+  );
+}
+
+/** Every `const NAME: ModuleRecord = ModuleRecord { … };`, keyed by NAME. */
+export function parseRecords(src) {
+  const records = new Map();
+  const re =
+    /(?:pub(?:\([^)]*\))?\s+)?const ([A-Z0-9_]+): ModuleRecord = ModuleRecord \{([\s\S]*?)\n\};/g;
+  for (const m of src.matchAll(re)) {
+    const [, name, body] = m;
+    const field = (f) => {
+      const hit = body.match(new RegExp(`^\\s*${f}: "([^"]*)"`, "m"));
+      return hit ? hit[1] : null;
+    };
+    const assets = [];
+    const assetRe =
+      /PlatformAsset \{\s*host_key: "([^"]+)",\s*archive: "([^"]+)",\s*sha256: "([^"]+)",\s*\}/g;
+    for (const a of body.matchAll(assetRe)) {
+      assets.push({ hostKey: a[1], archive: a[2], sha256: a[3] });
+    }
+    records.set(name, {
+      name,
+      id: field("id"),
+      version: field("version"),
+      releaseUrl: field("release_url"),
+      assets,
+    });
+  }
+  if (records.size === 0)
+    throw new Error("registry.rs: parsed zero ModuleRecord blocks");
+  return records;
+}
+
+/**
+ * Decide what one record's pin state means.
+ *
+ * `actual` is `git describe --tags` output for the submodule; `exemption` is the
+ * matching entry from module-pin-exemptions.json, or undefined.
+ *
+ * A declared exemption accepts one exact drift only. A stale exemption is not
+ * harmless: it is a standing licence for the next real drift to pass unnoticed.
+ */
+export function classifyPin({
+  id,
+  version,
+  submodulePath,
+  actual,
+  exemption,
+  sourceParityContext,
+}) {
+  const wanted = `v${version}`;
+  if (actual === wanted) {
+    if (exemption) {
+      return {
+        ok: false,
+        kind: "stale-exemption",
+        message:
+          `"${id}" is listed in module-pin-exemptions.json, but its pins now AGREE ` +
+          `(${submodulePath} is at ${actual}). Delete the exemption — a stale exemption ` +
+          `hides the next real drift.`,
+      };
+    }
+    return { ok: true, kind: "match" };
+  }
+  if (exemption) {
+    // `git describe` lengthens an abbreviated object ID when the local object
+    // database needs more characters to make it unique. The release tag and
+    // commit distance remain part of the prefix, and either hash abbreviation
+    // must be a prefix of the other, so this accepts only the same commit.
+    const sameDescribe = (expected, observed) => {
+      if (expected === observed) return true;
+      const parse = (value) => value.match(/^(.*-g)([0-9a-f]+)$/);
+      const expectedParts = parse(expected);
+      const observedParts = parse(observed);
+      return (
+        expectedParts !== null &&
+        observedParts !== null &&
+        expectedParts[1] === observedParts[1] &&
+        (expectedParts[2].startsWith(observedParts[2]) ||
+          observedParts[2].startsWith(expectedParts[2]))
+      );
+    };
+    if (!sameDescribe(exemption.expect, actual)) {
+      return {
+        ok: false,
+        kind: "exemption-widened",
+        message:
+          `"${id}" drift has CHANGED since it was accepted.\n` +
+          `    registry.rs version : ${version} (expects tag ${wanted})\n` +
+          `    ${submodulePath} is at : ${actual}\n` +
+          `    exemption pins      : ${exemption.expect}\n` +
+          `    An exemption accepts one specific drift, not any drift. If the new state is\n` +
+          `    intended, update \`expect\` and the reason in module-pin-exemptions.json.`,
+      };
+    }
+    const hasSourceParity = Object.hasOwn(exemption, "sourceParity");
+    if (hasSourceParity) {
+      const proof = validateTestOnlySourceParity({
+        ...sourceParityContext,
+        version,
+        proof: exemption.sourceParity,
+      });
+      if (!proof.ok) {
+        return {
+          ok: false,
+          kind: "invalid-source-parity",
+          message: `"${id}" source-parity exemption is invalid: ${proof.message}`,
+        };
+      }
+    }
+    return {
+      ok: true,
+      kind: "exempt",
+      reason: exemption.reason,
+      sourceParity: hasSourceParity,
+    };
+  }
+  return {
+    ok: false,
+    kind: "drift",
+    message:
+      `"${id}" registry pin and submodule pin describe different releases.\n` +
+      `    registry.rs version : ${version}  (would download the v${version} artifact)\n` +
+      `    ${submodulePath} is at : ${actual}  (what this build compiles the contract against)\n` +
+      `    Fix by moving whichever pin is stale (\`node scripts/modules/release-and-repin.mjs ${id}\`\n` +
+      `    releases the module and re-pins both from its checksum.toml; add \`--version X.Y.Z\` to\n` +
+      `    re-pin to a release that already exists), or — if the two are meant to differ —\n` +
+      `    declare it in scripts/ci/module-pin-exemptions.json with a reason.`,
+  };
+}
+
+/**
+ * Verify one reviewed, exact source-parity attestation for a test-only commit.
+ * The proof names either one test file (the original format) or an explicit
+ * set of test files. It does not infer Rust test-only semantics for arbitrary
+ * diffs. The asset digest covers the registry version plus assets sorted by
+ * host key; the source digest covers sorted `mode type oid<TAB>path<LF>` entries
+ * other than the named test file(s).
+ */
+export function validateTestOnlySourceParity({
+  repoPath,
+  version,
+  assets,
+  actualHead,
+  proof,
+  runGit = (args) =>
+    execFileSync("git", args, {
+      cwd: repoPath,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim(),
+}) {
+  try {
+    if (typeof repoPath !== "string" || repoPath.length === 0) {
+      throw new Error("submodule repository path is missing");
+    }
+    const commonFields = [
+      "tag",
+      "releaseCommit",
+      "candidateCommit",
+      "assetsSha256",
+      "unchangedTreeSha256",
+    ];
+    const singleFileProof =
+      proof &&
+      Object.hasOwn(proof, "testFile") &&
+      !Object.hasOwn(proof, "testFiles");
+    const fileSetProof =
+      proof &&
+      Object.hasOwn(proof, "testFiles") &&
+      !Object.hasOwn(proof, "testFile");
+    const expectedFields = singleFileProof
+      ? [...commonFields, "testFile", "binding"]
+      : fileSetProof
+        ? [...commonFields, "testFiles", "bindings"]
+        : [];
+    if (
+      !proof ||
+      Object.keys(proof).sort().join(",") !== expectedFields.sort().join(",")
+    ) {
+      throw new Error("proof fields are missing or unknown");
+    }
+    if (!/^v\d+\.\d+\.\d+$/.test(proof.tag) || proof.tag !== `v${version}`) {
+      throw new Error("release tag does not match the registry version");
+    }
+    for (const [name, sha] of [
+      ["releaseCommit", proof.releaseCommit],
+      ["candidateCommit", proof.candidateCommit],
+    ]) {
+      if (!/^[0-9a-f]{40}$/.test(sha)) {
+        throw new Error(`${name} must be a full commit SHA`);
+      }
+    }
+    if (actualHead !== proof.candidateCommit) {
+      throw new Error("HEAD is not the exact attested candidate commit");
+    }
+    if (runGit(["rev-parse", "HEAD"]) !== proof.candidateCommit) {
+      throw new Error("checked-out HEAD differs from attested candidate");
+    }
+    if (
+      runGit([
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+      ])
+    ) {
+      throw new Error("module worktree is dirty");
+    }
+    if (
+      runGit(["rev-parse", `refs/tags/${proof.tag}^{commit}`]) !==
+      proof.releaseCommit
+    ) {
+      throw new Error(
+        "release tag does not resolve to the attested release commit",
+      );
+    }
+    runGit([
+      "merge-base",
+      "--is-ancestor",
+      proof.releaseCommit,
+      proof.candidateCommit,
+    ]);
+
+    const assetPayload = JSON.stringify({
+      version,
+      assets: [...assets]
+        .map(({ hostKey, archive, sha256 }) => ({ hostKey, archive, sha256 }))
+        .sort((a, b) => a.hostKey.localeCompare(b.hostKey)),
+    });
+    if (sha256(assetPayload) !== proof.assetsSha256) {
+      throw new Error("registry version or artifact asset map changed");
+    }
+    if (!/^[0-9a-f]{64}$/.test(proof.assetsSha256)) {
+      throw new Error("asset-map digest is malformed");
+    }
+    if (!/^[0-9a-f]{64}$/.test(proof.unchangedTreeSha256)) {
+      throw new Error("unchanged-tree digest is malformed");
+    }
+
+    const validRepoPath = (value) =>
+      typeof value === "string" &&
+      /^[A-Za-z0-9_./-]+$/.test(value) &&
+      !posix.isAbsolute(value) &&
+      !value.split("/").includes("..");
+    const files = singleFileProof ? [proof.testFile] : proof.testFiles;
+    const bindings = singleFileProof ? [proof.binding] : proof.bindings;
+    if (
+      !Array.isArray(files) ||
+      files.length === 0 ||
+      !Array.isArray(bindings) ||
+      bindings.length !== files.length
+    ) {
+      throw new Error(
+        "test-file set and module bindings must be non-empty and have equal length",
+      );
+    }
+    const filePaths = new Set();
+    const bindingsByPath = new Map();
+    for (const file of files) {
+      if (
+        !file ||
+        Object.keys(file).sort().join(",") !==
+          "candidateBlob,candidateMode,path,releaseBlob,releaseMode"
+      ) {
+        throw new Error("test-file proof fields are missing or unknown");
+      }
+      if (
+        !validRepoPath(file.path) ||
+        !file.path.endsWith(".rs") ||
+        filePaths.has(file.path)
+      ) {
+        throw new Error("test-file paths must be unique safe Rust source paths");
+      }
+      filePaths.add(file.path);
+      const newTestFile =
+        fileSetProof && file.releaseMode === null && file.releaseBlob === null;
+      if (
+        (!newTestFile && file.releaseMode !== "100644") ||
+        file.candidateMode !== "100644"
+      ) {
+        throw new Error("attested test file must remain a regular non-executable file");
+      }
+      if (
+        !/^[0-9a-f]{40}$/.test(file.candidateBlob) ||
+        (!newTestFile &&
+          (!/^[0-9a-f]{40}$/.test(file.releaseBlob) ||
+            file.releaseBlob === file.candidateBlob))
+      ) {
+        throw new Error("test-file blob pair is malformed or unchanged");
+      }
+    }
+    for (const binding of bindings) {
+      if (
+        !binding ||
+        Object.keys(binding).sort().join(",") !==
+          "moduleBlob,modulePath,testPath" ||
+        !validRepoPath(binding.modulePath) ||
+        !validRepoPath(binding.testPath) ||
+        !/^[0-9a-f]{40}$/.test(binding.moduleBlob) ||
+        !filePaths.has(binding.testPath) ||
+        posix.dirname(binding.testPath) !== posix.dirname(binding.modulePath) ||
+        bindingsByPath.has(binding.testPath)
+      ) {
+        throw new Error("test path is not a safe sibling of an exact module binding");
+      }
+      bindingsByPath.set(binding.testPath, binding);
+    }
+    if (bindingsByPath.size !== filePaths.size) {
+      throw new Error("every changed test file must have exactly one module binding");
+    }
+    const entries = (ref) =>
+      runGit(["ls-tree", "-r", "--full-tree", "-z", ref])
+        .split("\0")
+        .filter(Boolean)
+        .map((entry) => {
+          const match = entry.match(
+            /^([0-7]{6}) (blob|commit) ([0-9a-f]{40})\t([\s\S]+)$/,
+          );
+          if (!match) throw new Error(`unsupported tree entry in ${ref}`);
+          if (!/^[\x20-\x7e]+$/.test(match[4])) {
+            throw new Error(`unsupported non-printable Git path in ${ref}`);
+          }
+          return {
+            mode: match[1],
+            type: match[2],
+            oid: match[3],
+            path: match[4],
+          };
+        });
+    const releaseEntries = entries(proof.releaseCommit);
+    const candidateEntries = entries(proof.candidateCommit);
+    for (const file of files) {
+      const releaseFile = releaseEntries.find((item) => item.path === file.path);
+      const candidateFile = candidateEntries.find((item) => item.path === file.path);
+      const newTestFile =
+        fileSetProof && file.releaseMode === null && file.releaseBlob === null;
+      if (
+        (newTestFile
+          ? releaseFile !== undefined
+          : !releaseFile ||
+            releaseFile.mode !== file.releaseMode ||
+            releaseFile.type !== "blob" ||
+            releaseFile.oid !== file.releaseBlob) ||
+        !candidateFile ||
+        candidateFile.mode !== file.candidateMode ||
+        candidateFile.type !== "blob" ||
+        candidateFile.oid !== file.candidateBlob
+      ) {
+        throw new Error(
+          singleFileProof
+            ? "attested test file path, mode, or blob does not match the Git trees"
+            : `attested test file ${file.path} path, mode, or blob does not match the Git trees`,
+        );
+      }
+    }
+    const attestedPaths = new Set(files.map(({ path }) => path));
+    const treeHash = (items) =>
+      sha256(
+        items
+          .filter((item) => !attestedPaths.has(item.path))
+          .map(
+            ({ mode, type, oid, path }) => `${mode} ${type} ${oid}\t${path}\n`,
+          )
+          .sort()
+          .join(""),
+      );
+    const releaseTreeHash = treeHash(releaseEntries);
+    const candidateTreeHash = treeHash(candidateEntries);
+    if (
+      releaseTreeHash !== proof.unchangedTreeSha256 ||
+      candidateTreeHash !== proof.unchangedTreeSha256
+    ) {
+      throw new Error(
+        "other source, manifest, lock, build input, or gitlink differs from the release tree",
+      );
+    }
+
+    for (const binding of bindings) {
+      const moduleEntry = candidateEntries.find(
+        (item) => item.path === binding.modulePath,
+      );
+      if (
+        !moduleEntry ||
+        moduleEntry.type !== "blob" ||
+        moduleEntry.mode !== "100644" ||
+        moduleEntry.oid !== binding.moduleBlob
+      ) {
+        throw new Error(
+          "test module declaration source differs from the attested blob",
+        );
+      }
+      const moduleSource = runGit([
+        "show",
+        `${proof.candidateCommit}:${binding.modulePath}`,
+      ]);
+      const declaration = `#[cfg(test)]\n#[path = "${binding.testPath.split("/").at(-1)}"]\nmod tests;`;
+      if (!moduleSource.includes(declaration)) {
+        throw new Error(
+          `the exact cfg(test) sibling module binding for ${binding.testPath} is absent`,
+        );
+      }
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, message: error.message };
+  }
+}
+
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+/**
+ * Decide what a provider record's pin state means.
+ *
+ * A provider module is released from
+ * its OWN repository on its OWN version line, so its version can never equal
+ * the tag of the shared source submodule it is built against. What can be
+ * checked offline is: (1) the registry record names the release that
+ * module-provider-pins.json declares, and (2) that release was built against
+ * the commit the host's submodule is at now.
+ *
+ * `lock` is the provider's entry from module-provider-pins.json, `sourceHead`
+ * the full commit of the submodule it is built against.
+ */
+export function classifyProviderPin({
+  id,
+  version,
+  releaseUrl,
+  lock,
+  sourceSubmodule,
+  sourceHead,
+}) {
+  if (!lock || !lock.repo || !lock.version || !lock.built_against) {
+    return {
+      ok: false,
+      message:
+        `"${id}" is a provider record but module-provider-pins.json has no complete ` +
+        `entry (repo, version, built_against) for it.`,
+    };
+  }
+  const problems = [];
+  if (lock.version !== version) {
+    problems.push(
+      `registry.rs version is ${version} but module-provider-pins.json says the ` +
+        `provider release is ${lock.version}.`,
+    );
+  }
+  const wantedUrl = `https://github.com/${lock.repo}/releases/tag/v${lock.version}`;
+  if (releaseUrl !== wantedUrl) {
+    problems.push(
+      `registry.rs release_url is ${releaseUrl ?? "(none)"} but the provider pin implies ${wantedUrl}.`,
+    );
+  }
+  if (!/^[0-9a-f]{40}$/.test(lock.built_against)) {
+    problems.push(
+      `module-provider-pins.json built_against must be a full 40-hex commit, got "${lock.built_against}".`,
+    );
+  } else if (lock.built_against !== sourceHead) {
+    problems.push(
+      `provider release v${lock.version} was built against ${sourceSubmodule} ${lock.built_against.slice(0, 8)}, ` +
+        `but the host pins ${sourceHead.slice(0, 8)}. Re-release the provider from ${lock.repo} ` +
+        `against the new source and re-pin it.`,
+    );
+  }
+  if (problems.length > 0) {
+    return {
+      ok: false,
+      message: `"${id}" provider pin is inconsistent:\n    ${problems.join("\n    ")}`,
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * Every record in `ALL` must be known to the pin map, and every pin-map entry
+ * must still be a record.
+ *
+ * This is the half that survives the next module landing. Six vendored crates
+ * were added between 2026-08-20 and 2026-08-27; a gate that enumerated the
+ * modules of the day would already be behind, and would report a clean scan
+ * while ignoring the newest one.
+ */
+export function checkPinMapCoverage(activeIds, pinMapIds) {
+  const failures = [];
+  for (const id of activeIds) {
+    if (!pinMapIds.includes(id)) {
+      failures.push(
+        `modules::registry::ALL contains "${id}", which scripts/ci/check-module-pins.mjs ` +
+          `does not know about.\n` +
+          `    Add it to PIN_MAP: either name the vendor/ submodule that is the source of\n` +
+          `    truth for its version, or set submodule: null with a reason (and sharesWith,\n` +
+          `    if it ships out of another crate's release).\n` +
+          `    This is deliberate: a new module must not inherit an unchecked pin.`,
+      );
+    }
+  }
+  for (const id of pinMapIds) {
+    if (!activeIds.includes(id)) {
+      failures.push(
+        `PIN_MAP has an entry for "${id}", which is no longer in modules::registry::ALL. Remove it.`,
+      );
+    }
+  }
+  return failures;
+}
+
+/** path -> gitlink sha, parsed from `git ls-tree -r <ref>` output. */
+export function parseGitlinks(lsTreeOutput) {
+  const map = new Map();
+  for (const line of lsTreeOutput.split("\n")) {
+    const m = line.match(/^160000 commit ([0-9a-f]{40})\t(.+)$/);
+    if (m) map.set(m[2], m[1]);
+  }
+  return map;
+}
+
+/** A deliberate rewind is declared on the branch that does it. */
+export function rewindDeclared(text) {
+  return /\[pin-rewind\]/i.test(text ?? "");
+}
+
+/**
+ * Classify a submodule pin move from BOTH ancestry answers.
+ *
+ * "Not an ancestor" is not the same as "forward". When the new commit and the
+ * base commit are siblings — a side branch, or a submodule whose history was
+ * rebased — neither is an ancestor of the other, and a check that asks only
+ * `is-ancestor head base` sees its single query fail and calls the move forward.
+ *
+ * A divergent pin drops whatever the base branch had just as surely as a rewind
+ * does; it simply does it sideways. Since the whole point of this gate is that a
+ * pin must not silently lose commits, treating divergence as forward would
+ * defeat it: a rewind onto a sibling — 14a23b994's shape, one rebase away —
+ * would walk straight through.
+ *
+ * So both directions are asked and only a genuine descendant is forward.
+ */
+export function classifyMove({ headIsAncestorOfBase, baseIsAncestorOfHead }) {
+  if (headIsAncestorOfBase) return "rewind";
+  if (baseIsAncestorOfHead) return "forward";
+  return "divergent";
+}
+
+/**
+ * Does `toplevel` prove that `path` is a checked-out submodule?
+ *
+ * `git -C <path> rev-parse --git-dir` cannot answer this: git walks UPWARD, so
+ * from an uninitialised or merely empty `vendor/<x>` it answers the
+ * SUPERPROJECT's `.git` and exits 0 — reporting "present" having checked
+ * nothing. `--show-toplevel` answers the root of whichever repository owns the
+ * directory, and only when that root IS the directory is it a real checkout.
+ *
+ * Both sides must already be realpath-resolved by the caller: macOS resolves
+ * `/tmp/...` to `/private/tmp/...`, and comparing one resolved path against one
+ * unresolved path is its own quiet false negative.
+ */
+export function toplevelProvesSubmodule(resolvedToplevel, resolvedPath) {
+  return Boolean(resolvedToplevel) && resolvedToplevel === resolvedPath;
+}

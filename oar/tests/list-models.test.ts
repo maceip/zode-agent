@@ -1,0 +1,251 @@
+import path from "node:path";
+import { expect, test } from "vitest";
+import { effortLevelOf, effortLevelsOf } from "../packages/oar/src/shared/effort-levels.js";
+import { claudeListModels, projectClaudeModels } from "../packages/oar/src/runtimes/claude/list-models.js";
+import { codexDefaultModel, codexListModels, projectCodexModels } from "../packages/oar/src/runtimes/codex/list-models.js";
+import { grokListModels, grokModelState, projectGrokModels } from "../packages/oar/src/runtimes/grok/list-models.js";
+import { kimiListModels } from "../packages/oar/src/runtimes/kimi/list-models.js";
+import { createPiListModels, piListModels, projectPiModels } from "../packages/oar/src/runtimes/pi/list-models.js";
+import { defaultRuntimes } from "../packages/oar/src/index.js";
+
+const executable = { kind: "available", via: "executable", command: "x", version: "1" } as const;
+const bundled = { kind: "available", via: "bundled", version: "1" } as const;
+
+test("every registered runtime exposes listModels", () => {
+  for (const runtime of defaultRuntimes.list()) {
+    expect(typeof runtime.listModels, runtime.id).toBe("function");
+  }
+});
+
+test("effortLevelsOf accepts strings and {effort}/{id} objects", () => {
+  expect(effortLevelsOf(undefined)).toBeUndefined();
+  expect(effortLevelsOf("high")).toBeUndefined();
+  expect(effortLevelsOf([])).toEqual([]);
+  expect(effortLevelsOf(["low", { effort: "high", description: "x" }, { id: "max" }, {}, 3])).toEqual([
+    "low",
+    "high",
+    "max",
+  ]);
+  expect(effortLevelOf("medium")).toBe("medium");
+  expect(effortLevelOf({ effort: "xhigh" })).toBe("xhigh");
+  expect(effortLevelOf("")).toBeUndefined();
+});
+
+test("codex model/list keeps native ids and service tiers, drops hidden entries", () => {
+  expect(projectCodexModels({ data: [
+    { id: "picker-id", model: "gpt-5.5", displayName: " GPT 5.5 ", defaultReasoningEffort: "medium",
+      supportedReasoningEfforts: [{ reasoningEffort: "low" }, { reasoningEffort: "high" }],
+      serviceTiers: [{ id: "priority", name: "Fast" }, { id: "flex" }, {}], defaultServiceTier: "flex", additionalSpeedTiers: ["wrong"] },
+    { model: "hidden", hidden: true }, { displayName: "no model" }, { model: "bare", isDefault: true },
+    { model: "standard", serviceTiers: [], defaultServiceTier: null, isDefault: false },
+  ] })).toEqual([
+    { id: "gpt-5.5", displayName: "GPT 5.5", effortLevels: ["low", "high"], defaultEffort: "medium", serviceTiers: ["priority", "flex"], defaultServiceTier: "flex" },
+    { id: "bare", default: true }, { id: "standard", serviceTiers: [] },
+  ]);
+  expect(projectCodexModels(null)).toEqual([]);
+});
+
+test("claude projection keeps alias vs resolution, native fast support and disabled reasons", () => {
+  const models = projectClaudeModels({
+    models: [
+      {
+        value: "sonnet",
+        resolvedModel: "claude-sonnet-5",
+        displayName: "Sonnet",
+        supportsEffort: true,
+        supportedEffortLevels: ["low", "high"],
+      },
+      { value: "haiku", resolvedModel: "claude-haiku-4-5-20251001", supportedEffortLevels: null },
+      {
+        value: "cc-update-required-1",
+        displayName: "Fable 5.1",
+        description: "Update to 2.1.255+ to use Fable 5.1",
+        disabled: true,
+      },
+      { value: "opus", supportsFastMode: true },
+      { value: "", displayName: "dropped" },
+    ],
+  });
+  expect(models).toEqual([
+    { id: "sonnet", resolvedId: "claude-sonnet-5", displayName: "Sonnet", effortLevels: ["low", "high"] },
+    { id: "haiku", resolvedId: "claude-haiku-4-5-20251001" },
+    {
+      id: "cc-update-required-1",
+      displayName: "Fable 5.1",
+      disabled: { reason: "Update to 2.1.255+ to use Fable 5.1" },
+    },
+    { id: "opus", serviceTiers: ["fast"] },
+  ]);
+});
+
+// #347: claude's "Default (recommended)" entry is not what an unset session runs when settings
+// pick a model, and nothing in claude's answer says which, so claude marks no default (Lookout, 2.1.296).
+test("claude projection marks no default", () => {
+  expect(projectClaudeModels({ models: [
+    { value: "default", resolvedModel: "claude-opus-5-5", displayName: "Default (recommended)" },
+    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus 5.5" },
+  ] })).toEqual([
+    { id: "default", resolvedId: "claude-opus-5-5", displayName: "Default (recommended)" },
+    { id: "opus", resolvedId: "claude-opus-5-5", displayName: "Opus 5.5" },
+  ]);
+});
+
+// #347: a model codex's configuration sets wins over the catalog's isDefault; an unlisted one marks nothing.
+test("codex default follows the configured model when it is listed", () => {
+  const models = [{ id: "gpt-6.1-sol", default: true as const }, { id: "gpt-5.5" }];
+  expect(codexDefaultModel(models, undefined)).toEqual(models);
+  expect(codexDefaultModel(models, "gpt-5.5")).toEqual([{ id: "gpt-6.1-sol" }, { id: "gpt-5.5", default: true }]);
+  expect(codexDefaultModel(models, "not-listed")).toEqual([{ id: "gpt-6.1-sol" }, { id: "gpt-5.5" }]);
+});
+
+test("grok projection unwraps the handler envelope and filters unselectable models", () => {
+  const state = grokModelState({
+    result: {
+      currentModelId: "grok-4",
+      availableModels: [
+        {
+          modelId: "grok-4",
+          name: "Grok 4",
+          reasoning_efforts: ["low", { effort: "high" }],
+          default_reasoning_effort: "low",
+        },
+        { model_id: "grok-hidden", hidden: true },
+        { modelId: "grok-internal", user_selectable: false },
+        { modelId: "grok-3-mini", displayName: "Grok 3 mini" },
+      ],
+    },
+  });
+  expect(projectGrokModels(state)).toEqual([
+    { id: "grok-4", displayName: "Grok 4", effortLevels: ["low", "high"], defaultEffort: "low", default: true },
+    { id: "grok-3-mini", displayName: "Grok 3 mini" },
+  ]);
+  expect(projectGrokModels(grokModelState({ available_models: [{ id: "flat" }] }))).toEqual([{ id: "flat" }]);
+  expect(() => grokModelState({ error: { message: "boom" } })).toThrow(/boom/u);
+});
+
+// pi's own menu per model (pi-ai getSupportedThinkingLevels), injected; a
+// model without `reasoning` runs only `off` and lists none.
+function piLevels(model: { readonly id: string }): readonly string[] {
+  return model.id === "gpt-6-astra" ? ["minimal", "low", "medium", "high", "xhigh", "max"] : ["off", "minimal", "low", "medium", "high"];
+}
+
+test("pi projection lists pi's thinking levels for reasoning models only", () => {
+  expect(projectPiModels([
+    { id: "gpt-6-astra", provider: "openai-codex", name: "GPT-6 Astra", reasoning: true },
+    { id: "deepseek-v3.2", provider: "openrouter", name: "DeepSeek V3.2", reasoning: true },
+    { id: "deepseek-chat", provider: "openrouter", name: "DeepSeek Chat", reasoning: false },
+  ], piLevels)).toEqual([
+    { id: "openai-codex/gpt-6-astra", displayName: "GPT-6 Astra", effortLevels: ["minimal", "low", "medium", "high", "xhigh", "max"], provider: { id: "openai-codex" } },
+    { id: "openrouter/deepseek-v3.2", displayName: "DeepSeek V3.2", effortLevels: ["off", "minimal", "low", "medium", "high"], provider: { id: "openrouter" } },
+    { id: "openrouter/deepseek-chat", displayName: "DeepSeek Chat", provider: { id: "openrouter" } },
+  ]);
+});
+
+test("pi projection namespaces ids by provider", () => {
+  expect(projectPiModels([
+    { id: "claude-sonnet-5", provider: "anthropic", name: "Claude Sonnet 5" },
+    { id: "gpt-5.5", provider: "openai", name: " " },
+  ])).toEqual([
+    { id: "anthropic/claude-sonnet-5", displayName: "Claude Sonnet 5", provider: { id: "anthropic" } },
+    { id: "openai/gpt-5.5", displayName: "gpt-5.5", provider: { id: "openai" } },
+  ]);
+});
+
+function kimiProviderName(id: string): string | undefined {
+  return id === "kimi-coding" ? "Kimi For Coding" : id;
+}
+
+// #347: pi's provider display name and the default saved in pi's settings, both from pi; nothing guessed.
+test("pi projection names each provider and marks the saved default only", () => {
+  const models = [
+    { id: "kimi-k3", provider: "kimi-coding", name: "Kimi K3" },
+    { id: "kimi-k3", provider: "moonshot", name: "Kimi K3" },
+  ];
+  expect(projectPiModels(models, undefined, { providerName: kimiProviderName, savedDefault: { provider: "moonshot", id: "kimi-k3" } })).toEqual([
+    { id: "kimi-coding/kimi-k3", displayName: "Kimi K3", provider: { id: "kimi-coding", displayName: "Kimi For Coding" } },
+    { id: "moonshot/kimi-k3", displayName: "Kimi K3", provider: { id: "moonshot" }, default: true },
+  ]);
+  expect(projectPiModels(models, undefined, { savedDefault: { provider: "openai", id: "gpt-5.5" } }).some((model) => model.default === true)).toBe(false);
+});
+
+test("pi lister awaits getAvailable instead of reading the unrefreshed snapshot", async () => {
+  // Regression for `oar models pi` printing "no models" while `pi --list-models`
+  // showed twenty: ModelRegistry.getAvailable() only echoes a snapshot that is
+  // empty until an availability refresh runs. The lister must ask the runtime
+  // to compute availability and must hand the same timeout signal to both
+  // the runtime construction (extension loading) and the availability call.
+  const seen: { providerId: string | undefined; signal: AbortSignal | undefined }[] = [];
+  let constructionSignal: AbortSignal | undefined = undefined;
+  const lister = createPiListModels(async (signal) => {
+    constructionSignal = signal;
+    return {
+      async getAvailable(providerId?: string, options?: { readonly signal?: AbortSignal }) {
+        seen.push({ providerId, signal: options?.signal });
+        return [{ id: "grok-4.6", provider: "xai", name: "Grok 4.6" }];
+      },
+    };
+  });
+  expect(await lister(bundled, { timeoutMs: 1000 })).toEqual({
+    kind: "ok",
+    models: [{ id: "xai/grok-4.6", displayName: "Grok 4.6", provider: { id: "xai" } }],
+  });
+  expect(seen).toHaveLength(1);
+  expect(seen[0]?.providerId).toBeUndefined();
+  expect(seen[0]?.signal).toBeInstanceOf(AbortSignal);
+  expect(constructionSignal).toBe(seen[0]?.signal);
+
+  const failing = createPiListModels(async () => ({
+    async getAvailable() {
+      await Promise.resolve();
+      throw new Error("registry exploded");
+    },
+  }));
+  expect(await failing(bundled)).toMatchObject({ kind: "unsupported", reason: /registry exploded/u });
+});
+
+test("pi lister builds pi's services for the requested directory", async () => {
+  const seen: string[] = [];
+  const lister = createPiListModels(async (_signal, cwd) => {
+    seen.push(cwd);
+    return { getAvailable: async () => { await Promise.resolve(); return []; } };
+  });
+  await lister(bundled, { cwd: "workspace", env: { OAR_PI_AGENT_DIR: "child-only-dir" } });
+  await lister(bundled);
+  expect(seen).toEqual([path.resolve("workspace"), process.cwd()]);
+});
+
+test("pi lister reports a configured provider through the real SDK", async () => {
+  // End-to-end through the bundled SDK with a dummy key: any API-key provider
+  // counts as available without network, so this pins that the in-process
+  // path actually populates the list (it was empty before the fix). The
+  // extension-registered providers are environment-specific, so parity with
+  // `pi --list-models` is pinned by experiments/pi-list-models.ts instead.
+  const previous = process.env.XAI_API_KEY;
+  process.env.XAI_API_KEY = "dummy-not-a-real-key";
+  try {
+    const result = await piListModels(bundled, { timeoutMs: 15_000 });
+    expect(result.kind).toBe("ok");
+    if (result.kind === "ok") {
+      expect(result.models.some((model) => model.id.startsWith("xai/"))).toBe(true);
+    }
+  } finally {
+    if (previous === undefined) {
+      delete process.env.XAI_API_KEY;
+    } else {
+      process.env.XAI_API_KEY = previous;
+    }
+  }
+});
+
+test("executable listers refuse bundled installations and pi refuses executables", async () => {
+  const results = await Promise.all([
+    codexListModels(bundled),
+    claudeListModels(bundled),
+    grokListModels(bundled),
+    kimiListModels(bundled),
+    piListModels(executable),
+  ]);
+  for (const result of results) {
+    expect(result).toMatchObject({ kind: "unsupported" });
+  }
+});

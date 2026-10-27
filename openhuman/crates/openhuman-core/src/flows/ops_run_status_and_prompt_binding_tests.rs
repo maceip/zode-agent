@@ -1,0 +1,420 @@
+use super::*;
+
+/// CodeRabbit (PR #4702 review): parity coverage for the probe-override path
+/// in `graph_output_field_warnings` — mirrors
+/// `graph_wiring_warnings_suggests_the_probed_split_out_path_when_schema_is_unknown`
+/// above, but for a downstream FIELD binding rather than `split_out.path`.
+/// With no schema at all (`output_schema: None`, `output_fields: []`), the
+/// field-not-in-output_fields check would otherwise stay silent (nothing
+/// real to check against) — once `get_tool_output_sample` has probed the
+/// slug, the probed `output_fields` become the ground truth: a binding to a
+/// probed-real field is silent, and a binding to a field NOT in the probed
+/// set is flagged, exactly like the schema-known case already covers.
+#[tokio::test]
+async fn graph_wiring_warnings_uses_the_probed_output_fields_when_schema_is_unknown() {
+    let contract = ToolContract {
+        slug: "GHPROBEFIELDS_LIST_REPOSITORY_ISSUES".to_string(),
+        toolkit: "ghprobefields".to_string(),
+        description: None,
+        required_args: vec!["owner".to_string(), "repo".to_string()],
+        input_schema: None,
+        output_fields: vec![],
+        output_schema: None,
+        primary_array_path: None,
+        is_curated: true,
+    };
+    seed_live_catalog_cache("ghprobefields", vec![contract]);
+    seed_probe_cache(
+        "GHPROBEFIELDS_LIST_REPOSITORY_ISSUES",
+        ProbedOutputSample {
+            primary_array_path: Some("data.issues".to_string()),
+            output_fields: vec!["issues".to_string(), "total_count".to_string()],
+            sample: json!({ "data": { "issues": [], "total_count": 0 } }),
+        },
+    );
+    let config = Config::default();
+
+    // A binding to a field the probe actually observed — silent.
+    let real_field = graph(json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "post", "kind": "tool_call", "name": "Post",
+              "config": { "slug": "GHPROBEFIELDS_LIST_REPOSITORY_ISSUES",
+                "args": { "owner": "acme", "repo": "widgets" } } },
+            { "id": "xform", "kind": "transform", "name": "Log",
+              "config": { "set": { "note": "=nodes.post.item.json.data.total_count" } } }
+        ],
+        "edges": [
+            { "from_node": "t", "to_node": "post" },
+            { "from_node": "post", "to_node": "xform" }
+        ]
+    }));
+    assert!(
+        graph_wiring_warnings(
+            &crate::core::runtime::DispatchCtx::unbound(),
+            &config,
+            &real_field
+        )
+        .await
+        .expect("TinyFlows wiring warnings should succeed")
+        .is_empty(),
+        "a probed-real field must not warn: {:?}",
+        graph_wiring_warnings(
+            &crate::core::runtime::DispatchCtx::unbound(),
+            &config,
+            &real_field
+        )
+        .await
+        .expect("TinyFlows wiring warnings should succeed")
+    );
+
+    // A binding to a field the probe did NOT observe — flagged, using the
+    // probed output_fields as ground truth even though the schema itself is
+    // unknown.
+    let fake_field = graph(json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "post", "kind": "tool_call", "name": "Post",
+              "config": { "slug": "GHPROBEFIELDS_LIST_REPOSITORY_ISSUES",
+                "args": { "owner": "acme", "repo": "widgets" } } },
+            { "id": "xform", "kind": "transform", "name": "Log",
+              "config": { "set": { "note": "=nodes.post.item.json.data.not_a_probed_field" } } }
+        ],
+        "edges": [
+            { "from_node": "t", "to_node": "post" },
+            { "from_node": "post", "to_node": "xform" }
+        ]
+    }));
+    let warnings = graph_wiring_warnings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &config,
+        &fake_field,
+    )
+    .await
+    .expect("TinyFlows wiring warnings should succeed");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("not_a_probed_field") && w.contains("post")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
+fn agent_prompt_binding_unaffected() {
+    // The field-addressability checks are scoped to `tool_call` `args` only
+    // — an agent's own `prompt` referencing a dangling/unschemad node path is
+    // NOT inspected for that, even though it IS inspected for the narrower
+    // "reads as prose, not jq" case (see the tests below). A simple dotted
+    // path — even one pointing at a missing node — is a real, valid
+    // expression (it just resolves to `null` at runtime, same as any other
+    // dangling reference), so it's accepted here.
+    let g = graph(json!({
+        "nodes": [
+            { "id": "t", "kind": "trigger", "name": "Manual" },
+            { "id": "summarize", "kind": "agent", "name": "Summarize",
+              "config": { "prompt": "=nodes.missing.item.channel" } }
+        ],
+        "edges": [ { "from_node": "t", "to_node": "summarize" } ]
+    }));
+    let engine_graph: tinyflows::model::WorkflowGraph =
+        serde_json::from_value(g.clone()).expect("graph fixture converts to engine graph");
+    assert!(tinyflows::gates::failures(&engine_graph).is_empty());
+}
+
+/// Regression for issue #4593 (widened for #4881's `resume_flow_run`/
+/// `cancel_flow_run` addition to the belt): the `flows_build` builder turn
+/// runs under `AgentTurnOrigin::Cli`, which makes the `ApprovalGate`
+/// auto-allow every `external_effect` tool. The flows live-runner (`run_flow`)
+/// and the run-resume tool (`resume_flow_run`) both execute/advance a *live*
+/// saved flow's real outbound effects, so both must be unreachable on this
+/// path — `restrict_builder_toolset` drops them (plus `cancel_flow_run`, out
+/// of caution) from the builder's callable belt while leaving the authoring
+/// tools in place so the turn still functions (never fail-closes).
+#[tokio::test]
+async fn flows_build_hides_the_live_run_tool_from_the_builder_belt() {
+    crate::agent::session_host::test_support::install_model_fixture();
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Document WHY each run-advancing tool must be hidden: running or
+    // resuming a saved flow fires real Slack/Gmail/HTTP/code effects, so both
+    // are external-effect tools. This pins that invariant independently of
+    // belt name-resolution so the hide-list can't silently stop covering a
+    // live-run/resume tool.
+    use tinytools::Tool as _;
+    let live_runner = crate::flows::copilot_bus::BusCopilotTool::from_name(
+        std::sync::Arc::new(config.clone()),
+        "run_flow",
+    );
+    assert!(
+        live_runner.external_effect(),
+        "the flows live-runner must be external-effect for the #4593 concern to apply"
+    );
+    let resumer = crate::flows::builder_tools::tests_support::resume_flow_run_tool(
+        std::sync::Arc::new(config.clone()),
+    );
+    assert!(
+        resumer.external_effect(),
+        "resume_flow_run advances a real run's outbound effects, so it must be \
+         external-effect for the same #4593/#4881 concern to apply"
+    );
+    let canceller = crate::flows::builder_tools::tests_support::cancel_flow_run_tool(
+        std::sync::Arc::new(config.clone()),
+    );
+    assert!(
+        canceller.external_effect(),
+        "cancel_flow_run is external-effect since the T-M3 fix — it stays hidden on THIS \
+         (Cli-origin, auto-allow) path regardless, because that gate is exactly what this \
+         origin bypasses; see restrict_builder_toolset's doc"
+    );
+
+    // Building an agent constructs a memory client, which needs the host seams
+    // wired. `Once`-guarded, so this is free when another test got there first.
+    crate::agent_registry::host_definition::AgentDefinitionRegistry::init_global(
+        &config.workspace_dir,
+    )
+    .expect("agent registry init");
+    let mut agent = crate::agent::OpenHumanSessionHost::from_config_for_agent(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        "workflow_builder",
+    )
+    .expect("build workflow_builder agent");
+    agent.set_agent_definition_name("workflow_builder".to_string());
+
+    // Precondition: the builder advertises all four run-advancing tools on its
+    // belt before restriction — the exact set #4593/#4881 are about.
+    let visible_before = agent.visible_tool_specs_arc();
+    for present in ["run_flow", "resume_flow_run", "cancel_flow_run"] {
+        assert!(
+            visible_before.iter().any(|spec| spec.name == present),
+            "precondition: workflow_builder belt should advertise `{present}`; visible = \
+             {visible_before:?}"
+        );
+    }
+
+    restrict_builder_toolset(&mut agent);
+
+    // After restriction none of the run-advancing tools are callable on the
+    // flows_build path — the hide-list covers all of them (#4593 + #4881).
+    let visible = agent.visible_tool_specs_arc();
+    for hidden in [
+        "run_workflow",
+        "run_flow",
+        "resume_flow_run",
+        "cancel_flow_run",
+    ] {
+        assert!(
+            !visible.iter().any(|spec| spec.name == hidden),
+            "run-advancing tool `{hidden}` must be hidden on the flows_build path; visible = \
+             {visible:?}"
+        );
+    }
+    // Authoring / read tools — including the born-disabled `create_workflow`
+    // and `duplicate_flow` — stay reachable so the builder turn still works
+    // headlessly under the CLI origin (no fail-close).
+    for keep in [
+        "propose_workflow",
+        "revise_workflow",
+        "save_workflow",
+        "dry_run_workflow",
+        "list_flows",
+        "create_workflow",
+        "duplicate_flow",
+    ] {
+        assert!(
+            visible.iter().any(|spec| spec.name == keep),
+            "authoring tool `{keep}` must remain visible after restriction; visible = {visible:?}"
+        );
+    }
+}
+
+/// Pins the exact contents of both `flows_build` hide-lists so a future edit
+/// can't silently narrow/widen either belt without a test catching it
+/// (PR3: flows-copilot-live-run-approval).
+#[test]
+fn flows_build_hide_lists_have_the_expected_contents() {
+    assert_eq!(
+        FLOWS_BUILD_COPILOT_HIDDEN_TOOLS,
+        ["run_workflow", "cancel_flow_run"],
+        "the streaming (copilot) hide-list must hide the legacy `run_workflow` AND \
+         `cancel_flow_run`. The T-M3 fix DID give the latter `external_effect() == true` \
+         plus a run-ownership guard, so it would now park safely here — but unhiding it \
+         is a capability expansion (letting an authoring turn tear down a user-started \
+         run), not a security fix, and that product decision has not been taken. Only \
+         `run_flow`/`resume_flow_run` stay visible, gated by the WebChat approval surface"
+    );
+    for tool in [
+        "run_workflow",
+        "run_flow",
+        "resume_flow_run",
+        "cancel_flow_run",
+    ] {
+        assert!(
+            FLOWS_BUILD_HIDDEN_TOOLS.contains(&tool),
+            "the headless hide-list must still contain `{tool}` (existing #4593/#4881 \
+             contract) — {FLOWS_BUILD_HIDDEN_TOOLS:?}"
+        );
+    }
+}
+
+/// Streaming (copilot) path: `restrict_builder_toolset_for_copilot` leaves
+/// `run_flow` / `resume_flow_run` visible on the builder's belt — they're gated
+/// by the WebChat approval surface, not hidden — while hiding the unrelated
+/// legacy `run_workflow` AND `cancel_flow_run`, and keeping every authoring
+/// tool reachable (PR3: flows-copilot-live-run-approval). The T-M3 fix made
+/// `cancel_flow_run` safe to unhide (external_effect + run-ownership guard),
+/// but doing so would newly let an authoring turn tear down a user-started
+/// run — a product decision, deliberately not taken here.
+#[tokio::test]
+async fn flows_build_copilot_toolset_unhides_the_live_run_tools() {
+    crate::agent::session_host::test_support::install_model_fixture();
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Building an agent constructs a memory client, which needs the host seams
+    // wired. `Once`-guarded, so this is free when another test got there first.
+    crate::agent_registry::host_definition::AgentDefinitionRegistry::init_global(
+        &config.workspace_dir,
+    )
+    .expect("agent registry init");
+    let mut agent = crate::agent::OpenHumanSessionHost::from_config_for_agent(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        "workflow_builder",
+    )
+    .expect("build workflow_builder agent");
+    agent.set_agent_definition_name("workflow_builder".to_string());
+
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let capture = Capture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).expect("install test tracing subscriber");
+
+    restrict_builder_toolset_for_copilot(&mut agent);
+
+    let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        log.contains("cancel_flow_run"),
+        "trace should name the hidden tool: {log}"
+    );
+    assert!(
+        log.contains("run_flow/resume_flow_run stay visible")
+            && log.contains("cancel_flow_run and the unrelated legacy run_workflow are hidden"),
+        "trace should describe the actual builder tool visibility: {log}"
+    );
+    assert!(
+        !log.contains("run_flow/resume_flow_run/cancel_flow_run stay visible"),
+        "trace contradicts the actual hidden toolset: {log}"
+    );
+
+    let visible = agent.visible_tool_specs_arc();
+    for still_reachable in ["run_flow", "resume_flow_run"] {
+        assert!(
+            visible.iter().any(|spec| spec.name == still_reachable),
+            "`{still_reachable}` must stay reachable on the streaming copilot path — it \
+             is gated behind the WebChat approval surface, not hidden; visible = {visible:?}"
+        );
+    }
+    for hidden in ["run_workflow", "cancel_flow_run"] {
+        assert!(
+            !visible.iter().any(|spec| spec.name == hidden),
+            "`{hidden}` must stay hidden on the copilot path (unrelated legacy runner / \
+             a cancel that is now safe to unhide but deliberately still gated behind a \
+             product decision); visible = {visible:?}"
+        );
+    }
+    for keep in [
+        "propose_workflow",
+        "revise_workflow",
+        "save_workflow",
+        "dry_run_workflow",
+        "list_flows",
+        "create_workflow",
+        "duplicate_flow",
+    ] {
+        assert!(
+            visible.iter().any(|spec| spec.name == keep),
+            "authoring tool `{keep}` must remain visible on the copilot path; visible = \
+             {visible:?}"
+        );
+    }
+}
+
+/// Regression for issue #4868 (systemic fix, superseding the old B31
+/// per-caller `apply_builder_iteration_cap` override): `flows_build` must get
+/// an agent carrying the `workflow_builder` `AgentDefinition`'s
+/// `effective_max_iterations()` (50, from `agent.toml`'s
+/// `iteration_policy = "extended"`), not the global `Config::default()`
+/// `agent.max_tool_iterations` (10) — and it must get this from the shared
+/// resolution point in `build_session_agent_inner`, with **no** per-caller
+/// override needed (that function was deleted as part of #4868).
+#[tokio::test]
+async fn flows_build_applies_the_builder_definitions_effective_iteration_cap() {
+    crate::agent::session_host::test_support::install_model_fixture();
+    let tmp = TempDir::new().unwrap();
+    let config = test_config(&tmp);
+
+    // Precondition: the global default really is lower than the definition's
+    // effective cap, otherwise this test can't distinguish the two.
+    assert_eq!(config.agent.max_tool_iterations, 10);
+
+    // Building an agent constructs a memory client, which needs the host seams
+    // wired. `Once`-guarded, so this is free when another test got there first.
+    crate::agent_registry::host_definition::AgentDefinitionRegistry::init_global(
+        &config.workspace_dir,
+    )
+    .expect("agent registry init");
+    let def = crate::agent_registry::host_definition::AgentDefinitionRegistry::global()
+        .expect("registry initialised")
+        .get("workflow_builder")
+        .expect("workflow_builder definition registered")
+        .clone();
+    let expected = def.effective_max_iterations();
+    assert_eq!(
+        expected, 50,
+        "workflow_builder's agent.toml is expected to declare iteration_policy = \"extended\", \
+         yielding an effective cap of EXTENDED_MAX_TOOL_ITERATIONS (50)"
+    );
+
+    // End-to-end: the agent actually built for this path carries the
+    // definition's cap straight off the unmodified `config` — the session
+    // builder resolves it internally now, no `flows_build`-side override.
+    let agent = crate::agent::OpenHumanSessionHost::from_config_for_agent(
+        &crate::core::runtime::DispatchCtx::ambient(),
+        &config,
+        "workflow_builder",
+    )
+    .expect("build workflow_builder agent");
+    assert_eq!(agent.agent_config().max_tool_iterations, expected);
+    assert_ne!(
+        agent.agent_config().max_tool_iterations,
+        config.agent.max_tool_iterations,
+        "sanity: the resolved cap must actually differ from the unmodified global config"
+    );
+}

@@ -1,0 +1,66 @@
+# Qwen stream-json probe
+
+Run the native binary directly against a local OpenAI-compatible scripted
+provider, without OAR's adapter or an account:
+
+```sh
+pnpm tsx experiments/qwen-native/probe.ts /path/to/qwen /tmp/qwen-evidence plain
+pnpm tsx experiments/qwen-native/probe.ts /path/to/qwen /tmp/qwen-mcp tools
+pnpm tsx experiments/qwen-native/probe.ts /path/to/qwen /tmp/qwen-permission permission
+pnpm tsx experiments/qwen-native/probe.ts /path/to/qwen /tmp/qwen-catalog catalog
+```
+
+The permission scenario deliberately uses native default approval to obtain a
+`can_use_tool` request. The adapter always uses yolo. Each run creates an isolated
+HOME and project; the evidence directory contains both directions of the wire,
+stderr, provider requests and query results. It preserves temporary native state
+for inspection; remove the reported temporary root after inspection.
+
+Rechecked all four scenarios on Linux with **0.26.1** on 2026-10-25. Ordinary
+turns completed on fresh and resumed sessions; interrupt still produced a
+native error result followed by a successful new turn. MCP calls, permission
+responses, effort and the configured model catalog remained observable. The
+warm-HOME lock probe below also passed its assertions, reproducing the existing
+readiness limitation. See the [dated report](../runtime-version-checks/2026-10-25.md#qwen-0261)
+for the separate OAR vendor, behavior and installation checks.
+
+Observed 2026-10-23 on npm 0.26.0, published source
+ac97ce7a70d9b2ea5d62b357e3d9b0851423afc9:
+
+- Initialize must be the first stdin frame. Its success precedes completion of
+  extension/MCP initialization, so it is not a readiness barrier.
+- Every turn reports model init and result; no command_lifecycle arrives.
+- Results accumulate session token totals, including restored history and
+  auxiliary calls. Neither global get_usage_info nor get_context_usage is a
+  session-spend baseline for resume.
+- `effort_status` reports whether an explicitly requested effort was applied.
+  No effort is assumed from the request alone.
+- MCP stdio calls and the native allow/updatedInput permission response work;
+  interrupt settles the active turn, and another prompt can run afterward.
+- A native modelProviders configuration appears in get_available_models;
+  environment-only configuration can return an empty list.
+
+[evidence.json](evidence.json) retains a small observation from the initial
+behavior run's extension-lock failure. The machine-local full trace also includes
+the development failures that led to this fix. It is not a successful test run.
+The [runtime page](../../docs/runtimes/qwen.md) and native vendor suite preserve
+these limits and verification boundaries.
+
+## Shared HOME and extension-store locking
+
+Run `pnpm tsx experiments/qwen-native/lock-lifetime.ts /absolute/path/to/qwen`
+whenever the Qwen version changes, as listed in `runtime-versions.ts`. This
+uses an isolated HOME, a synthetic provider and a deliberately held native
+lock. It first completes a warmup, then observes whether initialize replies
+while the next first prompt waits for that lock. Releasing the lock allows
+the prompt through. A normal later prompt is also tested with a held lock;
+that is not a guarantee about extension refresh operations.
+
+Qwen 0.26.0 returned initialize in 1.65 seconds with the lock held, sent no
+provider request during the first 300 ms of the prompt, and completed after
+release. The later ordinary prompt completed despite the held lock. Linux
+and Windows CI also observed `Extension store is busy` with multiple sessions
+sharing an already warmed HOME; [runtime documentation](../../docs/runtimes/qwen.md#extension-store-contention)
+records the versions, concurrency and failing jobs. Shared behavior tests
+now isolate each new session's HOME, while resumes keep the original HOME.
+There is no native-lock retry or adapter startup serialization.

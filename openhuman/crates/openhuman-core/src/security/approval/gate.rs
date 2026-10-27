@@ -1,0 +1,505 @@
+//! `ApprovalGate` — middleware between the agent and any tool whose
+//! [`tinytools::Tool::external_effect`] returns `true`.
+//!
+//! Flow (issue #1339):
+//! 1. Agent harness calls [`ApprovalGate::intercept`] with the tool
+//!    name, a redacted JSON of the arguments, and a short summary.
+//! 2. Gate checks the user's "Always allow" allowlist
+//!    (`autonomy.auto_approve`, read live via
+//!    [`crate::security::live_policy`]). Hit → `Allow`
+//!    immediately. An `ApproveAlwaysForTool` decision adds the tool to
+//!    that list via `approval_decide` (config save + policy reload).
+//! 3. Otherwise: persist a row in `pending_approvals`, publish a
+//!    [`DomainEvent::ApprovalRequested`] event so the UI can pop a
+//!    toast, and park the call on a `oneshot::Sender` keyed by
+//!    `request_id`.
+//! 4. UI calls `approval_decide` (RPC) which routes through
+//!    [`ApprovalGate::decide`] → sends the decision on the oneshot.
+//! 5. The parked future wakes with the decision and translates it
+//!    into [`GateOutcome::Allow`] / `Deny`.
+//!
+//! Sessions: the gate is keyed by an internal per-launch UUID
+//! (`session-<uuid>`) used purely for audit grouping. This value is
+//! generated unconditionally by the caller (see
+//! `bootstrap_core_runtime`) and is never derived from the JSON-RPC
+//! bearer token or any other credential material — it is safe to
+//! persist and to log. Rows from prior launches are intentionally
+//! preserved on init — the issue #1339 acceptance criterion requires
+//! they survive restart so the UI can show / dismiss orphans.
+//! Decisions on orphan rows update the DB but cannot resume a parked
+//! future across processes — no side effect can fire across launches,
+//! so the security invariant is preserved without auto-purging.
+
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
+
+use crate::config::Config;
+use crate::core::bus::BUS;
+use crate::core::events::DomainEvent;
+#[cfg(test)]
+use crate::security::turn_origin;
+use crate::security::turn_origin::{AgentTurnOrigin, TrustedAutomationSource};
+use tinytools::status::POLICY_DENIED_MARKER;
+
+use super::store;
+use super::types::{
+    ApprovalDecision, ApprovalSourceContext, ExecutionOutcome, GateOutcome, PendingApproval,
+};
+
+/// Disambiguates why [`ApprovalGate::decide`] returned `Ok(None)`. See
+/// [`ApprovalGate::classify_decide_miss`] for the lookup that produces this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecideMiss {
+    /// The pending row was already decided, lazily expired, or superseded — a
+    /// benign race (TAURI-RUST-5EH). Safe to demote out of Sentry.
+    AlreadyResolved,
+    /// No row was ever persisted for this request_id — a genuine lost
+    /// registration that must stay a Sentry signal.
+    NeverRegistered,
+}
+
+/// A decision refused by the gate before it reached the store.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ApprovalError {
+    /// The request was parked by a different agent than the one deciding it.
+    #[error("approval request {request_id} belongs to another agent")]
+    WrongAgent { request_id: String },
+}
+
+/// The key `thread_to_request` files a parked chat thread under, keyed by
+/// the tenant that parked it: the thread id alone for the process's own
+/// sessions, `<agent>\x1f<thread>` for an embedded agent (both unchanged),
+/// and the [`tenant_key`](crate::core::runtime::tenant_key) of the thread for
+/// a SaaS profile, so two profiles' default agents (which have no agent id)
+/// never share a route. A profile key starts with `\x1e`, which no agent id
+/// contains, and the desktop and SaaS modes never share a process.
+pub(crate) fn thread_route_key(tenant: &crate::core::runtime::Tenant, thread_id: &str) -> String {
+    match (&tenant.profile, &tenant.agent) {
+        (Some(_), _) => crate::core::runtime::tenant_key(tenant, thread_id),
+        (None, Some(agent)) => format!("{agent}\u{1f}{thread_id}"),
+        (None, None) => thread_id.to_string(),
+    }
+}
+
+/// The tenant whose approvals the calling task parks and answers. A SaaS
+/// task with no scope gets a tenant nothing else shares, so it can neither
+/// find nor clear another user's route.
+pub(crate) fn current_route_tenant() -> crate::core::runtime::Tenant {
+    crate::core::runtime::tenant::current_tenant_or_isolated("approval_gate")
+}
+
+/// How long the gate will park a future before timing out and
+/// returning `Deny`. 10 minutes matches the default `expires_at`
+/// written into the persisted row.
+const DEFAULT_APPROVAL_TTL: Duration = Duration::from_secs(60 * 10);
+
+/// Shorter park window for approvals raised by the Flow Canvas copilot's
+/// live-run path — `flows_build` streaming into the copilot pane calling
+/// `run_flow` / `resume_flow_run` (PR #5090). A stale ten-minute park on a
+/// copilot pane the user may have already navigated away from is a long time
+/// to leave a live Slack/Gmail/HTTP node waiting; if nobody approves within
+/// three minutes, deny and let the authoring turn continue (the user can
+/// still re-trigger the run from the Runs rail). Scoped by
+/// [`ApprovalTurnContext::copilot_stream`]. Deliberately NOT applied to
+/// main-chat `WebChat` parks — only `flows::ops::flows_build`'s streaming
+/// branch sets the flag.
+const COPILOT_APPROVAL_TTL: Duration = Duration::from_secs(180);
+
+/// Shorter park window for approvals raised inside a sub-agent run — a
+/// delegated worker (`image_agent`, `video_agent`, `skill_setup`, …) calling
+/// an external-effect tool. Same three-minute window and the same rationale
+/// as [`COPILOT_APPROVAL_TTL`]: the prompt is one level removed from what the
+/// user is looking at (an async sub-agent's card lands on a parent turn that
+/// may already have finished), and a ten-minute park left every failed
+/// `media_generate_image` / `media_generate_video` / `skill_registry_install`
+/// blocking for exactly 600s with the result never delivered. If nobody answers
+/// in three minutes the call is denied with an "approval wasn't answered"
+/// result so the parent agent can tell the user and they can ask again.
+const SUBAGENT_APPROVAL_TTL: Duration = Duration::from_secs(180);
+
+/// Phrase every TTL-expiry denial carries, so a caller that renders its own
+/// refusal (the hosted `OpenHumanSecurityGate`) can tell "nobody answered" from
+/// "the user said no" without parsing the rest of the reason. See
+/// [`is_unanswered_approval_reason`].
+pub const APPROVAL_UNANSWERED_PHRASE: &str = "nobody answered the approval prompt";
+
+/// Whether the parked `request_id` was routed to its chat thread from a task
+/// detached from that turn (an async-delegated sub-agent, #5499), so its card
+/// can outlive the turn. Read by the web-channel surface when it bridges
+/// `ApprovalRequested` (the route is recorded before the event is published);
+/// `false` when no gate is installed or the request is unknown.
+pub fn is_detached_request(request_id: &str) -> bool {
+    ApprovalGate::try_global().is_some_and(|gate| gate.request_is_detached(request_id))
+}
+
+/// Whether a [`GateOutcome::Deny`] reason is a TTL expiry (the prompt went
+/// unanswered) rather than a refusal.
+pub fn is_unanswered_approval_reason(reason: &str) -> bool {
+    reason.contains(APPROVAL_UNANSWERED_PHRASE)
+}
+
+/// Per-turn chat context for routing a parked approval's yes/no reply back to
+/// the originating thread. The web channel hands it to the turn it starts
+/// (inside an [`ApprovalTurnContext`]); the turn's run context carries it to
+/// the gate and to the tools that read it. Absent for non-chat callers (CLI,
+/// detached sub-agents) — their approvals are simply not chat-routable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalChatContext {
+    pub thread_id: String,
+    pub client_id: String,
+    /// The turn currently running on this thread, when the caller has one in
+    /// scope. Carried through to `external_transfer_pending` (and any other
+    /// event this context backs) so the frontend can correlate a disclosure
+    /// to the turn that triggered it instead of only the thread.
+    pub request_id: Option<String>,
+}
+
+/// Per-run flow context (flow-approval-surface, PR2 of the tinyflows
+/// approval-surfacing design). `flows::ops::flows_run` / `flows_resume`
+/// hand it to the engine's capabilities, alongside the existing
+/// `Workflow` [`AgentTurnOrigin`](crate::security::turn_origin::AgentTurnOrigin),
+/// so a tool call parked from that run can correlate
+/// [`PendingApproval::source_context`](super::types::PendingApproval) back to
+/// the exact flow + run (the origin alone only carries `flow_id`, not
+/// `run_id`). Absent for every non-flow caller — chat, cron, background
+/// jobs, CLI never scope this.
+#[derive(Clone, Debug)]
+pub struct FlowRunContext {
+    pub flow_id: String,
+    pub run_id: String,
+}
+
+/// What the approval gate needs to know about the turn that owns a gated call,
+/// beyond the turn origin: where to route the yes/no reply, whether the turn is
+/// the Flow Canvas copilot, and which flow run it belongs to.
+///
+/// This is an explicit value, handed from the entry point that starts the turn
+/// to the gate check (and to the tools that route their own prompts) through
+/// the turn's run context. It used to be three ambient task-locals, which meant
+/// "no chat context" was indistinguishable from "this task lost its scope".
+///
+/// Deliberately **not** carried across a detached spawn: a detached sub-agent
+/// (`OpenHumanRunContext::detached_child`) starts with the default value, so
+/// its parks route via the origin as `detached` and survive the parent turn
+/// (#5499). Inline children clone their parent's value.
+#[derive(Clone, Debug, Default)]
+pub struct ApprovalTurnContext {
+    /// Thread/client to surface a parked approval to. `None` for non-chat
+    /// callers (CLI, cron, background, detached sub-agents).
+    pub chat: Option<ApprovalChatContext>,
+    /// The turn is the Flow Canvas copilot's streaming `flows_build` path: the
+    /// park window is clamped to [`COPILOT_APPROVAL_TTL`] instead of the gate's
+    /// own (possibly env-overridden) TTL. Plain main-chat `WebChat` turns leave
+    /// it `false` and keep the full [`DEFAULT_APPROVAL_TTL`].
+    pub copilot_stream: bool,
+    /// The flow run the turn belongs to, so a park stamps its
+    /// `PendingApproval::source_context` with the exact flow and run. `None`
+    /// for every non-flow caller.
+    pub flow_run: Option<FlowRunContext>,
+}
+
+impl ApprovalTurnContext {
+    /// A chat-routed turn.
+    pub fn chat(chat: ApprovalChatContext) -> Self {
+        Self {
+            chat: Some(chat),
+            ..Self::default()
+        }
+    }
+
+    /// Marks the turn as the Flow Canvas copilot's streaming build.
+    pub fn with_copilot_stream(mut self) -> Self {
+        self.copilot_stream = true;
+        self
+    }
+
+    /// Binds the turn to one flow run.
+    pub fn with_flow_run(mut self, flow_run: FlowRunContext) -> Self {
+        self.flow_run = Some(flow_run);
+        self
+    }
+
+    /// Whether the turn is interactive: a chat surface is attached to it.
+    pub fn is_interactive(&self) -> bool {
+        self.chat.is_some()
+    }
+}
+
+/// Parse a chat reply to a parked approval into a binary decision (v1). Only an
+/// explicit yes/no answer maps to a decision; anything else returns `None` — the
+/// web channel treats `None` as "not an answer", cancels the parked turn, and
+/// dispatches the message as a fresh user turn (so the user can redirect).
+pub fn parse_approval_reply(message: &str) -> Option<ApprovalDecision> {
+    match message.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" | "ok" | "okay" | "approve" | "approved" | "allow" => {
+            Some(ApprovalDecision::ApproveOnce)
+        }
+        "no" | "n" | "deny" | "denied" => Some(ApprovalDecision::Deny),
+        _ => None,
+    }
+}
+
+static GLOBAL_GATE: OnceLock<Arc<ApprovalGate>> = OnceLock::new();
+
+/// Snapshot of the host-aware boot decision the runtime made when it
+/// evaluated `OPENHUMAN_APPROVAL_GATE`. Surfaced to the UI banner via
+/// `approval_get_gate_state` so the user sees a banner the *first* time
+/// they open the app after an override was honored, not only when a
+/// connected socket happens to receive the boot-time domain event.
+///
+/// Set exactly once on boot from `bootstrap_core_runtime`; subsequent
+/// reads return the same snapshot for the lifetime of the process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovalGateBootState {
+    /// True when the gate was installed at boot.
+    pub installed: bool,
+    /// True when an `OPENHUMAN_APPROVAL_GATE=0` env override was honored
+    /// (CLI / Docker host) — the gate is OFF and external_effect tools
+    /// run unprompted. UI banners on this state.
+    pub disabled_by_env: bool,
+    /// True when an `OPENHUMAN_APPROVAL_GATE=0` env override was observed
+    /// but suppressed because the host is the Tauri desktop shell. UI
+    /// surfaces a softer one-shot info banner so the user knows the
+    /// override was rejected.
+    pub override_ignored: bool,
+    /// Host tag the boot decision keyed off — `tauri-shell` / `cli` /
+    /// `docker`. Pinned strings; downstream consumers may switch on this.
+    pub host: &'static str,
+}
+
+static BOOT_STATE: OnceLock<ApprovalGateBootState> = OnceLock::new();
+
+/// Record the host-aware boot decision so the UI / RPC layer can read it
+/// back. Idempotent — only the first call wins, mirroring the gate
+/// `OnceLock` install pattern.
+pub fn record_boot_state(state: ApprovalGateBootState) {
+    let _ = BOOT_STATE.set(state);
+}
+
+/// Read the recorded boot state. Returns `None` when `record_boot_state`
+/// was never called (e.g. older test paths that bring up the gate
+/// directly without going through `bootstrap_core_runtime`); RPC and UI
+/// callers treat that as "no banner needed".
+pub fn try_boot_state() -> Option<ApprovalGateBootState> {
+    BOOT_STATE.get().copied()
+}
+
+/// Routing correlation captured at park time for one `request_id`: the chat
+/// thread/client to surface a decision to, plus the gated tool call's
+/// provider-assigned call id. Looked up by [`ApprovalGate::take_request_route`]
+/// when a decision resolves so `DomainEvent::ApprovalDecided` can carry the
+/// same routing the original `ApprovalRequested` did, without re-deriving it
+/// from ambient task-locals that may no longer be in scope (a decision can
+/// resolve from an RPC call with no chat context of its own).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RequestRoute {
+    pub(crate) thread_id: Option<String>,
+    pub(crate) client_id: Option<String>,
+    pub(crate) tool_call_id: Option<String>,
+    pub(crate) forced: bool,
+    pub(crate) agent_id: Option<String>,
+    /// Instance barrier captured at registration, independent of decision context.
+    pub(crate) approval_scope: Option<Arc<super::ApprovalScope>>,
+    /// The [`thread_route_key`] the request was parked under, so a decision
+    /// made outside the parking task's scope clears the right route.
+    pub(crate) thread_key: Option<String>,
+    /// The park can outlive the chat turn it is shown on — an async-delegated
+    /// sub-agent routed through the origin fallback (#5499). Carried so the
+    /// replay path re-emits the same `detached` flag the live event had.
+    pub(crate) detached: bool,
+    /// The store the request was parked in, captured under the parking task's
+    /// storage scope, so a decision made from outside that scope (an RPC with
+    /// no agent or profile of its own) reaches the row where it was written.
+    pub(super) docs: Option<super::store_documents::Docs>,
+}
+
+/// Coordinator for pending approvals.
+pub struct ApprovalGate {
+    config: Config,
+    session_id: String,
+    ttl: Duration,
+    waiters: Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>,
+    /// [`thread_route_key`] → request_id for the approval currently parked on
+    /// that chat thread, so the web channel can route a yes/no reply to
+    /// `approval_decide`.
+    /// In-memory only (session-scoped — a parked approval doesn't survive a
+    /// restart, and the oneshot waiter is in-memory anyway).
+    thread_to_request: Mutex<HashMap<String, String>>,
+    /// request_id → [`RequestRoute`] for every currently-parked call. Populated
+    /// at park time (`intercept_audited_inner`), consulted when a decision
+    /// resolves (`decide`, and the TTL/channel-drop paths in
+    /// `gate_intercept.rs`) so `ApprovalDecided` can mirror the same
+    /// thread/client/tool_call_id the original `ApprovalRequested` carried.
+    request_routes: Mutex<HashMap<String, RequestRoute>>,
+}
+
+/// RAII guard that tears the parked waiter down even when the surrounding turn
+/// future is dropped mid-park.
+///
+/// `intercept_audited_inner` only runs its cleanup (`evict_waiter` /
+/// `store::decide(Deny)` / routing-map removal) inside the
+/// `tokio::time::timeout(...).await` match arms — i.e. only when the park
+/// resolves *normally*. Once a turn future can be torn down *externally* — the
+/// harness `max_wall_clock_ms` backstop (#4746) or the outer web backstop
+/// (#4751) firing while a tool call is parked — dropping the future skips those
+/// arms entirely, leaving the in-memory waiter, the thread routing
+/// mappings, and the `pending_approvals` row dangling until the store TTL
+/// sweeps them. A later yes/no arriving before that expiry would then route to a
+/// dead request and return without starting a fresh turn (#4774).
+///
+/// The guard is created just before the park await and [`disarm`](Self::disarm)ed
+/// on every normal exit (the match arm already ran the exact teardown for its
+/// outcome), so its `Drop` fires *only* on external cancellation.
+struct WaiterGuard<'a> {
+    gate: &'a ApprovalGate,
+    request_id: String,
+    thread_key: Option<String>,
+    /// Storage scope of the parking call, kept for `Drop`: the acting agent's
+    /// task-local is gone by then.
+    docs: Result<super::store_documents::Docs, String>,
+    armed: bool,
+}
+
+impl WaiterGuard<'_> {
+    /// Mark the park as resolved normally so `Drop` becomes a no-op.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // External teardown: the normal cleanup was skipped. Evict the waiter,
+        // drop the routing mapping so a later chat reply is not
+        // mis-routed to this now-dead request, and deny the still-open pending
+        // row. `store::decide` is `WHERE decided_at IS NULL`, so a decision that
+        // committed in the same instant is honored rather than overwritten.
+        self.gate.evict_waiter(&self.request_id);
+        // Only clear the routing entry when it still points at *this* request.
+        // On external teardown a replacement turn can park a new approval on the
+        // same thread and overwrite the mapping before this guard drops;
+        // an unconditional `remove` would delete the *new* request's routing, so
+        // the next typed yes/no would fall through as a fresh chat turn instead
+        // of resolving the live gate (#4774).
+        if let Some(thread_key) = &self.thread_key {
+            self.gate
+                .clear_thread_route_if_owned(thread_key, &self.request_id);
+        }
+        let decided = store::decide_captured(&self.docs, &self.request_id, ApprovalDecision::Deny);
+        if let Ok(Some(row)) = decided {
+            let route = self.gate.take_request_route(&self.request_id);
+            BUS.publish(DomainEvent::ApprovalDecided {
+                request_id: row.request_id,
+                tool_name: row.tool_name,
+                decision: ApprovalDecision::Deny.as_str().to_string(),
+                thread_id: route.as_ref().and_then(|r| r.thread_id.clone()),
+                client_id: route.as_ref().and_then(|r| r.client_id.clone()),
+                tool_call_id: route.and_then(|r| r.tool_call_id),
+                resolution: Some("cancelled".to_string()),
+                agent_id: row.agent_id,
+            });
+        }
+        tracing::warn!(
+            request_id = %self.request_id,
+            "[approval::gate] parked approval future dropped mid-park (external turn teardown) — \
+             evicted waiter, cleared routing, denied pending row (#4774)"
+        );
+    }
+}
+
+include!("gate_setup.rs");
+include!("gate_intercept.rs");
+include!("gate_intercept_decision.rs");
+include!("gate_state.rs");
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Surfaces a flow-origin park as a `CoreNotification` (category `Agents`,
+/// `kind: "flow-gate-approval"`) with three action buttons matching the
+/// [`ApprovalDecision`] variants a flow-scoped approval accepts:
+/// `approve_once` / `approve_always_for_flow` / `deny`. Each action's payload
+/// carries the same `{kind, request_id, flow_id, tool_name, summary}` shape
+/// (plus `run_id`, additive) so the frontend can dispatch straight to
+/// `approval_decide` without a second round-trip to fetch the pending row.
+///
+/// Mirrors `flows::ops::notify_pending_approval` (the tinyflows-native
+/// per-node HITL gate's notification) but is a distinct surface: this one
+/// fires from the *tool-call* `ApprovalGate`, not the graph's own
+/// `require_approval` gate node.
+/// `workspace` is the handle and revision of the workspace the flow parked in.
+/// This publisher bypasses the notification bridge that stamps workspace
+/// identity, and the approval gate itself is process-wide — so without the
+/// binding, the banner stays actionable after a workspace switch and approves
+/// another workspace's pending call from inside the one the user moved to
+/// (#5966). `None` only when the workspace could not be resolved; the caller
+/// says why that fails open.
+fn publish_flow_gate_notification(
+    request_id: &str,
+    flow_id: &str,
+    run_id: &str,
+    tool_name: &str,
+    summary: &str,
+    workspace: Option<(String, u64)>,
+) {
+    use crate::desktop::notifications::bus::publish_core_notification;
+    use crate::desktop::notifications::types::{
+        CoreNotificationAction, CoreNotificationCategory, CoreNotificationEvent,
+    };
+
+    const KIND: &str = "flow-gate-approval";
+    let base_payload = |action: ApprovalDecision| {
+        serde_json::json!({
+            "kind": KIND,
+            "request_id": request_id,
+            "flow_id": flow_id,
+            "run_id": run_id,
+            "tool_name": tool_name,
+            "summary": summary,
+            "decision": action.as_str(),
+        })
+    };
+
+    publish_core_notification(CoreNotificationEvent {
+        id: format!("{KIND}:{request_id}"),
+        category: CoreNotificationCategory::Agents,
+        title: "Workflow needs approval".to_string(),
+        body: format!("\"{tool_name}\" — {summary}"),
+        deep_link: None,
+        timestamp_ms: now_ms(),
+        actions: Some(vec![
+            CoreNotificationAction {
+                action_id: "approve_once".to_string(),
+                label: "Approve once".to_string(),
+                payload: Some(base_payload(ApprovalDecision::ApproveOnce)),
+            },
+            CoreNotificationAction {
+                action_id: "approve_always_for_flow".to_string(),
+                label: "Always allow for this workflow".to_string(),
+                payload: Some(base_payload(ApprovalDecision::ApproveAlwaysForFlow)),
+            },
+            CoreNotificationAction {
+                action_id: "deny".to_string(),
+                label: "Deny".to_string(),
+                payload: Some(base_payload(ApprovalDecision::Deny)),
+            },
+        ]),
+        workspace: workspace.as_ref().map(|(handle, _)| handle.clone()),
+        workspace_revision: workspace.map(|(_, revision)| revision),
+    });
+}
+
+#[cfg(test)]
+#[path = "gate_tests.rs"]
+mod tests;

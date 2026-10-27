@@ -1,0 +1,238 @@
+use super::*;
+
+fn base() -> Config {
+    let mut config = Config::default();
+    config.default_model = Some("test-model".to_string());
+    config
+}
+
+#[test]
+fn maps_the_path_roots_verbatim() {
+    let c = base();
+    let s = session_config_from(&c).unwrap();
+    assert_eq!(s.workspace_dir, c.workspace_dir);
+    assert_eq!(s.action_dir, c.action_dir);
+}
+
+#[test]
+fn missing_model_is_reported_without_inventing_a_default() {
+    let mut c = base();
+    c.default_model = None;
+    assert!(session_config_from(&c).is_err());
+
+    c.default_model = Some("some-model".into());
+    assert_eq!(session_config_from(&c).unwrap().model, "some-model");
+}
+
+#[test]
+fn turn_limits_come_from_the_agent_section() {
+    let mut c = base();
+    c.agent.max_tool_iterations = 7;
+    c.agent.max_history_messages = 11;
+    c.agent.parallel_tools = true;
+    c.agent.max_parallel_tools = 3;
+    c.agent.agent_timeout_secs = 45;
+    // Set away from the default so a dropped assignment fails here. A
+    // default-valued field is invisible to `default_config_maps_to_the_
+    // crate_defaults` (it compares against `TurnConfig::default()`) and to
+    // `per_section_mappers_agree_with_the_composed_one` (which compares
+    // `turn_config_from` against itself), so this is the only test that can
+    // catch it.
+    c.agent.compact_context = !AgentConfig::default().compact_context;
+    c.agent.tool_result_budget_bytes = 4242;
+
+    let t = session_config_from(&c).unwrap().turn;
+    assert_eq!(t.max_tool_iterations, 7);
+    assert_eq!(t.max_history_messages, 11);
+    assert!(t.parallel_tools);
+    assert_eq!(t.max_parallel_tools, 3);
+    assert_eq!(t.timeout_secs, 45);
+    assert_eq!(t.compact_context, !AgentConfig::default().compact_context);
+    assert_eq!(t.tool_result_budget_bytes, 4242);
+}
+
+#[test]
+fn default_config_maps_to_the_crate_defaults() {
+    // The two schemas drifting apart is the failure mode this whole mapper
+    // exists to make visible, so pin that an unconfigured host produces an
+    // unconfigured crate config.
+    let s = session_config_from(&base()).unwrap();
+    assert_eq!(s.turn, TurnConfig::default());
+    // The default dialect is `auto` (native, else JSON-in-tag), never a code
+    // dialect: python-style calls mis-parse on too many models.
+    assert_eq!(s.tools.dispatcher, ToolDispatcher::Auto);
+    assert_eq!(s.tools, ToolConfig::default());
+}
+
+#[test]
+fn every_dispatcher_spelling_maps_and_unknown_falls_back_to_auto() {
+    for (raw, want) in [
+        ("auto", ToolDispatcher::Auto),
+        ("native", ToolDispatcher::Native),
+        ("xml", ToolDispatcher::Xml),
+        ("pformat", ToolDispatcher::Pformat),
+        ("python", ToolDispatcher::Python),
+        ("typescript", ToolDispatcher::Typescript),
+        // Case and surrounding whitespace are tolerated.
+        ("  NATIVE ", ToolDispatcher::Native),
+        // A typo must not fail the session.
+        ("nativ", ToolDispatcher::Auto),
+        ("", ToolDispatcher::Auto),
+    ] {
+        assert_eq!(dispatcher_from(raw), want, "mapping {raw:?}");
+    }
+}
+
+#[test]
+fn required_output_contract_is_carried_across() {
+    let mut c = base();
+    c.agent.required_output = Some(crate::config::RequiredOutputContract {
+        block_key: "thoughts".into(),
+        required_keys: vec!["next_action".into()],
+    });
+
+    let r = session_config_from(&c)
+        .unwrap()
+        .turn
+        .required_output
+        .expect("contract is mapped");
+    assert_eq!(r.block_key, "thoughts");
+    assert_eq!(r.required_keys, vec!["next_action".to_string()]);
+    assert!(r.is_active());
+}
+
+#[test]
+fn apply_agent_config_overrides_the_global_agent_section() {
+    // The session builder takes a per-agent AgentConfig override. Mapping
+    // only from the global Config would silently discard it and run every
+    // agent on the global limits — this is the regression that guards it.
+    let mut c = base();
+    c.agent.max_tool_iterations = 3;
+
+    let mut s = session_config_from(&c).unwrap();
+    assert_eq!(s.turn.max_tool_iterations, 3, "global applies first");
+
+    let mut per_agent = AgentConfig::default();
+    per_agent.max_tool_iterations = 25;
+    per_agent.agents_md_enabled = false;
+    apply_agent_config(&mut s, &per_agent);
+
+    assert_eq!(s.turn.max_tool_iterations, 25);
+    assert!(!s.agents_md_enabled);
+    // Path roots and model are session-level and must survive the overlay.
+    assert_eq!(s.workspace_dir, c.workspace_dir);
+    assert_eq!(s.model, session_config_from(&c).unwrap().model);
+}
+
+#[test]
+fn per_section_mappers_agree_with_the_composed_one() {
+    let mut c = base();
+    c.agent.max_history_messages = 9;
+    c.agent.tool_dispatcher = "pformat".into();
+
+    let s = session_config_from(&c).unwrap();
+    assert_eq!(s.turn, turn_config_from(&c.agent));
+    assert_eq!(s.tools, tool_config_from(&c.agent));
+    assert_eq!(s.tools.dispatcher, ToolDispatcher::Pformat);
+}
+
+#[test]
+fn required_output_from_preserves_key_semantics() {
+    let host = RequiredOutputContract {
+        block_key: "thoughts".into(),
+        required_keys: vec!["next_action".into()],
+    };
+    let crate_side = required_output_from(&host);
+    assert_eq!(crate_side.all_keys(), host.all_keys());
+    assert_eq!(crate_side.is_active(), host.is_active());
+
+    // The inert case must agree too — that is the one that decides whether
+    // enforcement runs at all.
+    let inert = RequiredOutputContract {
+        block_key: "  ".into(),
+        required_keys: vec!["next_action".into()],
+    };
+    let inert_crate = required_output_from(&inert);
+    assert_eq!(inert_crate.all_keys(), inert.all_keys());
+    assert!(!inert_crate.is_active());
+    assert!(!inert.is_active());
+}
+
+#[test]
+fn base_mapping_implies_no_delegation_and_no_model_pins() {
+    let s = session_config_from(&base()).unwrap();
+    assert_eq!(s.max_depth, 0, "depth is per-delegate, not global");
+    assert!(!s.may_delegate_at(0));
+    assert!(s.lead_model.is_none());
+    assert!(s.subagent_model.is_none());
+}
+
+#[test]
+fn team_pins_apply_and_a_missing_team_is_a_no_op() {
+    let mut c = base();
+    c.teams.insert(
+        "research".into(),
+        crate::config::TeamModelConfig {
+            lead_model: Some("opus".into()),
+            agent_model: Some("haiku".into()),
+        },
+    );
+
+    let mut s = session_config_from(&c).unwrap();
+    apply_team_models(&mut s, &c, "research");
+    assert_eq!(s.effective_lead_model(), "opus");
+    assert_eq!(s.effective_subagent_model(), "haiku");
+
+    // An unknown team leaves the session exactly as it was.
+    let mut untouched = session_config_from(&c).unwrap();
+    let before = untouched.clone();
+    apply_team_models(&mut untouched, &c, "no-such-team");
+    assert_eq!(untouched, before);
+}
+
+/// `TeamModelConfig`'s own doc: "Callers fall back across the pair so
+/// configs can specify only one tier without breaking routing." A team that
+/// pins one model means that model for both tiers — leaving the other on the
+/// **global** default would silently run half the team on a model the user
+/// did not choose for this team.
+#[test]
+fn a_team_pinning_only_one_tier_applies_it_to_both() {
+    let mut c = base();
+    c.default_model = Some("sonnet".into());
+    c.teams.insert(
+        "solo".into(),
+        crate::config::TeamModelConfig {
+            lead_model: Some("opus".into()),
+            agent_model: None,
+        },
+    );
+
+    let mut s = session_config_from(&c).unwrap();
+    apply_team_models(&mut s, &c, "solo");
+    assert_eq!(s.effective_lead_model(), "opus");
+    assert_eq!(
+        s.effective_subagent_model(),
+        "opus",
+        "a single pin covers both tiers"
+    );
+}
+
+/// A blank pin is not a pin. Without the trim-and-drop it would replace a
+/// working default with the empty string and fail at dispatch instead.
+#[test]
+fn a_blank_team_pin_does_not_displace_the_default() {
+    let mut c = base();
+    c.default_model = Some("sonnet".into());
+    c.teams.insert(
+        "blank".into(),
+        crate::config::TeamModelConfig {
+            lead_model: Some("   ".into()),
+            agent_model: None,
+        },
+    );
+
+    let mut s = session_config_from(&c).unwrap();
+    apply_team_models(&mut s, &c, "blank");
+    assert_eq!(s.effective_lead_model(), "sonnet");
+    assert_eq!(s.effective_subagent_model(), "sonnet");
+}

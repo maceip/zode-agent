@@ -1,0 +1,737 @@
+# Kimi
+
+Independent inventories: skills, commands, MCP servers and tools return unsupported on the selected interface. The separately probed Web API is not used.
+See the [query contract](../spec/inventory.md) and [native probe evidence](inventory.md).
+
+Evidence baseline: native source
+[`kimi-code` `f9ca33376`](https://github.com/MoonshotAI/kimi-code/tree/f9ca33376)
+(0.41.0, reviewed 2026-09-08). The
+[wire snapshot](../../tests/replay/fixtures/kimi-acp-v1.vendor.json) is
+**0.38.0** (2026-08-26; `acp-runtime.ts kimi` ran on it 2026-08-27). Live
+observations come from **kimi 0.42.0** (`agentInfo.name` "Kimi Code CLI",
+darwin arm64, default model `kimi-code/k3`, no `--model`), 2026-09-11, through
+[`experiments/live-contract.ts kimi`](../../experiments/live-contract.ts)
+(scenario names in parentheses below) and the kimi probes in the
+[experiments index](../../experiments/README.md): `kimi-wire-tap.ts`,
+`kimi-usage-update-order.ts live`, `kimi-steer-or-queue.ts`. All of them pass
+on **kimi 2.0.0** (2026-09-18, live-contract 13/13; its `thinking` values are
+under [Effort](#models-instructions-and-context)). The newest checked release
+is **kimi 2.3.2** (2026-10-25): all 11 scripted-provider vendor tests and
+15 shared behavior cases passed on the first run, with four behavior skips
+([version check](../../experiments/runtime-version-checks/2026-10-25.md#kimi-232)).
+The earlier 2.3.0 hook-test initialization timeout did not recur. That test
+uses a shortened 2,000 ms `requestTimeoutMs`, while OAR's Kimi request
+default is 30 seconds; the earlier failure did not establish a user-facing
+timeout or its cause
+([October 21 evidence](../../experiments/runtime-version-checks/2026-10-21.md#kimi-230)).
+Facts from later binaries name their version. Versions are
+evidence baselines, not a support range. The [spec](../spec/README.md) is the
+contract the adapter implements, not evidence of this adapter's behavior; see
+the [runtime index](README.md) for status conventions.
+
+## Native concepts and calling interfaces
+
+This page concerns the TypeScript **MoonshotAI/kimi-code** harness. The
+separate [Python kimi-cli](https://github.com/MoonshotAI/kimi-cli) is not
+interchangeable evidence despite overlapping command and product names.
+
+A native session is a persistent workspace/conversation container. Inside it,
+agents have their own context, turns, tool calls, and event scopes. Session
+identity, agent identity, numeric turn IDs, and prompt IDs have distinct
+roles. Children are native agents with their own lifecycle, including
+background execution.
+
+Kimi offers a terminal application and several programmatic surfaces: the
+Node SDK (`KimiHarness`/`Session`), native KAP/klient services, and `kimi acp`
+for ACP JSON-RPC over stdio. These interfaces expose different subsets.
+The [Node Session](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/node-sdk/src/session.ts#L140-L200)
+has prompt/steer methods and approval/question handlers. Native
+[agent services](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/klient/src/contract/agent/services.ts#L28-L55)
+separate submission from cancellation. ACP instead binds
+[`klient.session(sessionId).agent('main')`](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/acp-server/src/session.ts#L249-L344)
+and translates that agent's event stream, so one ACP session does not expose
+every agent in the native session. OAR uses `kimi acp`.
+
+## High-level mapping to OAR
+
+OAR exposes one ordered record stream per Session
+([contract](../../packages/oar/src/contracts/session.ts)). Every ACP frame is
+recorded verbatim as a frame's `native`; the cross-runtime `events` are what
+OAR read out of it. Control calls are request/response record pairs. The
+profile declares `capabilities` `{ queue: { durable: false }, attribution:
+"opaque" }`, with `images` read from `initialize`; the session has no
+`steer`.
+
+| Native concept or owner | Current OAR mapping |
+| --- | --- |
+| `kimi-code` executable | One `kimi acp` subprocess per OAR Session, spawned in the session `cwd` with the env overlay; its exit is an `exited` response record (answering `dispose` when OAR caused it, `requestId ""` when the process died on its own). |
+| Persistent native session | `Session.id` is the native `sessionId`; `SessionOptions.resume` attaches through ACP `session/resume` with a fresh stream (seq 0, no history rebuild), only in the session's own directory. |
+| Handshake answers and opening pushes | `initialize`, `authenticate`, `session/new`/`resume`/`load`, `session/set_model`, `session/set_config_option` answers are frame records with `model` and `effort` events where they report one (the `thinking` option's current value is the effort); pushes arriving while opening (`available_commands_update`, `current_mode_update`, `config_option_update`) are recorded in arrival order, so `Session.model()` and `effort()` are folds over the stream. |
+| Native agent and turn | Only ACP's `main` agent reaches this transport; every `session/update` is one frame with `native` verbatim. No `spanId` (ACP updates carry no turn id). |
+| Prompt, steer, queue, and cancel | `prompt()` is a `toRuntime` request whose `session/prompt` answer carries `turn_ended`. The session has no `steer` (no ACP method); `queue()` is a host-memory FIFO; `abort()` is `session/cancel` with a kill fallback. |
+| Typed events, history, and child graph | Events for message/thought/tool/usage/model updates; unknown kinds recorded with no events. No child session arrives on this transport, so the graph holds the root only. |
+| Client execution and interaction duties | Every reverse request (`session/request_permission`, `terminal/*`) is a `toApp` request record (verbatim, under the runtime's JSON-RPC id) and OAR's fixed-policy answer the `answered` response; `events()` reads the pair as `app_request` (method as `type`) and `app_answered`. |
+
+See the [Kimi profile](../../packages/oar/src/runtimes/kimi/session.ts),
+[ACP opening path](../../packages/oar/src/shared/acp/profile.ts),
+[session controller](../../packages/oar/src/shared/acp/session.ts),
+[record placement](../../packages/oar/src/shared/acp/records.ts),
+[turn machinery](../../packages/oar/src/shared/acp/turns.ts),
+[event projection](../../packages/oar/src/shared/acp/projection.ts), and
+[client app](../../packages/oar/src/shared/acp/client-app.ts), alongside
+the [native ACP reference](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/docs/en/reference/kimi-acp.md).
+
+ACP `tool_call_update` reports `status: "completed" | "failed"` ([src]
+ACP schema `ToolCallStatus`); OAR maps those to `tool_call_ended.result:
+"ok" | "failed"`, and a non-terminal or missing status leaves the field
+absent. "Transport-limited" below means the selected native boundary already
+loses the capability.
+
+## Capability details
+
+### Session creation and resume
+
+Native ACP requires `initialize` with the protocol version and client
+capabilities. `authenticate { methodId: "login" }` validates readiness rather
+than starting login: the
+[auth gate](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/acp-server/src/server.ts#L626-L645)
+accepts engine-ready credentials, with an OAuth-summary fallback.
+`session/new { cwd, mcpServers, additionalDirectories? }` returns an
+engine-generated `sessionId`, `configOptions`, and `modes`.
+
+**What the runtime advertises (0.42.0):** `initialize` answers `loadSession:
+true`, `sessionCapabilities` `list`/`resume`/`close`/`delete`/`fork`/
+`additionalDirectories`, `promptCapabilities` image + embeddedContext (no
+audio), `mcpCapabilities` http + sse, and one auth method `login`
+(`type: "terminal"`, a device-code flow OAR never starts). `session/new`
+answers `sessionId`, `configOptions` (`model`, `thinking`, `mode` with
+`default`/`plan`/`auto`/`yolo`) and `modes` (the same four); the model
+catalog and `thinking` values are under
+[Models](#models-instructions-and-context).
+
+**Mapped:** OAR launches `kimi acp` (initialize declares `fs` read/write
+`false`, `terminal: true`, `clientInfo` `oar`), selects the advertised `login`
+method, passes the session's `mcpServers` (`[]` without them; see
+[session MCP servers](#session-mcp-servers)), applies a requested model through
+`session/set_model`, then selects yolo through `session/set_mode` when the
+answer advertises it (in `modes` or the `mode` config option). `session/new`
+and `session/resume` each have a 630-second deadline to allow SessionStart
+hooks. All other bounded ACP requests retain 30 seconds, including
+initialize, authentication, session/list, session/load, model and mode
+configuration; spawn, auth, and creation failures reject
+session construction with the process killed. The opening stream is six
+records: `initialize`, `authenticate` (`{}`), `session/new` (model event),
+then three pushes: `available_commands_update` (the slash commands, `compact`
+first) right after the `session/new` answer, and `current_mode_update`
+(`yolo`) plus `config_option_update` (model event again) between the
+`session/set_mode` request and its `{}` answer. Opening takes about 1.9 s
+(`basic`). Credentials and persisted sessions must be accessible in the
+subprocess's configured data root.
+
+**SessionStart hooks (2.2.0, 2026-10-20):** new and cold-resumed sessions
+both await configured hooks, but ACP forwards no hook-start or hook-finish
+notification. The server awaits session creation or restoration before
+wiring the session event subscriptions. Direct ACP and OAR tests used a
+2.4-second real hook in a temporary home: both opens waited for it, sent no
+model request, and exposed no hook progress. The native
+[regression](../../sea-trial/vendor/kimi-open-hooks.vendor.test.ts) also
+checks process-tree cleanup when the bound expires.
+
+The 2.2.0 hook configuration accepts integer timeouts from 1 to 600 seconds;
+the default is 30. Hooks matching the same event run concurrently through
+`Promise.all`, not one after another. OAR's fixed 630 seconds leave the full
+600-second hook allowance plus the usual 30 seconds for startup. Without
+progress frames OAR cannot distinguish a hook from a genuine hang, so a
+stuck new/resume request also waits up to ten minutes and thirty seconds
+before failing. This is a bound on the entire request, not a fresh allowance
+per hook: any total opening work exceeding it is refused.
+[Configuration schema](https://github.com/MoonshotAI/kimi-code/blob/472192c34c1efad89a369870eff0da0b708ce9bb/packages/agent-core-v2/src/features/externalHooks/configSection.ts),
+[hook dispatcher](https://github.com/MoonshotAI/kimi-code/blob/472192c34c1efad89a369870eff0da0b708ce9bb/packages/agent-core-v2/src/features/externalHooks/internal/matchHooks.ts),
+[ACP server](https://github.com/MoonshotAI/kimi-code/blob/472192c34c1efad89a369870eff0da0b708ce9bb/packages/acp-server/src/server.ts),
+[deadline regressions](../../tests/acp/acp-open-timeouts.test.ts).
+
+**Resume (mapped):** native `session/resume { sessionId, cwd, mcpServers,
+additionalDirectories? }` restores the existing session and returns
+`configOptions` and `modes` **without history replay**; `session/load` has the
+same request shape but awaits ordered history `session/update` notifications
+before responding (history is not a response messages array). The
+[handlers](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/acp-server/src/server.ts#L296-L322)
+ignore `cwd`, warn and ignore `additionalDirectories`, and pass MCP settings
+to restore; [cold restore](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/acp-server/src/server.ts#L533-L570)
+can apply those ephemeral servers, already-live sessions pass through.
+Unknown IDs return `invalid_params` (`-32602`); missing authentication returns
+`auth_required` (`-32000`). Neither creates a substitute session.
+
+Because the handlers ignore `cwd`, a resume that names another directory runs
+in the session's own: live (2.1.1, 2026-10-03), a resume naming B ran its
+shell as `cd <A> && pwd`. OAR therefore (profile flag
+`resumeKeepsSessionCwd`) pages through the advertised `session/list` before
+resuming, without recording it, and when the session is listed under another
+directory `session()` rejects with an `UnsupportedOptionError` on `cwd` whose
+message names both directories ([resume in another directory](resume-cwd.md),
+[test](../../tests/acp/acp-resume-cwd.test.ts)). If a complete list has no
+matching id and the native resume then fails, OAR throws
+`SessionNotFoundError`, preserving the resume method/native error in `cause`.
+No missing claim is made from an unavailable or incomplete list, or from
+`-32602` alone; authentication refusals keep their existing type
+([missing targets](../spec/runtime-matrix.md#missing-resume-targets)).
+
+```ts
+const resumed = await kimiRuntime.session(installation, {
+  cwd,
+  resume: previousSessionId, // Exact earlier Session.id, not an agent/turn ID.
+});
+const next = resumed.prompt("Continue");
+```
+
+OAR selects `session/resume` when `sessionCapabilities.resume` is `true` or
+an object, otherwise `session/load` when `loadSession === true`, otherwise
+rejects; it does not retry a failed resume as load. The resume answer carries
+`configOptions` + `modes` only (no `sessionId`, nothing replayed on the wire);
+the resumed stream restarts at seq 0 with the same six-record opening,
+`session/resume` in place of `session/new`, and `Session.id` is the supplied
+earlier id. The next prompt recalls what was taught before disposal (`resume`
+scenario: a codeword). No Turn handle or transcript is restored; history
+pushed during a `session/load` opening is not retained. Concurrent same-ID
+controllers and continuing in-flight work across OAR subprocesses are
+**unverified**.
+
+The Node SDK separately offers
+[`harness.resumeSession({ id, includeSubagents?, replayTurnLimit?, ... })`](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/node-sdk/src/types.ts#L222-L237),
+which returns a native Session and [reuses/coalesces facades](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/node-sdk/src/kimi-harness.ts#L166-L225)
+for active or identical concurrent resumes inside that harness; ACP uses
+`klient.session(id).restore()` and rebuilds its main-agent wrapper. OAR
+neither exposes the SDK replay options nor inherits its coalescing guarantee
+(source facts, not observed on the 0.38.0 snapshot). Native ACP also
+implements session list, delete, and fork; OAR exposes **none** of those (it
+reads `session/list` only for the directory check above): resume is neither a
+session browser nor a fork API.
+
+### Prompt, steering, queueing, and abort
+
+Native `session/prompt { sessionId, prompt: [{ type: "text", text }] }`
+streams updates and returns a `stopReason`. Attachment submits no prompt.
+The native ACP driver buffers events arriving before the launch returns a
+turn ID and can bind a `session/cancel` request to that eventual ID. Native
+ACP accepts image and resource blocks. OAR sends `InputOptions.images` as
+`image` blocks (`data`, `mimeType`, the file as `uri`) before the text block,
+because `initialize` advertises `promptCapabilities.image`
+(`capabilities.images` is read from it). Live (kimi 2.0.0, model
+`kimi-code/k3`, 2026-09-29), asked the color of a plain green PNG, it
+answered `green`.
+
+For image-only input OAR sends ACP image blocks without a text block, and
+kimi forwards only an `image_url` content part to a scripted chat
+completions provider (kimi 2.2.0, [image-only provider test](../../sea-trial/vendor/image-only.vendor.test.ts),
+which declares the model's `image_in` capability).
+
+**Prompt (mapped):** `prompt(string)` records a prompt request answered
+`accepted` once the RPC is on the wire, or `rejected` (`busy` during a turn,
+as in `busy-and-late-control`; the transport error when the process is gone). The
+RPC answer is recorded as frame `session/prompt` with the `turn_ended`
+event; an RPC error answer as `session/prompt/error` with a failed end
+([test](../../tests/acp/acp-session.test.ts)).
+
+**Steer (not available on this transport):** the native SDK and agent
+services support steering, but the ACP method set has no steer operation, so
+the session has no `steer`: a host reads the absent member, not a runtime
+name. `steerOrQueue()` and `deliver()` therefore queue: the queue request is
+accepted and the input runs after the current turn; no steer request is
+recorded (`kimi-steer-or-queue.ts` on kimi 0.42.0 and 2.0.0, run while OAR
+still rejected a `steer()` before queueing).
+
+**Queue (mapped):** `queue()` is a host-memory FIFO
+(`capabilities.queue.durable: false`, no claim about native queue
+durability), drained one input per turn end; the drained input runs as a
+spontaneous turn with its own `session/prompt` answer and no prompt request
+of its own (`queue`). Held input is dropped once the runtime is unreachable.
+`withdraw(inputId)` takes an input out of the FIFO before it is prompted
+(`accepted`) and answers `not_queued` after; kimi's `session/cancel` targets
+the running turn, not held input ([input cancellation](input-cancellation.md),
+[test](../../tests/acp/acp-session-withdraw.test.ts)).
+
+**Abort (mapped):** `abort()` sends `session/cancel` (a notification, so
+the `accepted` answer carries no `native`) and is `rejected no active
+turn` after the turn. Kimi then asks the client to `terminal/kill` the running
+command, `wait_for_exit` answers `SIGTERM`, the tool ends `status: "failed"`,
+and the prompt answers `stopReason: "cancelled"` about one second later,
+recorded as `turn_ended: aborted` (`abort`). If the cancelled prompt is not
+answered within ten seconds OAR kills the process and the `exited` response
+is the turn's end, read as `aborted` after the accepted cancel. The exit
+code is retained; the fallback has not been needed live. Kimi still pushes
+the turn's `usage_update` after a cancelled answer (about 1 ms later); the
+usage gate does not wait while aborting, so on an aborted turn that record
+lands after the turn end. Effects on background children are **unverified**.
+
+**Outcomes:** native ACP [maps most non-auth failures to `end_turn`](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/acp-server/src/events-map.ts#L59-L74);
+blocked/filtered cases become `refusal`, while auth failures use the RPC
+error channel. OAR's `turn_ended` event maps `cancelled` to aborted and every
+other stop reason to completed; the answer itself is in the event's `native`,
+so a consumer can still read `refusal` or any other stop reason. This
+separates loss before OAR receives a response (native) from OAR's reading
+(the event). Opening with an unknown model makes `session/set_model` answer a
+JSON-RPC error `-32603 "Internal error"` with `data.details` `Model "<id>" is
+not configured in config.toml.`; session construction rejects with the SDK's
+`RequestError` (message `Internal error`, the details on its `data`) and no
+OAR session or log exists (`bad-model`).
+
+**Unreachable runtime:** `dispose()` mid-turn runs the cancel path, then
+`session/close` (advertised; answered `{}`), then the kill; the dispose
+request is answered by the `exited` response (`dispose-mid-turn`). If no
+native turn end came first, the folds read this exit as `aborted`. The exit
+code is `null` (signal), except when the process exits `0` on `session/close`
+before the kill (seen once, `subagent`). When `kimi acp` dies on its own
+(SIGKILL mid-turn), the stream gets an `exited` response with `requestId ""`
+and `code: null`, which is the turn's end (read as failed /
+`runtime_exited`); a later `prompt()` is rejected and a later `dispose()` is a
+request answered `accepted` without further work (`kill-runtime`;
+[test](../../tests/acp/acp-kimi-wire-shapes.test.ts)).
+
+### Observation, children, and history
+
+**Mapped:** every update is a frame with `native` verbatim; events carry
+text (`agent_message_chunk` → `text_delta`), reasoning, tool boundaries,
+context snapshots, and model reports. Reasoning arrives as
+`agent_thought_chunk` text deltas ending with an empty chunk (`reasoning:
+empty`); `session_info_update` (the session title) is recorded with no events
+after each first prompt. Native `${turnId}:${toolCallId}` wire IDs survive as
+call IDs. Detail strings truncate at 10,000 characters (`native` does not);
+tool progress/status distinctions are in `native` only; a tool the runtime
+never ended gets no synthetic end. Kimi reports no retry through ACP, so
+`retry` never appears. `Session.usage().total` stays `null`: no frame carries
+token totals, only `usage_update` context, so there is no `cacheRead` or
+`cacheWrite` either.
+
+**Known gap: a failed turn looks completed.** Against a scripted provider
+(2.1.1, [failure evidence](../spec/runtime-matrix.md#failure-evidence); the
+auth and rate-limit cases again on 2.2.0,
+[vendor test](../../sea-trial/vendor/failure-classes-acp.vendor.test.ts)), only
+an authentication failure reaches ACP (`session/prompt` error -32000
+"Authentication required: 401 …"). A rate limit, usage limit, billing error,
+server error, overload, a model the provider refuses, or an oversized context
+ends the prompt `stopReason: end_turn` with no message, after kimi's own
+retries (about 9 s for a 429, 140 s for a 5xx), so OAR records the turn
+`completed`. kimi's own session file records `turn.ended` `reason: failed`
+with a structured error, but that file is kimi's storage, not an interface,
+and OAR reads only ACP. Upstream: [MoonshotAI/kimi-code#1865](https://github.com/MoonshotAI/kimi-code/issues/1865)
+(reported on 0.26.0; the ACP adapter logs a failed turn and answers
+`end_turn`, as ACP's `StopReason` has no failure value), still so on 2.2.0.
+
+**Tool frames:** the opening `tool_call` carries `title`, `kind`
+(`execute` for `Bash`, `other` for `Agent`), `status: "pending"`, an empty
+`content` text block, and no `rawInput`, so `tool_call_started` has no
+`input`. The arguments then stream as partial-JSON `content` text over a
+dozen `tool_call_update` frames with no event (OAR does not read those
+chunks: `content` while `in_progress` is input, not output, so it is never
+`tool_call_progress`; only an update carrying `rawOutput` would be), and one
+more update carries the full `rawInput` (`{"command": …}`) with `title`
+"Running: …", read as a `tool_call_input` holding that whole input. The
+session view's tool part takes it, so `classifyTool` reads `Bash` as
+`run_command` with its `command`
+([test](../../tests/replay/tool-activity.test.ts)). The command runs
+through `terminal/create` (`/bin/bash -c "cd '<cwd>' && …"`, env `NO_COLOR`,
+`TERM=dumb`, …), `wait_for_exit`, `output`, `release`, each a `toApp` request
+with OAR's answer; the captured output is in the `terminal/output` answer.
+The completed frame's `content` is a terminal reference
+(`{type: "terminal", terminalId}`) with no `rawOutput`, so
+`tool_call_ended.content` is that reference as an `other` part, not the command's text
+(`tool-detail`). The `tool` label is the opening `tool_call` frame's `title`
+rather than the ACP `kind` category; for the two tools observed live (`Bash`,
+`Agent`) that title is the tool's name; whether every kimi tool opens with its
+name as `title` is **unverified**. A call first seen on a `tool_call_update`
+(whose `title` is progress text) is labelled by `kind`; an explicit
+`name`/`toolName` always wins
+([test](../../tests/acp/acp-kimi-wire-shapes.test.ts)).
+
+**Children (transport-limited, `opaque`):** the
+[native child schema](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/protocol/src/events.ts#L878-L927)
+contains `subagentId`, `parentToolCallId`, optional `parentAgentId`, and
+`runInBackground`; completion can carry usage and context tokens. ACP
+subscribes to `main`, so children never reach OAR and the adapter fabricates
+nothing. Asked to delegate one shell command, the root runs an `Agent` tool
+call whose arguments stream as `content` text (`prompt`, `description`,
+`subagent_type: "coder"`); the child's own Bash call surfaces ONLY as the
+root session's `terminal/create` → `wait_for_exit` → `output` → `release`
+reverse requests, under the root `sessionId`: no `session/update` for the
+child, no `tool_call` frame for its Bash. The Agent call's completed frame
+carries the child's report as `rawOutput` (`agent_id: agent-0`,
+`actual_subagent_type: coder`, `status: completed`, a `resume_hint` naming
+`Agent(resume="agent-0")`). Every record carries the root `sessionId`,
+`agentPath` is `[]` throughout, and the graph has one node (`subagent`). A
+root `Agent` tool card is not a child trajectory. OAR does not filter by
+session id: should a future `kimi acp` emit updates for other session ids,
+they would be recorded as child-session records. (The `isFromMainAgent`
+guard lives in the older `acp-adapter` package; this baseline uses
+`acp-server` with scoped subscriptions; see the
+[runtime matrix](../spec/runtime-matrix.md).)
+
+**History:** the retained stream backs `rawEvents(observer, cursor)` for the
+life of the process (`cursor`); there is no native-history enumeration and
+no rebuild after the process died.
+
+### Service tiers
+
+`SessionOptions.serviceTier` is explicitly refused with
+`UnsupportedOptionError`, declared in `Runtime.refusedSessionOptions`.
+No per-session native setting plus applied-state readback has been verified
+for this adapter; `listModels` therefore advertises no service tiers. OAR
+does not silently ignore a requested tier or alter a global default.
+
+### Models, instructions, and context
+
+Native ACP config options cover model, thinking, and mode, with
+`session/set_model` retained as an extension. Every switch pushes
+`config_option_update` before the switch request is answered, and the
+`set_model` answer is `{}`.
+
+**Mapped:** open-time model selection (`SessionOptions.model` →
+`session/set_model`) and early config-update readback: `Session.model()` is
+the latest `model` event, read from `configOptions` id `model` on the open
+answer and from every `config_option_update`, never from the request
+parameter. The
+[model lister](../../packages/oar/src/runtimes/kimi/list-models.ts) starts
+`kimi acp` and creates a temporary authenticated session (`terminal: false`),
+both in `ListModelsOptions.cwd` (default the host's cwd), reads the `model`
+config option, closes and kills it. The current model is the entry marked
+`default`; the `thinking` option (found by its
+`thought_level` category, as the session finds it) is emitted only for the
+current model, so effort levels attach to that entry only (`off` is a
+toggle and dropped). A `-32601` error reads as unsupported, `-32000` or an
+auth message as unauthenticated. On this account the 0.42.0 catalog is
+`kimi-k2.5`, `kimi-code/kimi-for-coding`, `kimi-code/kimi-for-coding-highspeed`,
+`kimi-code/k3` (current, thinking `high`), `kimi-code/k3-256k`.
+
+**Effort (mapped).** kimi's effort is the `thinking` config option in
+ACP's `thought_level` category ([env] 2.0.0: low/high/max on k3, while
+kimi-k2.5 offers off/on/low). `SessionOptions.effort` is
+`session/set_config_option {configId: "thinking", value}`, sent after
+`session/set_model`, which re-derives the option's menu for the new model
+and keeps a level the new menu still has. kimi pushes a
+`config_option_update`, then answers with every option's current value;
+both carry the `effort` event, and a `currentValue` other than the request
+refuses the open. An unknown value is refused `-32602 "Invalid params:
+Unknown thinking value: bogus"`, so the open rejects with that message.
+The level persists with the session: a resume answers the level last set
+(live 2026-09-29: `low`), and a resume that asks for none keeps it
+(`high` after a `high` run). The native record is the agent's wire log
+(`~/.kimi-code/sessions/…/agents/main/wire.jsonl`): `config.update
+{thinkingEffort}`, then each `llm.request` carries `thinkingEffort` (live:
+`low` on the first turn, `high` after the resume). Live changes on a
+running session are absent ([native surfaces](live-configure.md)).
+[ACP effort channel](../../packages/oar/src/shared/acp/effort.ts),
+[test](../../tests/acp/acp-session-effort.test.ts).
+
+`session()` refuses `systemPrompt` and `appendSystemPrompt` with an
+`UnsupportedOptionError`, declared before open in
+`kimiRuntime.refusedSessionOptions` ([options](../../packages/oar/src/runtimes/kimi/options.ts)),
+because `kimi acp` has no per-session
+instruction input through its protocol or launcher
+([refused session options](../spec/runtime-matrix.md#refused-session-options)).
+The first-party launch audit (kimi **2.1.1**, 2026-10-07; 2.2.0 changes
+neither the `acp` command nor the ACP server source) checked `kimi --help`,
+`kimi acp --help` and the matching release source. The top-level CLI accepts
+`--agent-file` and `--agent`, but the
+[`acp` command](https://github.com/MoonshotAI/kimi-code/blob/f67e6398fb3210ad8ace970e2dfd5bcc984ed61f/apps/kimi-code/src/cli/sub/acp.ts)
+passes neither to `runAcpServer`: it supplies only the data root, agent
+identity and terminal-auth metadata. The
+[`session/new` handler](https://github.com/MoonshotAI/kimi-code/blob/f67e6398fb3210ad8ace970e2dfd5bcc984ed61f/packages/acp-server/src/server.ts)
+also supplies no agent-profile or prompt input to the engine.
+
+The native harness can load agent profiles. Its
+[`extraAgentDirs` configuration section](https://github.com/MoonshotAI/kimi-code/blob/f67e6398fb3210ad8ace970e2dfd5bcc984ed61f/packages/agent-core-v2/src/workspace/workspaceAgentProfileLoader/configSection.ts)
+has no environment binding, and the ACP launcher exposes no separate config
+path. Redirecting `KIMI_CODE_HOME` would also redirect credentials and saved
+sessions; OAR does not use that as a prompt override or modify user config.
+
+| Session option | Channel used by OAR |
+| --- | --- |
+| `cwd` | ACP `session/new`; resume in another directory is refused. |
+| `resume` | ACP `session/resume`, or `session/load` when resume is not advertised. |
+| `model` | ACP `session/set_model`, with config-update readback. |
+| `effort` | ACP `session/set_config_option` on `thinking`, with readback. |
+| `env` | Environment of this session's subprocess and tool subprocesses; `null` removes an inherited variable ([contract](../spec/runtime-matrix.md#session-environment)). |
+| `mcpServers` | ACP `mcpServers` on `session/new` and `session/resume` ([session MCP servers](#session-mcp-servers)). |
+| `systemPrompt`, `appendSystemPrompt` | Refused: the selected native launcher does not carry them. |
+| `name` | Refused: kimi has no verified session name setting ([session name](../spec/runtime-matrix.md#session-name)). |
+
+**Context (partial):** native ACP
+[emits context usage after the prompt response](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/acp-server/src/session.ts#L907-L947)
+from an un-awaited task and may omit it when the catalog has no size for the
+model. OAR holds the `session/prompt` answer event at most 500 ms for that
+push (`usageUpdateAfterPrompt`), then records the answer as-is; this keeps
+the usage record before the turn end but is not a freshness guarantee. Live
+the push follows the answer by about 8 ms, so `contextUsage()` at
+`turn_ended` reads the turn's own value, growing across turns, e.g.
+`[20611, 20657]` (`kimi-usage-update-order.ts live`). `size` is `1048576` for
+`kimi-code/k3`; a one-word turn already occupies about 20.6k tokens (the
+system prompt). Per-agent usage remains unexposed.
+
+Native agent compaction exists; ACP
+[`/compact` dispatches a background task](https://github.com/MoonshotAI/kimi-code/blob/f9ca33376/packages/acp-server/src/builtin-commands.ts#L100-L110).
+OAR has no typed compact operation, and no ACP frame reports a compaction,
+so Kimi sessions never carry `compaction_started` or `compaction_ended`
+events. Prompt text can reach that slash route, but completion text emitted
+after the OAR Turn ends is dropped; prompt completion does not establish
+compaction completion.
+
+### Tools, permissions, and extensions
+
+Native ACP accepts MCP configuration and supports filesystem, terminal, and
+interaction reverse calls; its permission channel handles tool approvals and
+question fallback. OAR's [client](../../packages/oar/src/shared/acp/terminal.ts)
+hosts terminals (`create`, `output`, `wait_for_exit`, `kill`, `release`, run
+in the session `cwd` with the env overlay, output capped at 4 MiB by
+default), disables client filesystem methods, and passes the session's own
+MCP servers ([below](#session-mcp-servers)). Vendor-configured tools can
+still run; OAR has no generic client-tool callback.
+
+OAR uses yolo when available and answers `session/request_permission` with
+`allow_always`, then `allow_once`, otherwise `cancelled`. With yolo selected
+no `request_permission` arrives; the only reverse requests are `terminal/*`,
+and while a command runs kimi polls `terminal/output` every ~250 ms, each poll
+a `toApp` request/answer pair, terminal output included
+(`busy-and-late-control`, `kimi-wire-tap.ts`). No caller decision channel
+exists, so approval and question semantics cannot be represented as
+application interactions; the stream shows what was asked and what OAR
+answered.
+
+### Session MCP servers
+
+`SessionOptions.mcpServers` is ACP's `mcpServers` on `session/new` and
+`session/resume`, in ACP's `McpServer` shape (stdio `{name, command, args,
+env}`, http `{type: "http", name, url, headers}`, `env` and `headers` as
+`{name, value}` lists; `args`, `env` and `headers` always sent;
+[mapping](../../packages/oar/src/shared/acp/mcp-servers.ts),
+[test](../../tests/acp/acp-session-mcp-servers.test.ts)). kimi declares
+`mcpCapabilities` http and sse, so http entries are sent (to an agent that
+declares no http, OAR refuses one with `UnsupportedOptionError`). An empty
+or repeated name fails the open before kimi starts, as does a
+[reserved name](../spec/runtime-matrix.md#refused-session-options) such as
+`__proto__`, which kimi would drop silently. Measured on kimi 2.1.1, and the
+vendor test again on 2.2.0
+([version check](../../experiments/runtime-version-checks/2026-10-15.md#kimi-code-220)),
+against a scripted provider: a fresh `KIMI_CODE_HOME`, an OpenAI
+chat-completions model through
+`KIMI_MODEL_NAME`, `KIMI_MODEL_API_KEY`, `KIMI_MODEL_BASE_URL` and
+`KIMI_MODEL_PROVIDER_TYPE=openai`, and `authenticate {methodId: "login"}`
+answering `{}` for that API-key model, with no OAuth
+([vendor test](../../sea-trial/vendor/mcp-servers-acp.vendor.test.ts),
+[harness](../../sea-trial/harness/aimock-acp.ts)):
+
+- Both transports attach and the model is offered each tool as
+  `mcp__<server>__<tool>` (`mcp__echo__echo`, `mcp__remote__echo`), also the
+  ACP `tool_call` title. kimi's source (`mcpCore/tool-naming.ts`) sanitises
+  the name parts to `[a-zA-Z0-9_-]` and caps the name at 64 characters with a
+  hash suffix. The tool result reached the provider as the server wrote it,
+  so the server ran with the entry's `env` (stdio) or `headers` (http).
+- kimi's source converts the entries in `acp-server/src/convert.ts` and holds
+  them in memory only (`session/mcp/ephemeralMcpServers.ts`); a probe found no
+  temporary session config file on disk. `session/fork` ignores
+  `mcpServers`; OAR does not fork.
+- A resume remembers none: `session/resume` given them attaches them again;
+  resumed with none, no `mcp__` tool is offered.
+- On a name clash the session's `echo` wins over `$KIMI_CODE_HOME/mcp.json`'s
+  `echo`, the user's `userecho` is still called (answering with the user's
+  credential), and `mcp.json` is
+  unchanged. Probed: resuming that session without the option brings the
+  user's `echo` back. kimi's source (`mergedConnectionView.ts`) suggests the
+  user's same-name server is still started, only hidden; not measured.
+- kimi appends a `<system-reminder>` user message (the date) after the
+  prompt, so the scripted fixtures match the current turn's user messages,
+  not only the last one.
+
+The credentials reach kimi only in the open request's params, which OAR does
+not record (it records the answers, every `session/update` and vendor
+notification). A probe found none in the ACP traffic, kimi's stderr or kimi's
+files; the vendor test asserts no record holds one. A failed open's error
+message and stack are redacted (`[redacted]`).
+
+[Host-served tools](../spec/runtime-matrix.md#host-served-tools) attach as
+any http entry. kimi does not hand the server's `instructions` to the model
+(kimi 2.1.1), so guidance the model needs belongs in the tool descriptions.
+`kimiRuntime.mcpToolsListChanged` is `"none"`: after
+`notifications/tools/list_changed` kimi does not list again and its next
+model request offers the opening set (kimi 2.2.0,
+[vendor test](../../sea-trial/vendor/mcp-tools-list-changed.vendor.test.ts)).
+
+### Process ownership, installation, and account usage
+
+**Mapped:** OAR owns the spawned process. Native ACP close tears down a live
+session; delete is a separate operation. Disposal cancels active work,
+attempts the advertised `session/close`, kills the process, and disposes
+hosted terminals. On POSIX the process and each hosted terminal command
+lead their own process groups, so `terminal/kill`, release, and disposal reach
+what they started, and a runtime still running a grace period after SIGTERM
+(10 s, or `OAR_KILL_GRACE_MS`) is SIGKILLed with its group
+([test](../../tests/session-dispose.test.ts)). That SIGKILL, or the
+runtime's exit if that comes first, also takes its descendants that left
+its group, read from the process table when the kill begins and before the
+SIGKILL (as for [claude](claude.md#process-ownership-environment-installation-and-account-usage)).
+It does not delete persisted native sessions.
+
+On Windows, the shared ACP session uses `taskkill /T /F` for disposal and
+the abort fallback, including the runtime behind its launcher and its
+descendants ([test](../../tests/session-dispose.test.ts)). See
+[host-exit cleanup and limits](../spec/record-stream.md#the-rules).
+
+[Installation detection](../../packages/oar/src/runtimes/kimi/installation.ts)
+checks `OAR_KIMI_BIN`, PATH `kimi`, `$KIMI_INSTALL_DIR/bin/kimi`,
+`~/.kimi-code/bin/kimi`, and the legacy `kimi-code` name, probing
+`kimi acp --help` with 30-second timeouts; it does not prove compatibility
+with Python kimi-cli. When none is found,
+[`install`](../../packages/oar/src/runtimes/kimi/install.ts) runs Moonshot's
+native installer, `curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash`
+([README](https://github.com/MoonshotAI/kimi-code#install); macOS and Linux;
+[runtime install](../spec/install.md), [sandbox run](install.md)). OAR uses
+that method because its copy is the native one `kimi upgrade -y` updates (it
+answered "already up to date" for it, where an npm copy gets the manual
+command); the installer records region `mainland-cn`, so `checkUpdate`
+reads `code.kimi.com`.
+
+The region marker (`~/.kimi-code/region`) only seeds the first login: once
+signed in, the login's own host decides. So a copy from this installer signs
+in to Moonshot's mainland China service by default. People outside mainland
+China sign in with `kimi login --region global` (OAR has no kimi login yet,
+see [runtime login](../spec/login.md)). The installer never overwrites an
+existing marker.
+
+`checkUpdate` reads the release pointer kimi's own updater installs from, and
+`upgrade` runs `kimi upgrade -y`; a kimi older than 0.43.0 has no
+non-interactive upgrade, so `upgrade` answers `unsupported`
+`requires_terminal` ([runtime updates](update.md)).
+
+[Account usage](../../packages/oar/src/runtimes/kimi/account-usage.ts)
+resolves the managed `kimi-code` provider through `kimi provider list --json`
+(honouring `KIMI_CODE_BASE_URL`, `KIMI_CODE_OAUTH_HOST`, `KIMI_CODE_HOME`;
+no such provider is `unsupported/auth_configuration_unavailable`, a run that
+times out rejects),
+reads the stored OAuth token as-is (never refreshed), and calls the `/usages`
+and `/me` endpoints; 401/403 or a missing token read `reauth_required`, 404
+`unsupported`. [`/me`](../../packages/oar/src/runtimes/kimi/profile.ts) is a
+best-effort identity add-on: it supplies `plan` (`user_level_name`), `email`,
+and `displayName` (`nickname`). Phone or WeChat sign-ins return no `email`, so
+`displayName` is often their only readable identity. Account quota and
+session context occupancy are distinct APIs; neither supplies the missing
+child-agent usage stream.
+
+## Verification and open gaps
+
+[`experiments/live-contract.ts kimi`](../../experiments/live-contract.ts)
+covers the promises above on the real login: `basic`, `multi-turn`,
+`tool-detail`, `busy-and-late-control`, `steer` (skipped: the session
+has no `steer`), `queue`, `abort`, `dispose-mid-turn`, `cursor`, `resume`,
+`subagent`, `kill-runtime`, `bad-model`. [`kimi-wire-tap.ts`](../../experiments/kimi-wire-tap.ts) checks
+the raw JSON-RPC below the SDK against the record stream: one shell-tool turn
+is outbound `initialize`, `authenticate`, `session/new`, `session/set_mode`,
+`session/prompt`, `session/close`, all answered; inbound 49 `session/update`
+notifications (`available_commands_update` 1, `current_mode_update` 1,
+`config_option_update` 1, `session_info_update` 1, `agent_thought_chunk` 22,
+`tool_call` 1, `tool_call_update` 14, `agent_message_chunk` 7, `usage_update`
+1) and four `terminal/*` requests (no vendor extension notification, no
+unknown method), every one reaching the stream with the same count
+(`missingFromStream: []`).
+[`kimi-usage-update-order.ts`](../../experiments/kimi-usage-update-order.ts)
+separates fixture and live modes;
+[`kimi-steer-or-queue.ts`](../../experiments/kimi-steer-or-queue.ts) covers
+`steerOrQueue()`.
+
+[ACP tests](../../tests/acp/acp-session.test.ts) and
+[model/usage tests](../../tests/acp/acp-session-model-usage.test.ts) use a fake
+executable for the record skeleton, control accept/reject, early model
+updates, and late/missing usage updates (the usage record is deliberately
+held before the turn end).
+[Wire-shape tests](../../tests/acp/acp-kimi-wire-shapes.test.ts) pin the
+0.42.0 tool frames (title-only opening, late `rawInput` as `tool_call_input`, terminal-reference
+completion, the Agent report) and the dispose-after-death answer.
+[Snapshot tests](../../tests/acp/acp-vendor-snapshot.test.ts) bind login and
+yolo selection to the recorded 0.38.0 schema. The
+[real-runtime CI matrix](../../.github/workflows/ci.yml) excludes Kimi.
+
+Open gaps: questions and approvals (no `request_permission` arrives under
+yolo), post-turn compaction, whether every kimi tool opens with its name as
+`title`, abort effects on background children, concurrent same-ID
+controllers and in-flight work across OAR subprocesses, and any child usage
+(the transport carries none). [Session MCP servers](#session-mcp-servers)
+ran against a scripted provider only, not on the real login and model, and
+their vendor test runs locally (`OAR_TEST=kimi-aimock`), not in CI; whether
+a hidden same-name user server still starts is unmeasured. Install by
+region is open too: the install script's comments name a global mirror
+(`code.kimi.ai/kimi-code/install.sh`, which records region `global`), but
+Moonshot's README documents only `code.kimi.com`, so `install` runs that one.
+Choose the source by region once kimi documents the mirror, or once OAR has a
+kimi login that needs a regional install. Keep native API capabilities,
+transport limitations, OAR omissions, and unexecuted checks separate when
+designing or claiming support.
+
+## Disallowed tools
+
+`SessionOptions.disallowedTools` is refused before launch and declared in
+`refusedSessionOptions`. Kimi profiles support `disallowedTools`, but
+`kimi acp` starts the ACP server without forwarding root CLI profile
+options, and has no session tool-denial overlay. OAR does not replace the
+user's selected agent profile or redirect the whole native home to emulate
+one.
+
+Evidence and verification limits: [tool-denial audit](../../experiments/disallowed-tools-2026-10-08.md).
+
+## Launch arguments
+
+`SessionOptions.launchArgs` go after `acp`. `kimi acp` reads only its own options there (`--login`, `--region`) and exits on any other (2.1.1); the root command's options, placed before `acp`, do not reach the ACP server either, so kimi currently has no useful launch argument. OAR passes them unchecked and never records them; give them again on resume. See [launch arguments](../spec/runtime-matrix.md#launch-arguments).
+
+## Additional directories
+
+`SessionOptions.additionalDirectories` goes to ACP
+`session/new.additionalDirectories` only when initialize advertises that
+session capability. Paths resolve against cwd. The provider request of a
+newly created session contains the extra directory (kimi 2.2.0,
+[vendor test](../../sea-trial/vendor/additional-directories.vendor.test.ts)).
+
+**A non-empty list on resume is refused before starting Kimi**, with
+`UnsupportedOptionError` on `additionalDirectories` explaining that it has
+no effect on resume. Native resume/load warn and ignore the field; a cold
+resume probe (kimi 2.1.1) never included the newly requested directory. Omission or empty
+leaves native restoration alone; OAR does not reconstruct workspace state
+from an older conversation's context.
+
+[Evidence and verification limits](../../experiments/additional-directories-2026-10-11.md).
+
+## Structured output
+
+`SessionOptions.outputSchema` is declared refused and fails before launch.
+No final-answer schema channel was found through the selected Kimi ACP
+interface or its launch configuration. OAR does not imitate native output
+constraints by adding prompt instructions.
+
+[Native channel audit](../../experiments/structured-output-2026-10-11.md).
+
+## User configuration
+
+`userConfiguration: "exclude"` is declared refused before launch; omission
+and `"include"` preserve native behavior. Moving `KIMI_CODE_HOME` while
+linking `credentials/` and `oauth/` and copying `device_id` hides native
+history. Sharing the session directory and index files does not fully fix
+that: Kimi 2.3.1 atomically replaces the `workspaces.json` symlink with an
+independent file. A new workspace then exists only in the temporary home's
+catalog, while `session_index.jsonl` contains temporary session paths.
+
+The [local probe](../../experiments/kimi-user-configuration/README.md)
+retains the nuance: explicit cwd/id resume after cleanup succeeded, but the
+original workspace catalog had already diverged. That is not safe sharing
+of user data, so OAR does not implement the workaround. The experiment uses
+a local provider and synthetic state; it makes no OAuth refresh claim.
+
+## Orientation query costs
+
+`listModels()` starts an ACP process, initializes and authenticates the
+native channel, then opens a temporary native session to read its model config
+option. It closes the native session/process without a model prompt. This can
+load workspace configuration and contact the account service. OAR exposes no
+local auth-status reader; a model catalog is not used to invent one.
+
+## Reader environment
+
+Installation and model listing accept the session-style `env` overlay.
+Account usage also uses it for the provider CLI and credential paths, but
+rejects actual changes to its fixed host HTTP/TLS variable list before any
+process or request ([usage environment](../spec/account-usage.md#environment)).
+No host environment is temporarily changed.

@@ -1,0 +1,36 @@
+{
+  "name": "agentonweb",
+  "description": "Your local terminal and DSH workspace on the website you are using.",
+  "version": "0.4.1",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@11.5.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "build:extension": "node scripts/build-extension.mjs",
+    "build:extension:firefox": "node scripts/build-extension.mjs --browser firefox",
+    "build:extension:safari": "node scripts/build-extension.mjs --browser safari",
+    "build:preview": "node scripts/build-preview.mjs",
+    "check": "pnpm check:privacy && pnpm check:architecture && pnpm typecheck && pnpm test && pnpm build && pnpm build:extension:firefox && pnpm build:extension:safari && node scripts/check-extension-builds.mjs && pnpm check:extension:safari-native",
+    "check:privacy": "node scripts/check-safari-privacy.mjs",
+    "check:architecture": "node scripts/check-architecture.mjs",
+    "check:extension:safari-native": "node scripts/check-safari-native.mjs",
+    "install:dsh-surface": "node scripts/install-dsh-surface.mjs",
+    "package:extension": "node scripts/package-extension.mjs",
+    "preview": "node scripts/serve-preview.mjs",
+    "release:audit": "pnpm check && node scripts/release-audit.mjs",
+    "test": "pnpm --filter @agentonweb/dsh-surface build && pnpm --filter @agentonweb/terminal-host build && vitest run",
+    "typecheck": "tsc -b --pretty false",
+    "prepare:safari": "node scripts/prepare-safari.mjs"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.4",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^24.3.0",
+    "esbuild": "^0.25.9",
+    "jsdom": "^26.1.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}

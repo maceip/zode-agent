@@ -1,0 +1,12 @@
+{
+  "title": "Tools",
+  "pages": [
+    "built-in",
+    "define-tool",
+    "tool-registry",
+    "audit-log",
+    "trash",
+    "patch-envelope",
+    "error-kinds"
+  ]
+}

@@ -1,0 +1,784 @@
+# OpenCode
+
+Independent inventories: not implemented for OpenCode yet.
+See the [query contract](../spec/inventory.md) and [native probe evidence](inventory.md).
+
+The installed executable selects the adapter behavior: v1 (`opencode-ai`)
+and v2 (`@opencode/cli`) share the `opencode` runtime ID. OAR preserves the
+reported version string verbatim, including v2's `opencode v` prefix. Updating
+within a line and migrating to another line are separate user decisions.
+The sections below describe v1 unless they explicitly name v2.
+
+Evidence baseline: **opencode 1.18.30** (linux x64, `opencode acp`, the free
+model `opencode/big-pickle` with no login) on 2026-10-06 through
+[`experiments/live-contract.ts opencode`](../../experiments/live-contract.ts)
+(13/13, scenario names in parentheses below), the
+[vendor snapshot](../../tests/replay/fixtures/opencode-acp-v1.vendor.json)
+from [`experiments/acp-vendor-snapshot.ts`](../../experiments/acp-vendor-snapshot.ts),
+and direct ACP probes of the same binary for model switching, effort and
+resume. Source was read at **v1.18.34** (`anomalyco/opencode`,
+`packages/opencode/src/acp/`, `session/prompt.ts`); where only the source
+says so, the statement is marked [src]. The
+[HTTP server section](#the-http-server-investigated-2026-09-12) is the
+earlier investigation of the same version through `opencode serve`.
+Versions are evidence baselines, not a support range; see the
+[runtime index](README.md) for status conventions.
+
+v1 rechecks (Linux x64, no adapter changes; none repeats the HTTP-server
+investigation):
+
+- **1.18.35** (2026-10-07, Node 24.19.0): the same 13 live scenarios on
+  `opencode/big-pickle` (not the direct model-switching probes), the native
+  prompt-options probe and all three MCP vendor tests, including both
+  prompts with session MCP servers
+  ([October 7 report](../../experiments/runtime-version-checks/2026-10-07.md)).
+- **1.19.0** (2026-10-11): eight applicable native vendor tests, the
+  prompt-options experiment and eight selected live checks on free Big
+  Pickle without an account (model catalog, basic and tool turns, resume,
+  steering, MCP, abort, disposal)
+  ([October 11 report](../../experiments/runtime-version-checks/2026-10-11.md)).
+- **1.19.3** (2026-10-17; still current on 2026-10-18): 10 native vendor
+  tests, the shared session behavior suite (17 passed, 2 skipped on a
+  diagnostic rerun) and the prompt-options probe, with no account or
+  billable model
+  ([October 17 report](../../experiments/runtime-version-checks/2026-10-17.md),
+  [October 18 report](../../experiments/runtime-version-checks/2026-10-18.md)).
+- **1.19.4** (2026-10-23): 10 native tests, the prompt-options probe and a
+  10-model catalog. Shared behavior passed 17 cases with two skips on an
+  unchanged recheck after one native startup failed a workspace-table
+  creation statement; the underlying cause was not identified
+  ([October 23 report](../../experiments/runtime-version-checks/2026-10-23.md#opencode-startup-and-compatibility)).
+
+## OpenCode v2
+
+The v2 adapter's ACP subprocess owns a standalone native server; OAR does
+not connect to or leave a persistent daemon. Verified on `@opencode/cli`
+**2.1.4** (2026-10-23,
+[October 23 report](../../experiments/runtime-version-checks/2026-10-23.md#opencode-startup-and-compatibility)):
+shared session behavior (15 passed, 4 skipped on recheck), a nine-model
+catalog, prompt refusals and MCP list changes. The first shared run failed
+one case before server readiness; its saved native log reports
+`SQLiteError: database is locked`. The unchanged recheck passed. This
+identifies that run's startup error, not the cause of every earlier failure.
+Initial stderr, native state and elapsed times were preserved before cleanup.
+
+Only one of six direct cold resumes called echo on 2.1.4. A catalog removal
+47 ms after the first resume's prompt persisted until re-addition 2,337 ms
+after the sixth resume's prompt
+([evidence](../../experiments/runtime-version-checks/2026-10-23.md#cold-mcp-resume-remains-broken)).
+The [six successful calls on 2.1.2](../../experiments/runtime-version-checks/2026-10-21.md#opencode-212)
+had still included a removal/re-addition window and did not establish a fix.
+On 2.1.0, all six cold resumes had omitted the call
+([October 20 report](../../experiments/runtime-version-checks/2026-10-20.md#cold-mcp-resume-remains-broken)).
+The [boundary probe](../../experiments/opencode-release-lines.ts) last passed
+all ten of its checks on 2.0.29
+([October 14 report](../../experiments/runtime-version-checks/2026-10-14.md)).
+[October 12 evidence](../../experiments/runtime-version-checks/2026-10-12.md)
+covers 2.0.27, and [October 9 evidence](../../experiments/opencode-v2-2026-10-09.md)
+records the original 2.0.26 investigation, separating observations from
+source findings. Bullets that name no version come from the boundary probe
+(2.0.26 through 2.0.29) and that investigation.
+
+- **Control:** v2 refuses a concurrent `session/prompt`. The session has no
+  `steer` member; `steerOrQueue` and `deliver` queue the input for another
+  turn. Queueing remains an OAR memory FIFO, not durable native storage.
+  Native abort and disposal during a shell call both ended as `aborted`.
+- **Children:** standard updates arrive on the parent's envelope with
+  `update._meta["opencode/child-session"]` (`id`, `parentID`, `depth`,
+  `title`). OAR records them under the named child session, links its real
+  parent with `session_linked { parent, child, via: "tool_call" }` on the
+  first update frame naming that pair in this stream, and declares `nested`
+  attribution. Later updates do not repeat the edge. `graphOf(records)` preserves
+  those edges in replay, including nested descendants. Child text, tools
+  and usage do not become root output. Native notifications remain
+  verbatim. The native tool `name` wins over its display title, so a
+  child's `shell` stays `shell` even when its title has a child prefix.
+- **Tool names:** `shell` is a command with its reported `command` input;
+  v1 `bash` remains supported. `subagent` classifies as `subagent`, with
+  its `description` as the detail. Code Mode `execute` retains its name and
+  classifies as `other`: it can run MCP calls, ordinary
+  JavaScript or `fetch`; the name alone cannot prove an MCP operation.
+- **MCP:** stdio servers supplied at new and resumed session open are
+  callable through `execute`, whose input code, result and native metadata
+  are retained, including the names of enclosed MCP calls.
+  **Open cold-resume race:** a resumed session's first turn can see a native
+  catalog update that removes the reattached tool, then complete without
+  calling it. OAR observed this intermittently on 2.0.27, also with the
+  OAR-free [native reproduction](../../experiments/opencode-mcp-resume-native.ts)
+  ([October 12 evidence](../../experiments/runtime-version-checks/2026-10-12.md));
+  an [independent upstream reproduction](https://github.com/anomalyco/opencode/issues/54794#issuecomment-6123225428)
+  saw the removal notice on all 12 cold resumes, with tool failures
+  depending on when the model sees the later catalog update. It is tracked
+  in [OAR #371](https://github.com/botiverse/oar/issues/371) and
+  [upstream #54794](https://github.com/anomalyco/opencode/issues/54794),
+  both open with no posted fix as of 2.1.4 (2026-10-23). A passing run does
+  not resolve it; OAR adds no retry or sleep for it.
+- **Prompt options:** both `systemPrompt` and `appendSystemPrompt` are
+  refused before ACP startup, including resume. The v2 instruction loader
+  does not consume the v1 `instructions` configuration. v2 has native
+  `agents.<id>.system`, but OAR has not verified a safe session-local path
+  that resolves the actual agent on both creation and resume. This is an
+  adapter boundary, not a claim that v2 lacks system prompts; configure
+  v2's native settings directly when those settings are intended.
+- **Models:** queries use `models --standalone`, never `--verbose` or a
+  persistent service. On 2.0.27 through 2.0.30 and on 2.0.32, cold queries
+  in fresh native configurations returned a nonempty catalog, which OAR
+  returns as `ok` without an adapter change (on 2.0.27 two fresh
+  configurations each returned the same 11 IDs,
+  [October 12 evidence](../../experiments/runtime-version-checks/2026-10-12.md);
+  ten IDs on 2.0.32,
+  [October 17 report](../../experiments/runtime-version-checks/2026-10-17.md)).
+  On 2.0.26 the cold query returned no models; an empty native response
+  still becomes `unsupported`, not `ok` with zero models
+  ([upstream issue #53724](https://github.com/anomalyco/opencode/issues/53724)).
+  OAR creates no throwaway session for a read-only query. A nonempty native
+  listing supplies IDs only; no effort menu is fabricated. The separate
+  `api agent.list --standalone` empty result was observed on 2.0.26 and not
+  re-probed since.
+- **Defaults and configuration:** on 2.0.26 the native default model was
+  `opencode/exo-free`, and the initial effort was `default`; these are
+  observations, not OAR defaults. v2 can rewrite v1's `autoupdate` config
+  into `update` on its first launch. OAR does not migrate or rewrite that
+  user configuration. Explicit model selection still uses native readback.
+- **Interaction limits:** no elicitation capability is advertised. v2's
+  question path remains outside the verified host-answer contract.
+
+## Image-only input
+
+OAR sends ACP image blocks without a text block when `input` is `""`.
+OpenCode 1.18.35 delivers the image to a local scripted Anthropic provider
+without an empty text block ([image-only provider test](../../sea-trial/vendor/image-only.vendor.test.ts)). The selected model must advertise
+image input in `modalities.input`; a text-only model receives OpenCode's
+"Cannot read" notice instead of the image. Its separate title-generation
+request may add a title prompt beside the same image.
+
+## Native concepts and calling interfaces
+
+| Shape | Command | Protocol |
+|---|---|---|
+| HTTP server | `opencode serve` | REST + OpenAPI 3.1 self-description (`/doc`), SSE event stream |
+| ACP server | `opencode acp` | Agent Client Protocol over stdio |
+| Client | `opencode attach <url>` | Connects to someone else's server |
+| One-shot | `opencode run` | Single turn |
+
+The object hierarchy is `project` → `workspace` → `session`:
+
+- `project` is a git worktree; its id is a hash (`/tmp/faye-oc/repo` →
+  `5eb21528…`). **Every non-git directory collapses into one synthetic project
+  `global`, with worktree recorded as `/`**, so on one machine all
+  non-repository directories share one project.
+- `workspace` (`wrk_` prefix) is a git worktree materialised under
+  `~/.local/share/opencode/worktree/<projectID>/<slug>`.
+- `session` (`ses_` prefix) carries three attribution columns: `project_id`,
+  `workspace_id`, `parent_id`.
+
+A session runs one agent loop at a time. A prompt is admitted as a user
+message and the loop runs model steps until the last assistant message
+finishes without tool calls; each step re-reads the messages, so a user
+message admitted while the loop runs is part of the next step
+(`session/prompt.ts` `runLoop`, [src]). A `task` subagent runs in a child
+session (`parent_id`).
+
+OAR uses `opencode acp`. It is opencode's own ACP layer, built as a client of
+its own HTTP server API (`acp/service.ts` calls `sdk.session.prompt`,
+`sdk.session.list` and so on, [src]), so the mapping onto ACP is upstream's.
+`@opencode-ai/sdk` (1.18.34 on npm) is the generated client for that HTTP
+API, and its `createOpencode()` starts `opencode serve` as a child process;
+it is not an in-process SDK. The in-process host `@opencode-ai/sdk-next` is a
+private workspace package and is not published. Driving the HTTP server
+directly would mean a new adapter for an API in the middle of a v1 to v2
+migration; it becomes worth it if child-session events or attaching to a
+server the user already runs are needed.
+
+## High-level mapping to OAR
+
+OAR exposes one ordered record stream per Session
+([contract](../../packages/oar/src/contracts/session.ts)). Every ACP frame is
+recorded verbatim as a frame's `native`; the cross-runtime `events` are what
+OAR reads out of it. Control calls are request/response record pairs.
+
+| Native concept or owner | Current OAR mapping |
+| --- | --- |
+| `opencode acp` executable | One `opencode acp` subprocess per OAR Session, spawned in the session `cwd` with the env overlay (`null` removes an inherited variable, [contract](../spec/runtime-matrix.md#session-environment)); its exit is an `exited` response record (kill-runtime). |
+| Persistent native session | `Session.id` is the native `ses_` id; `SessionOptions.resume` attaches through `session/resume`, which replays nothing (resume). |
+| Handshake answers and opening pushes | Answers are frame records with `model` and `effort` events where they report them; no `authenticate` is sent. |
+| Native agent and turn | Every `session/update` is one frame with `native` verbatim. No `spanId`. Attribution tier `opaque`: a `task` subagent's child session never reaches the transport, so only the parent's tool call shows (subagent). |
+| Prompt, steer, queue and cancel | A turn is one `session/prompt` RPC, its answer carrying `turn_ended`. `steer()` is a second `session/prompt` while one runs; it joins the running loop and both answers close the one turn (steer). `queue()` is a host-memory FIFO; `abort()` is `session/cancel` with a kill fallback (abort). |
+| Typed events, history and child graph | Events for message, reasoning, tool, usage and model updates; unknown kinds are recorded with no events. The graph is the root session only. |
+| Client execution and interaction duties | opencode runs its own tools and asks for no terminal. A `session/request_permission` arrives only for what opencode's permission rules ask about; OAR allows it like every ACP request. The `question` tool is off for ACP clients ([src] `tool/registry.ts`). |
+
+Sources: [OpenCode profile](../../packages/oar/src/runtimes/opencode/session.ts),
+[ACP opening path](../../packages/oar/src/shared/acp/profile.ts),
+[session controller](../../packages/oar/src/shared/acp/session.ts),
+[turn machinery](../../packages/oar/src/shared/acp/turns.ts),
+[event projection](../../packages/oar/src/shared/acp/projection.ts).
+
+## Capability details
+
+### Session creation and resume
+
+`initialize` advertises `loadSession`, `sessionCapabilities` `close`, `fork`,
+`list` and `resume`, and image prompts. The one auth method,
+`opencode-login`, answers `{}` and changes nothing; credentials come from
+`opencode auth login` or provider environment variables, and the `opencode/*`
+free models need none. `session/new` answers the `model` and `mode` config
+options, plus `effort` when the model has variants.
+
+A resume naming another directory runs in the session's own: a session
+created in A and resumed with `cwd` B printed A for `pwd`, transcript intact.
+OAR reads the session's directory from `session/list` and refuses the resume
+with `UnsupportedOptionError` on `cwd` ([resume in another
+directory](resume-cwd.md)). Every non-git directory belongs to the one
+`global` project, yet `session/list` without a directory still found a
+session from a non-git directory when the resume named a git repository.
+
+On both release lines, a complete `session/list` with no matching id plus a
+native resume failure yields `SessionNotFoundError`, retaining the requested
+`sessionId` and method/native error in `cause`. V1's generic `-32603`
+`OpenCode service failure` cannot prove absence by itself: a listed id's
+failure keeps its original type. Missing/incomplete lists and authentication
+failures are likewise not mapped
+([missing targets](../spec/runtime-matrix.md#missing-resume-targets)).
+
+### Interrupted input
+
+On 1.18.35, steering followed immediately by `session/cancel` kept the
+steering text in the next prompt's provider request. An aborted prompt does
+not prove discard, so OAR emits no `input_dropped` for it. ACP provides no
+verified input-ID echo; inputs still enter the view at their request.
+[Native scripted-provider probe](../../experiments/input-interruption-2026-10-08.md).
+
+### Prompt, steering, queueing, and abort
+
+A `session/prompt` sent while one runs is not refused: opencode admits it and
+the running loop reads it at its next step. Both prompt RPCs are answered
+when the session goes idle, each after a `usage_update`
+([src] `acp/service.ts` `runUntilIdle`). Live, a steer sent mid-turn landed
+in the same turn's final reply (steer: "ALPHA BRAVO MANGO"). OAR therefore
+gives the session a `steer` with no extra prompt parameters, and the turn
+ends once, on the original prompt answer. Both native answers remain
+recorded. If a steering RPC later refuses, its error frame reports
+`input_dropped {inputId, reason: "runtime_refused"}`; the active turn keeps
+its own outcome. Acceptance stays immediate rather than blocking until
+OpenCode becomes idle.
+
+`session/cancel` aborts the loop; the prompt answers `cancelled` about 0.1 s
+later, the running shell call is closed, and the turn ends `aborted` (abort).
+After an abort the `usage_update` reports `used: 0`, since it reads the
+latest assistant message, which the abort left empty.
+
+OAR owns the ACP process. An exit ending a running turn after its accepted
+abort or dispose request is read as `aborted` by the folds; an unrequested
+exit is `failed: runtime_exited`. A native turn end that arrives first keeps
+its outcome, and the exit code stays on `exited`.
+Disposal and the ten-second abort fallback end its
+process group on POSIX (SIGTERM, then SIGKILL after the configured grace;
+the SIGKILL, or the runtime's exit if that comes first, also takes its
+descendants that left the group, as for
+[claude](claude.md#process-ownership-environment-installation-and-account-usage)),
+or its process tree on Windows (`taskkill /T /F`, including a launcher and
+the runtime behind it). The [dispose regression](../../tests/session-dispose.test.ts)
+checks both runtime and descendant termination. See
+[host-exit cleanup and limits](../spec/record-stream.md#the-rules).
+
+### Observation, children, and history
+
+Text, reasoning (`agent_thought_chunk`), tool calls and `usage_update` arrive
+as `session/update`. A tool call's opening `tool_call` carries its name as
+`title` and no arguments: a shell call has `title` `bash`, `kind` `execute`
+and `rawInput` `{cwd}` only, and the file tools (`write`, `read`, `edit`,
+`grep`, `glob`) an empty `rawInput`. The arguments arrive on the next
+`tool_call_update` (tool-detail): `bash` `{command, cwd}` or
+`{command, workdir}`, retitled with the command; `read` `{filePath}`;
+`write` `{content, filePath}`; `edit` `{filePath, oldString, newString}`;
+`grep` and `glob` `{path, pattern}`. OAR reads that update as a
+`tool_call_input` with the whole input (a further update repeating them
+adds none), and the session view's tool part takes it, so
+`classifyTool` reads `bash` as `run_command` with its `command`, `read` as
+`read_file`, `write` and `edit` as `edit_file` and `grep` and `glob` as
+`search`, each file tool with its `filePath` or `path` as the detail
+(`read`, `write` and `edit` also give that one path as `paths`)
+([recordings](../../tests/replay/fixtures/opencode-acp-v1-files.vendor.json),
+[test](../../tests/replay/tool-activity.test.ts)). No recorded `bash` input
+has a `description`. The closing update carries the output in `content` and
+`rawOutput` `{metadata, output}`, and retitles the call (`write`, `read`
+and `edit` with the file path, `grep` with the pattern, `glob` with the
+directory).
+
+The prompt answer's `usage` field is the last assistant message's tokens
+only, not the turn's, so OAR does not report token totals (and so no
+`cacheRead` or `cacheWrite`); context usage comes from `usage_update`
+(`used`, `size`, `cost`).
+
+A `task` subagent completed and its result reached the parent (subagent:
+`CHILD-OK-7731`), but no frame of the child session arrived: opencode's ACP
+layer forwards parts only for sessions it opened ([src] `acp/event.ts`).
+
+### Service tiers
+
+`SessionOptions.serviceTier` is explicitly refused with
+`UnsupportedOptionError`, declared in `Runtime.refusedSessionOptions`.
+No per-session native setting plus applied-state readback has been verified
+for this adapter; `listModels` therefore advertises no service tiers. OAR
+does not silently ignore a requested tier or alter a global default.
+
+### Models, effort, instructions, and context
+
+Model ids are `provider/model` (`opencode/big-pickle`). `session/set_model`
+answers `{}` and 1.18.30 pushes nothing, although the switch applies, so OAR
+switches with `session/set_config_option` on `model`, whose answer lists
+every option with its current value. `listModels` reads
+`opencode models --verbose` (every configured provider's models, with each
+model's `variants`). On both lines the query runs in
+`ListModelsOptions.cwd` (default: the host's cwd), because project
+configuration there can add providers.
+
+Effort is the `effort` option in the `thought_level` category, present only
+for a model with variants; its values are the variant names
+(`low`/`high`/`max` on `opencode/fledge-alpha-free`). Because the menu
+belongs to the model, OAR reads it from the model switch's answer when a
+model was requested; on a model without variants `effort` is refused with
+`UnsupportedOptionError`. An unknown model fails the open with the agent's
+`Invalid params: model not found` (bad-model).
+
+ACP has no direct prompt field, but the native launcher reads
+`OPENCODE_CONFIG_CONTENT`. OAR uses a fresh inline configuration for the
+session: `systemPrompt` overrides only the selected `agent.<name>.prompt`;
+`appendSystemPrompt` adds one session-owned file to `instructions`. Native
+config merging appends that file **after existing instructions**, preserving
+other agents, model choices, tools and permission rules. Environment/context,
+project instructions and skills that OpenCode adds separately still apply.
+The file stays available for later turns and compaction and is removed on
+failed open, disposal or process exit. OAR does not rewrite user config or
+redirect the runtime's native home.
+
+Before a replacement, OAR runs the selected executable's read-only
+`debug config` in the session directory, with the session environment. It
+uses `default_agent` (otherwise the native `build` default). For resume,
+`export <id> --sanitize` supplies the saved agent, including the historical
+message fallback, before consulting that default. No transcript is logged
+or used to rebuild the conversation. The ACP open must report that same
+mode; otherwise opening fails and names both agents. This also protects
+against disabled/renamed defaults and config changes between query and open.
+A saved or configured default custom agent missing from resolved config is
+refused before injection, so a prompt override cannot recreate a deleted agent
+with default permissions. Only the visible built-ins `build` and `plan` may
+be absent from that config.
+A replacement adds one native startup query, two on resume, each bounded at
+30 seconds; no prompt options retains the direct ACP path, and append-only
+needs no agent query.
+
+If the effective session environment defines `OPENCODE_CONFIG_CONTENT`,
+either prompt option is refused with
+`UnsupportedOptionError`. OAR does not parse or merge that existing value.
+Setting `env: { OPENCODE_CONFIG_CONTENT: null }` removes an inherited value
+before native configuration queries and permits prompt injection.
+An empty replacement is also refused: native OpenCode treats an empty agent
+prompt as selecting its built-in prompt. Literal `{env:...}` and
+`{file:...}` in the supplied prompt are preserved, not expanded by the
+native config parser.
+
+[Native request probe](../../experiments/opencode-prompt-options.ts),
+**1.18.34**, Linux x64, 2026-10-07: OAR and the real ACP process send requests
+to a local scripted provider, without login or model quota. Assertions cover
+custom default and customized build agents, both prompt options, earlier
+instructions remaining first, resume after the default agent changes,
+literal interpolation syntax, unchanged model and denied edit tools,
+unchanged config bytes, temporary-file removal, refusal to recreate a deleted agent, and config-env conflicts.
+The fixture config includes its `$schema` because OpenCode itself may add
+that field to a schema-less file even on the baseline path (observed in an
+isolated probe).
+
+Source at [v1.18.34](https://github.com/anomalyco/opencode/tree/v1.18.34):
+`config/config.ts` merges inline content and concatenates instructions;
+`config/variable.ts` substitutes variables before JSON parsing;
+`agent/agent.ts` resolves the default; `acp/service.ts` restores saved agent
+selection; `session/llm/request.ts` chooses the agent prompt; and
+`session/instruction.ts` reads instruction files again for subsequent requests.
+
+| Session option | Native channel and result |
+| --- | --- |
+| `cwd` | ACP directory; a resume elsewhere is refused from native `session/list`. |
+| `resume` | ACP resume, native session identity and saved agent. |
+| `model` | ACP model config option with native read-back. |
+| `effort` | ACP `thought_level` config option when the selected model has variants; otherwise refused. |
+| `systemPrompt` | Fresh inline `agent.<selected>.prompt`, verified against the ACP mode on new/resumed sessions. |
+| `appendSystemPrompt` | Fresh inline `instructions` entry for a session-owned temporary file, on new/resumed sessions. The file goes when the session ends; a host that ends without disposing leaves it to its `exit` event or the next opencode session's sweep ([private-temp](../../packages/oar/src/shared/private-temp.ts)). |
+| `env` | Child-process environment, shared by native queries, the ACP process and its tools. |
+| `name` | Refused with `UnsupportedOptionError` on both lines (no verified session name setting), declared in `Runtime.refusedSessionOptions` ([session name](../spec/runtime-matrix.md#session-name)). |
+
+### Tools, permissions, and process
+
+opencode runs its own tools in its own process tree and asks the client for
+no terminal and no file access. It inherits the session's environment, so a
+crew child's environment reaches its tools. Installation is the `opencode`
+executable on PATH (npm `opencode-ai`, Homebrew, Scoop) or the install
+script's `~/.opencode/bin/opencode`, pinned with `OAR_OPENCODE_BIN`.
+
+OpenCode ships two major lines of that one command: OpenCode 1 (npm
+`opencode-ai`, 1.x; `--version` prints `1.18.35`) and OpenCode 2 (npm
+`@opencode/cli`, 2.x; `opencode v2.0.26`). They do not install side by side:
+both scripts write `~/.opencode/bin/opencode`, the 2 installer replaces a 1
+binary ([migrating from 1](https://opencode.ai/v2/docs/migrate-v1)) and the 1
+script silently replaces a 2 binary
+([anomalyco/opencode#54084](https://github.com/anomalyco/opencode/issues/54084)).
+So the runtime declares `installLines` `v1` and `v2`, and
+[`install`](../../packages/oar/src/runtimes/opencode/install.ts) takes the
+host's `line` (none is `line_required`: OAR does not choose) and runs that
+line's script when nothing is found: `curl -fsSL https://opencode.ai/install | bash`
+([docs](https://opencode.ai/docs/#install)) or
+`curl -fsSL https://opencode.ai/v2/install | bash`
+([v2 docs](https://opencode.ai/v2/docs/)), macOS and Linux. A copy of either
+line already found is `already_installed` with its `line`, never replaced.
+OAR uses those scripts because each line's `opencode upgrade` takes its
+script install as the `curl` method and stays on the line
+([runtime install](../spec/install.md), [sandbox run](install.md)).
+
+### Session MCP servers
+
+This section's measurements are v1 unless they name 2.x. v2's Code Mode
+`execute` and its open cold-resume race are in the [v2 MCP notes](#opencode-v2).
+
+`SessionOptions.mcpServers` is ACP's `mcpServers` on `session/new`,
+`session/load` and `session/resume`, in ACP's `McpServer` shape (stdio
+`{name, command, args, env}`, http `{type: "http", name, url, headers}`,
+`env` and `headers` as `{name, value}` lists; `args`, `env` and `headers`
+always sent, empty when absent;
+[mapping](../../packages/oar/src/shared/acp/mcp-servers.ts),
+[test](../../tests/acp/acp-session-mcp-servers.test.ts)). opencode declares
+`mcpCapabilities` http and sse, so http entries are sent (to an agent that
+declares no http, OAR refuses one with `UnsupportedOptionError`). An empty
+or repeated name fails the open before opencode starts; so does a reserved
+name such as `__proto__` (which opencode would drop), with
+`UnsupportedOptionError` ([reserved names](../spec/runtime-matrix.md#refused-session-options)).
+Measured on opencode 1.18.30 against a scripted provider: an isolated `HOME`
+and XDG dirs, provider `aimock` on opencode's bundled `@ai-sdk/anthropic` in
+`$XDG_CONFIG_HOME/opencode/opencode.json`
+([vendor test](../../sea-trial/vendor/mcp-servers-acp.vendor.test.ts),
+[harness](../../sea-trial/harness/aimock-acp.ts)):
+
+- Both transports attach and the model is offered each tool as
+  `<server>_<tool>` (`echo_echo`, `remote_echo`), which is also the ACP
+  `tool_call` title. The tool result reached the provider as the server
+  wrote it, so the server ran with the entry's `env` (stdio) or `headers`
+  (http).
+- [src] at v1.18.30, `acp/service.ts` hands every entry on new, load, resume
+  and fork to `sdk.mcp.add({directory, name, config})`: stdio becomes
+  `{type: "local", command: [command, ...args], environment}`, http
+  `{type: "remote", url, headers}` (streamable HTTP, then SSE). Errors are
+  ignored, so a server that fails to attach fails silently. The servers are
+  held in memory by that opencode process, which OAR starts once per session.
+- A resume remembers none: resumed with the option, the servers attach
+  again; resumed without it, neither tool is offered.
+- On a name clash the session's `echo` replaces the user's `mcp.echo` for
+  that process, and the user's `userecho` is still called (answering with
+  the user's credential). Probed, not in
+  the test: a session `echo` whose command is broken still opens, and removes
+  the user's working `echo` too (opencode closes and deletes the same-name
+  client on failure).
+- With `systemPrompt` or `appendSystemPrompt` the session opens through the
+  prompt path ([prompts](#models-effort-instructions-and-context)): the
+  prompts travel in `OPENCODE_CONFIG_CONTENT` and the servers in the same
+  ACP open as above. Measured with both prompts and both servers in one
+  session: every agent request carried both prompts and both echoes arrived
+  ([vendor test](../../sea-trial/vendor/mcp-servers-acp.vendor.test.ts);
+  the open's wiring in
+  [prompt-cleanup](../../tests/opencode/prompt-cleanup.test.ts)).
+
+The credentials reach opencode only in the open request's params, which OAR
+does not record (it records the answers and every `session/update`). A probe
+found none in any ACP answer, notification or stderr line, nor under
+opencode's directories; the vendor test asserts no record holds one. A failed
+open's error message and stack are redacted (`[redacted]`).
+
+A server's tool-list change reaches the running session in full on both
+lines (`Runtime.mcpToolsListChanged` `"full"`). On 2.x a system update adds
+the new tools and withdraws the removed ones, and a call to a removed tool
+fails locally without reaching the server
+([probe](../../experiments/mcp-tools-catalog-changed.ts); 2.0.30,
+[October 16 report](../../experiments/runtime-version-checks/2026-10-16.md);
+2.0.32, [October 17 report](../../experiments/runtime-version-checks/2026-10-17.md)).
+See [host-served tools](../spec/runtime-matrix.md#host-served-tools).
+
+## Verification and open gaps
+
+- Only free `opencode/*` models were run; a logged-in provider and its
+  permission prompts were not.
+- Steer timing against a long tool call was not measured: the steer joins at
+  the next model step, so it waits for a running tool to finish.
+- The HTTP server would carry child sessions and a replayable event cursor;
+  not integrated.
+- No update check or upgrade (`opencode upgrade` exists; OAR does not drive
+  it) and no account usage query.
+- [Session MCP servers](#session-mcp-servers) ran against a scripted
+  provider only, not a logged-in provider or a free `opencode/*` model. The
+  vendor test runs locally (`OAR_TEST=opencode-aimock`), not in CI, which has
+  no ACP aimock backend. The broken-command clash was probed, not tested.
+- The `opencode-aimock` vendor suite is v1 only: 5 of its 10 cases fail on
+  v2 (2.0.30) because they need v1 protocol (direct MCP tools in the
+  provider's `tools` array, a classification from that array, or v1 prompt
+  replacement)
+  ([October 16 report](../../experiments/runtime-version-checks/2026-10-16.md)).
+  v2 evidence is the boundary probe, the shared behavior suite and focused probes.
+- Unexplained first-run failures, not reproduced on rerun:
+  `opencode --version` over its 15-second limit during concurrent opens
+  (1.19.2, [October 16 report](../../experiments/runtime-version-checks/2026-10-16.md));
+  two opens per line exiting with code 1 (1.19.3, 2.0.32), and a 2.0.32
+  model query failing natively with
+  `ServiceUnavailableError: Location plugins did not finish activating`
+  ([October 17 report](../../experiments/runtime-version-checks/2026-10-17.md)).
+
+## The HTTP server, investigated 2026-09-12
+
+Evidence baseline for this section: opencode 1.18.30 (`~/.opencode/bin/opencode`),
+Linux x86_64, probed 2026-09-12 through headless
+`opencode serve --port 4610/4611/4612`. The machine-readable contract is
+`GET /doc` (OpenAPI 3.1, 162 paths); every conclusion was cross-checked against
+the rows in `~/.local/share/opencode/opencode.db`.
+
+### Storage: event sourcing and mutable projections in one database
+
+One SQLite file, `~/.local/share/opencode/opencode.db`, holds 20 tables:
+`account`, `account_state`, `control_account`, `credential`, `data_migration`,
+`event`, `event_sequence`, `message`, `migration`, `part`, `permission`,
+`project`, `project_directory`, `session`, `session_context_epoch`,
+`session_input`, `session_message`, `session_share`, `todo`, `workspace`.
+
+The structure that matters: `event` (an immutable stream keyed by
+`aggregate_id` + `seq`) plus `event_sequence` (a per-aggregate cursor carrying
+an explicit **`owner_id`** column) plus mutable projection tables (`session`,
+`message`, `part`, …). The projection can be rewritten while the events stay
+fixed.
+
+### Events and projections disagree, and it is the projection that moves
+
+A session created through the `global` project's server, with
+`directory=/tmp/faye-oc/repo`, still carries `"projectID": "global"` in its
+immutable seq-0 event. After another server claimed that directory as a git
+project, the `session` **row** was retroactively rewritten to `5eb21528…`.
+The projection alone says the session always belonged to that project; the
+log alone says it never moved.
+
+### Event model: two naming layers, only the persistent one is versioned
+
+- **Bus / HTTP layer: roughly 60 event names, none versioned.** Examples:
+  `agent.cycle`, `catalog.updated`, `permission.asked`, `permission.replied`,
+  `question.asked`, `pty.created/deleted/exited/updated`, `mcp.tools.changed`,
+  `plugin.added`, `session.idle`, `session.error`, `message.part.delta`,
+  `session.next.compaction.delta`, `session.next.reasoning.delta`,
+  `server.connected`, `global.disposed`, `project.directories.updated`.
+- **Persistence / sync layer: 35 types, all suffixed `.N`.** 33 are at `.1`;
+  only `session.next.step.ended.2` and `session.next.step.failed.2` are at
+  `.2`.
+
+Of the four harnesses surveyed, opencode alone versions events explicitly.
+
+`/sync/history` cursor semantics: the request body is
+`{<aggregateID>: <last seen seq>}` and the response returns events **strictly
+greater than** that seq for the named aggregate; **any aggregate not listed is
+returned in full from seq 0.** Posting `{"ses_f6ba40976f…":1}` returned only
+seq 2 and 3 for that session while five other aggregates came back whole,
+consistent with the documented behaviour.
+
+### `/sync/steal` is workspace re-homing, not control preemption
+
+```
+POST /sync/steal?workspace=wrk_09460c96a0019dGVNJB3IhqUWP
+     {"sessionID":"ses_f6ba40976ffeOGfLJoyWTDRJd4"}
+→   {"sessionID":"ses_f6ba40976ffeOGfLJoyWTDRJd4"}
+```
+
+The query parameter names the target, the body names the session; omitting
+`?workspace=` or passing it empty is a `{"_tag":"BadRequest"}`. Database state
+before and after:
+
+| | before | after |
+|---|---|---|
+| `session.workspace_id` | empty | `wrk_0946…` |
+| `event_sequence.owner_id` | empty | `wrk_0946…` |
+| appended `event` | none | one `session.updated.1` per call |
+
+It emits `session.updated.1`, **not** `session.next.moved.1`; do not conflate
+the two. It is **idempotent in state but not in events**: repeated calls leave
+the state unchanged while the event stream keeps growing.
+
+**"Current workspace" is declared per request by the client, not held as
+server state.** The same steal succeeded from a server started at the
+repository root (4611) and from one started inside the worktree (4612); the
+server's cwd does not participate.
+
+### `/sync/replay` rebuilds a session from its events, and identity is client-declared
+
+1. Replaying a session's own 4 events verbatim (with `?workspace=`) returns
+   **the same** sessionID, which alone cannot distinguish rebuild from no-op.
+2. After `DELETE /session/<id>` (session row and event rows both go to zero),
+   replaying its seq-0 event **fully rebuilds** the session: id, slug and
+   directory all return. Replay is recovery from the log.
+3. Rewriting `aggregateID` / `sessionID` / the event `id` in the payload to a
+   fresh `ses_` returns the new id and produces **an entirely new session**:
+   same slug, same directory, a clone.
+4. Posting the same payload twice leaves a single seq-0 row: **event-level
+   idempotent** (the opposite of `steal`).
+
+So on `/sync/replay` **the client supplies the restored sessionID inside the
+event**; this does not establish how normal session creation mints IDs.
+`?workspace=` only sets `event_sequence.owner_id`; the session row's
+`workspace_id` / `project_id` / `directory` are restored from the event
+payload, never from the query parameter. Moving a session to another machine
+or workspace is therefore protocol-feasible, at the cost of session identity
+having no server-side authority: whoever can write events can declare
+identity. On this machine the server ran unauthenticated by default
+(`OPENCODE_SERVER_PASSWORD` unset).
+
+Two API traps: `/sync/history` returns `aggregate_id` (snake_case) while
+`/sync/replay` requires `aggregateID` (camelCase), so a round-trip must rename
+the field; and a replay missing `?workspace=` reports `500 UnknownError` with an
+`err_<id>` reference rather than `400`.
+
+### Where `parent_id` comes from
+
+- **Only** `POST /session {"parentID":"ses_…"}` writes `parent_id`; it appears
+  in `/children` immediately.
+- **Fork does not write `parent_id`**: after a fork, `/children` returns `[]`,
+  while `/children`'s own documentation describes "child sessions that were
+  **forked** from the specified parent". Documentation and implementation
+  disagree.
+- `POST /api/session` is a second session-creation endpoint whose schema has no
+  `parentID`. Passing it neither errors nor takes effect, despite the schema
+  declaring `additionalProperties: false`: unknown fields are silently
+  swallowed.
+- Related schema surface: `subagent`, `subagent_depth`,
+  `/experimental/session/{id}/background`.
+
+### Attribution compared with the other samples
+
+- **Claude Code**: runtime process identity `(pidDomain, pid, procStart)` plus a
+  peer socket registry. Attribution is bound to a **living process**.
+- **Codex**: `installation_id` plus `[projects."<absolute path>"].trust_level`.
+  Attribution is bound to a **disk path**.
+- **opencode**: workspace scope, rewritable by events, with a literal `owner_id`
+  column on the event stream. Attribution is **first-class, movable data**.
+
+### Addressability, resumability floor, and resume material
+
+In the vocabulary shared across the samples:
+
+| Property | opencode |
+|---|---|
+| identity authority | client-declared on `/sync/replay`; normal creation authority not established by this probe |
+| uniqueness scope | globally unique only if clients do not collide; `event_sequence.owner_id` is workspace scoped |
+| connection identity, by on-wire addressability | none; HTTP and SSE carry no connection id, and even "current workspace" is declared per request via `?workspace=` |
+| resumability floor | event-stream seq 0; deleting the session and replaying its seq-0 event rebuilds id, slug and directory in full |
+| history paging cursor | `/sync/history` with a per-aggregate last-seen seq |
+| live stream resume cursor | none on the bus itself; the difference can be filled in afterwards from `/sync/history` |
+| runtime side resume material | the immutable `event` table |
+| broadcast and subscription separated | separated by versioning, not by tier: the transient bus is unversioned, the 35 persistent sync types are all `.N` |
+| death boundary | not observed |
+
+"Runtime side resume material" is material the runtime feeds back to the
+model; replay is what a host offers its own subscribers. The two words should
+not be mixed.
+
+### Design input for OAR
+
+- **A log and a projection are two truths, and reading one is not reading the
+  other.** Any host that consumes a runtime's stored state has to say which of
+  the two it read.
+- **Identity written by the client has no server authority** (`/sync/replay`
+  above), so a host cannot inherit the runtime's identity as its own: OAR's
+  lineage has to record the requests OAR itself issued.
+- **Versioning only the persistent layer is a deliberate, copyable split.**
+  Transient broadcast (~60 unversioned bus names) and replayable record (35
+  `.N` types) are different contracts, and only the second needs to promise
+  evolution.
+
+### Server investigation gaps
+
+- **Blocked, not explained.** `POST /experimental/workspace {"type":"worktree"}`
+  returns `{"name":"WorkspaceCreateError","data":{"message":"Timed out waiting
+  for global event"}}` **while the database row and the on-disk git worktree are
+  both created**: a post-creation wait timeout (most likely on a server
+  instance or sync loop inside the new worktree), not a creation failure.
+  `GET /experimental/workspace` and `/experimental/workspace/status` still
+  return `[]` when the row exists. It is not localised further: the server
+  log printed only the unset-password warning, and the `err_<id>` detail
+  never reaches stdout.
+- Calling create twice leaves **two workspace rows pointing at the same
+  directory**. `DELETE /experimental/workspace/{id}` removes the database row,
+  the on-disk git worktree and the git registration, but **leaves the
+  `project_directory` row pointing at the missing directory**, another
+  projection that did not keep up.
+- Not probed: `/api/session/{id}/event`, `/event`,
+  `/experimental/session/{id}/background`, `/api/pty/*`, `/mcp/*`,
+  `/permission`, `project.sandboxes`, `session_context_epoch`.
+- No real model turns ran, so message/part write granularity is unmeasured.
+- Death boundary not observed: no process was killed mid-turn, so the event
+  stream and projections at an abrupt exit are unknown.
+
+## Disallowed tools
+
+`SessionOptions.disallowedTools` is refused before prompt preparation or
+launch and declared in `refusedSessionOptions`. OpenCode 1.18.35 has native
+global and per-agent permission rules, but a global deny can be overridden
+by an agent's allow. Permission names also differ from tool names (for
+example, multiple file mutations share `edit`). ACP exposes no session
+native tool-name denylist. OAR does not rewrite the user's agent definition
+or turn a denylist into a computed allowlist.
+
+Evidence and verification limits: [tool-denial audit](../../experiments/disallowed-tools-2026-10-08.md).
+
+## Launch arguments
+
+`SessionOptions.launchArgs` go after `acp`, on the process the session runs; OAR's helper queries (`--version`, `models`, and the prompt path's `debug config` and `export`) do not get them. OAR passes them unchecked and never records them; give them again on resume. See [launch arguments](../spec/runtime-matrix.md#launch-arguments).
+
+## Additional directories
+
+`SessionOptions.additionalDirectories` is supported on **v2** through the
+native ACP field on `session/new` and `session/resume`, after initialize
+advertises `sessionCapabilities.additionalDirectories`. Paths resolve
+against cwd. On 2.0.26 and 2.0.27
+([October 12 evidence](../../experiments/runtime-version-checks/2026-10-12.md)),
+`session/list` reported the supplied roots on new and resumed sessions (a
+resume's list replaces the earlier one), and a cold resume with the field
+omitted lost them. Supply the list again on resume. Empty has the same OAR
+meaning as omission.
+
+**v1 refuses** a non-empty list before prompt preparation or ACP opening;
+1.18.35 has no advertised/effective native directory channel. Permission
+rules for `external_directory` are a different setting and are not used as
+a substitute. cwd remains primary on both lines.
+
+[Evidence and verification limits](../../experiments/additional-directories-2026-10-11.md).
+
+## Structured output
+
+`SessionOptions.outputSchema` is declared refused on both release lines and
+fails before launch. OpenCode has a JSON-schema format on its HTTP prompt
+API, but its ACP prompt path does not forward that setting, and no ACP
+launch/configuration equivalent was verified. OAR uses ACP and does not
+silently switch interfaces or replace the schema with prompt instructions.
+
+[Native channel audit](../../experiments/structured-output-2026-10-11.md).
+
+## User configuration
+
+`userConfiguration: "exclude"` is declared refused with
+`UnsupportedOptionError` before opening a session. This adapter has no
+verified separation of user configuration from native login and session
+history. Omission and `"include"` retain existing behavior. See the
+[shared contract](../spec/runtime-matrix.md#user-configuration).
+
+## Orientation query costs
+
+`listModels()` starts `opencode models --verbose` on v1 or
+`opencode models --standalone` on v2 in the selected workspace. Native project
+configuration, provider credentials and catalog cache affect the result; a cold
+catalog can involve network access. It does not submit a model turn. OAR exposes
+no auth-status reader for local orientation.
+
+## Reader environment
+
+Installation and model listing accept the session-style `env` overlay.
+The model reader uses it both when identifying an unknown native version and
+when querying that version's catalog. See
+[reader environments](../spec/orientation.md#environment).

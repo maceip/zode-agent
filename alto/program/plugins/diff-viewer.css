@@ -1,0 +1,251 @@
+.diff-viewer-pane {
+  position: relative;
+  flex: 1 1 auto;
+  container-type: inline-size;
+}
+
+.diff-review-overlay-layer {
+  z-index: 78;
+  padding: clamp(18px, 4vw, 54px);
+  background: transparent;
+}
+
+.diff-review-overlay-panel {
+  --alto-floating-panel-border: color-mix(in srgb, var(--border-strong) 64%, transparent);
+  --alto-floating-panel-radius: var(--radius-panel);
+  --alto-floating-panel-background: color-mix(in srgb, var(--floating-panel) 98%, var(--canvas));
+  --alto-floating-panel-shadow:
+    var(--floating-panel-shadow),
+    0 32px 90px color-mix(in srgb, var(--bg) 24%, transparent);
+  width: min(90%, 1280px);
+  height: min(90%, 900px);
+  min-width: min(680px, 100%);
+  min-height: min(460px, 100%);
+  display: flex;
+  overflow: hidden;
+  outline: 0;
+  animation: diff-review-overlay-enter 180ms cubic-bezier(0.2, 0.72, 0.2, 1);
+}
+
+.diff-review-overlay-panel .diff-viewer-pane {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.diff-viewer-pane.is-overlay .diff-viewer-toolbar {
+  --alto-pane-toolbar-end-padding: var(--space-3);
+}
+
+@container (max-width: 540px) {
+  .diff-viewer-toolbar {
+    gap: 6px;
+  }
+
+  .diff-viewer-summary {
+    display: none;
+  }
+
+  .diff-viewer-commit-picker {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+}
+
+@container (max-width: 420px) {
+  .diff-viewer-style {
+    display: none;
+  }
+}
+
+.diff-viewer-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.diff-viewer-body > .file-tree {
+  background: color-mix(in srgb, var(--panel-soft) 76%, transparent);
+  -webkit-backdrop-filter: blur(12px) saturate(108%);
+  backdrop-filter: blur(12px) saturate(108%);
+}
+
+.diff-viewer-code {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  background: color-mix(in srgb, var(--border-soft) 72%, var(--canvas));
+  --diffs-light-bg: var(--canvas);
+  --diffs-dark-bg: var(--canvas);
+  --diffs-light: var(--text);
+  --diffs-dark: var(--text);
+  --diffs-addition-color: var(--green);
+  --diffs-deletion-color: var(--red);
+  --diffs-modified-color: var(--accent);
+  --diffs-bg-buffer-override: var(--canvas);
+  --diffs-bg-context-override: color-mix(in srgb, var(--panel-soft) 62%, var(--canvas));
+  --diffs-bg-context-gutter-override: color-mix(in srgb, var(--panel-soft) 78%, var(--canvas));
+  --diffs-bg-separator-override: color-mix(in srgb, var(--panel-soft) 82%, var(--canvas));
+  --diffs-fg-number-override: var(--muted);
+  --diffs-bg-addition-override: color-mix(in srgb, var(--green) 9%, var(--canvas));
+  --diffs-bg-addition-number-override: color-mix(in srgb, var(--green) 14%, var(--canvas));
+  --diffs-bg-addition-emphasis-override: color-mix(in srgb, var(--green) 16%, transparent);
+  --diffs-bg-deletion-override: color-mix(in srgb, var(--red) 9%, var(--canvas));
+  --diffs-bg-deletion-number-override: color-mix(in srgb, var(--red) 14%, var(--canvas));
+  --diffs-bg-deletion-emphasis-override: color-mix(in srgb, var(--red) 16%, transparent);
+  --diffs-bg-selection-override: var(--accent);
+  --diffs-bg-selection-number-override: var(--accent);
+  --diffs-bg-hover-override: var(--accent);
+  --diffs-font-family: var(--mono);
+  --diffs-header-font-family: var(--sans);
+  --diffs-font-size: 12.5px;
+  --diffs-line-height: 20px;
+  --diffs-gap-inline: 8px;
+  --diffs-gap-block: 5px;
+}
+
+.diff-viewer-state {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 28px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.diff-viewer-state.is-error,
+.diff-viewer-send-error { color: var(--danger); }
+.diff-viewer-state .is-spinning { animation: diff-viewer-spin 1.8s linear infinite; }
+
+.diff-review-draft {
+  position: absolute;
+  z-index: 6;
+  right: 16px;
+  bottom: 54px;
+  left: 16px;
+  max-width: 660px;
+  margin: 0 auto;
+  padding: 11px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: var(--panel-solid);
+  box-shadow: var(--shadow-panel);
+}
+
+.diff-review-draft-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 1px 8px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+}
+.diff-review-draft-heading span:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diff-review-draft-heading span:last-child { flex: 0 0 auto; }
+
+.diff-review-draft textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  padding: 8px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  outline: none;
+  color: var(--text);
+  background: var(--canvas);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.diff-review-draft textarea:focus { border-color: color-mix(in srgb, var(--purple, #7c3aed) 42%, var(--border)); }
+
+.diff-review-draft-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+}
+.diff-review-draft-actions button,
+.diff-viewer-footer button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel-soft);
+  font-size: 11.5px;
+}
+.diff-review-draft-actions button.primary,
+.diff-viewer-footer button {
+  border-color: transparent;
+  color: white;
+  background: var(--purple, #7c3aed);
+}
+.diff-review-draft-actions button:disabled,
+.diff-viewer-footer button:disabled { opacity: .45; }
+
+.diff-viewer-footer {
+  display: flex;
+  flex: 0 0 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 10px 0 14px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--panel-soft);
+}
+.diff-viewer-footer > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+.diff-viewer-send-error { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@keyframes diff-viewer-spin { to { transform: rotate(360deg); } }
+
+@keyframes diff-review-overlay-enter {
+  from { opacity: 0; transform: translateY(8px) scale(.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (max-width: 720px) {
+  .diff-review-overlay-layer { padding: 12px; }
+
+  .diff-review-overlay-panel {
+    width: 100%;
+    height: 100%;
+    min-width: 0;
+    min-height: 0;
+  }
+
+  .diff-review-draft { right: 8px; left: 8px; }
+}
+
+@container conversation-column (max-width: 560px) {
+  .diff-viewer-toolbar { gap: 6px; padding-left: 8px; }
+  .diff-viewer-style button { padding-inline: 6px; }
+}
+
+@container conversation-column (max-width: 430px) {
+  .diff-viewer-summary { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .diff-review-overlay-panel { animation: none; }
+}

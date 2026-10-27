@@ -1,0 +1,293 @@
+import assert from "node:assert/strict";
+import { afterEach, expect, test, vi } from "vitest";
+import { coalesceText, eventsOf } from "../packages/oar/src/observe/events.js";
+import { simpleStateOf as simpleStateOfSync } from "../packages/oar/src/observe/observe-agent.js";
+import { awaitTurnEnd } from "../packages/oar/src/observe/turns.js";
+import type { Event, EventObserver, RawEvent, RuntimeEventBody } from "../packages/oar/src/index.js";
+import { startMockSession } from "../sea-trial/fixtures/mock-session.js";
+import { steer } from "./fixtures/steer.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+const installation = { kind: "available", via: "bundled" } as const;
+
+/** One line per event: `kind[:detail]`. */
+function describeEvent(item: Event): string {
+  if (item.kind === "text_delta") {
+    return `text:${item.text}`;
+  }
+  if (item.kind === "reasoning") {
+    return item.content.kind === "text" ? `reasoning:${item.content.text}` : `reasoning:${item.content.kind}`;
+  }
+  return item.kind === "control_rejected" ? `control_rejected:${item.action}` : item.kind;
+}
+
+async function runEvents(options: { coalesceText?: boolean | { maxHoldMs: number } }): Promise<string[]> {
+  const session = await startMockSession(installation, { cwd: process.cwd() });
+  const seen: string[] = [];
+  session.events((item) => {
+    seen.push(`${String(item.seq)} ${describeEvent(item)}`);
+  }, options);
+  const result = await session.prompt("hello");
+  await steer(session, "extra");
+  await awaitTurnEnd(session, result.request.seq);
+  await session.dispose();
+  return seen;
+}
+
+test("events() reads the flat events off the stream: one per reading, sharing the record's seq", async () => {
+  expect(await runEvents({})).toMatchInlineSnapshot(`
+    [
+      "1 turn_started",
+      "5 text:echo:hello",
+      "6 text:steer:extra",
+      "7 turn_ended",
+      "7 usage",
+      "9 exited",
+    ]
+  `);
+});
+
+test("events({ coalesceText }) merges consecutive text into one event carrying the last piece's seq", async () => {
+  expect(await runEvents({ coalesceText: true })).toMatchInlineSnapshot(`
+    [
+      "1 turn_started",
+      "6 text:echo:hellosteer:extra",
+      "7 turn_ended",
+      "7 usage",
+      "9 exited",
+    ]
+  `);
+});
+
+async function stallFixture(): Promise<{ stalls: string[]; stop: () => void; dispose: () => Promise<void> }> {
+  const { observeStalls } = await import("../packages/oar/src/observe/stall-observer.js");
+  const session = await startMockSession(installation, { cwd: process.cwd() });
+  const stalls: string[] = [];
+  const stop = observeStalls(session, {
+    stallAfterMs: 50,
+    onStall: (info) => {
+      stalls.push(info.lastRecordKind);
+    },
+  });
+  const started = await session.prompt("hang");
+  assert.equal(started.response.body.kind, "accepted");
+  return { stalls, stop, dispose: async () => session.dispose() };
+}
+
+test("observeStalls reports a silent active turn (virtual time)", async () => {
+  // Date is mocked too: stallOf re-derives silence from the wall clock, so
+  // virtual time must advance both the timer AND Date.now().
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  const { stalls, stop, dispose } = await stallFixture();
+  vi.advanceTimersByTime(49);
+  assert.deepEqual(stalls, [], "must not fire before the threshold");
+  vi.advanceTimersByTime(2);
+  assert.deepEqual(stalls, ["response"], "fires once past the threshold (last record: the accepted response)");
+  vi.advanceTimersByTime(500);
+  assert.deepEqual(stalls, ["response"], "fires once per silence episode");
+  stop();
+  await dispose();
+});
+
+let seqCounter = 0;
+function event(events: RuntimeEventBody[], overrides: { agentPath?: readonly string[]; seq?: number; receivedAt?: number } = {}): RawEvent {
+  seqCounter += 1;
+  return {
+    sessionId: "s",
+    agentPath: overrides.agentPath ?? [],
+    seq: overrides.seq ?? seqCounter,
+    receivedAt: overrides.receivedAt ?? 0,
+    kind: "frame",
+    body: { type: "fixture", native: null, events },
+  };
+}
+
+const flat = (observer: EventObserver) => (record: RawEvent): void => {
+  for (const item of eventsOf(record)) {
+    observer(item);
+  }
+};
+
+test("coalesceText maxHoldMs flushes a held block on quiescence (virtual time)", () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const seen: string[] = [];
+  const observer = flat(coalesceText((item) => {
+    seen.push(describeEvent(item));
+  }, { maxHoldMs: 100 }));
+  observer(event([{ kind: "text_delta", text: "a" }]));
+  observer(event([{ kind: "text_delta", text: "b" }]));
+  vi.advanceTimersByTime(99);
+  assert.deepEqual(seen, [], "held while the stream is briefly quiet");
+  vi.advanceTimersByTime(1);
+  assert.deepEqual(seen, ["text:ab"], "quiescence flush after maxHoldMs");
+});
+
+test("coalesceText merges readable reasoning without swallowing redaction, per agent", () => {
+  const seen: string[] = [];
+  const observer = flat(coalesceText((item) => {
+    const text = item.kind === "reasoning" && item.content.kind === "text" ? item.content.text : item.kind;
+    seen.push(`${item.agentPath.join("/") || "root"}:${text}`);
+  }));
+  observer(event([{ kind: "reasoning", content: { kind: "text", text: "read" } }]));
+  observer(event([{ kind: "reasoning", content: { kind: "text", text: "ing" } }]));
+  observer(event([{ kind: "reasoning", content: { kind: "text", text: "child" } }], { agentPath: ["a1"] }));
+  observer(event([{ kind: "reasoning", content: { kind: "redacted" } }]));
+  observer(event([{ kind: "text_delta", text: "x" }, { kind: "tool_call_started", callId: "c", tool: "t" }]));
+  assert.deepEqual(seen, ["root:reading", "a1:child", "root:reasoning", "root:text_delta", "root:tool_call_started"]);
+});
+
+const promptRecord: RawEvent = { sessionId: "s", agentPath: [], seq: 0, receivedAt: 1000, kind: "request", id: "rq", direction: "toRuntime", body: { kind: "prompt", input: "hi" } };
+
+test("reduceStatus follows the documented transition table", async () => {
+  const { initialStatus, reduceStatus } = await import("../packages/oar/src/observe/agent-status.js");
+  const fold = (records: RawEvent[]): unknown[] => {
+    let status = initialStatus;
+    const seen: unknown[] = [];
+    for (const record of records) {
+      status = reduceStatus(status, record);
+      seen.push(status.kind === "running" ? status.phase : status.kind);
+    }
+    return seen;
+  };
+  expect(fold([
+    promptRecord,
+    event([{ kind: "reasoning", content: { kind: "redacted" } }]),
+    event([{ kind: "text_delta", text: "hi" }]),
+    event([{ kind: "tool_call_started", callId: "c1", tool: "bash" }]),
+    event([{ kind: "tool_call_ended", callId: "c1" }], { agentPath: ["child"] }),
+    event([{ kind: "tool_call_ended", callId: "c1" }]),
+    event([{ kind: "turn_ended", outcome: { kind: "completed" } }]),
+  ])).toMatchInlineSnapshot(`
+    [
+      "waiting_model",
+      "thinking",
+      "responding",
+      {
+        "callId": "c1",
+        "tool": "bash",
+      },
+      {
+        "callId": "c1",
+        "tool": "bash",
+      },
+      "waiting_model",
+      "idle",
+    ]
+  `);
+});
+
+test("reduceStatus: stall, rejected prompt, and exit leave running", async () => {
+  const { initialStatus, reduceStatus, stallOf } = await import("../packages/oar/src/observe/agent-status.js");
+  const runningAt = reduceStatus(initialStatus, promptRecord);
+  assert.deepEqual(stallOf(runningAt, 1400, 500), null);
+  assert.deepEqual(stallOf(runningAt, 1600, 500), { sinceSeq: 0, silentForMs: 600 });
+  assert.equal(stallOf(initialStatus, 99_999, 1), null);
+  const rejected: RawEvent = { sessionId: "s", agentPath: [], seq: 1, receivedAt: 1001, kind: "response", requestId: "rq", body: { kind: "rejected", code: "busy", reason: "busy" } };
+  assert.deepEqual(reduceStatus(runningAt, rejected), { kind: "idle" }, "a rejected prompt never became a turn");
+  const exited: RawEvent = { sessionId: "s", agentPath: [], seq: 2, receivedAt: 1002, kind: "response", requestId: "", body: { kind: "exited", code: 1 } };
+  assert.equal(reduceStatus(runningAt, exited).kind, "idle");
+});
+
+test("resume adopts the runtime-native session identity", async () => {
+  const first = await startMockSession(installation, { cwd: process.cwd() });
+  const second = await startMockSession(installation, { cwd: process.cwd(), resume: first.id });
+  assert.equal(second.id, first.id);
+  await first.dispose();
+  await second.dispose();
+});
+
+test("session.steerOrQueue steers when possible and queues otherwise", async () => {
+  const session = await startMockSession(installation, { cwd: process.cwd() });
+  const active = await session.prompt("one");
+  const mid = await session.steerOrQueue("mid");
+  assert.equal(mid.landed, "steered");
+  await awaitTurnEnd(session, active.request.seq);
+  const late = await session.steerOrQueue("late");
+  assert.equal(late.landed, "queued");
+  await session.dispose();
+});
+
+async function virtualTimeSession(): Promise<Awaited<ReturnType<typeof startMockSession>>> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  const session = await startMockSession(installation, { cwd: process.cwd() });
+  return session;
+}
+
+async function observedStates(): Promise<string[]> {
+  const { observeAgent, simpleStateOf } = await import("../packages/oar/src/observe/observe-agent.js");
+  const session = await virtualTimeSession();
+  const observer = observeAgent(session, { stallAfterMs: 50 });
+  const states: string[] = [];
+  observer.subscribe((view) => {
+    states.push(simpleStateOf(view));
+  });
+  void session.prompt("hang");
+  await vi.advanceTimersByTimeAsync(2000);
+  observer.dispose();
+  await session.dispose();
+  return states;
+}
+
+test("observeAgent unifies fold and stall into one view stream", async () => {
+  const states = await observedStates();
+  assert.equal(states[0], "idle", "initial view pushed on subscribe");
+  assert.equal(states[1], "busy");
+  assert.equal(states.at(-1), "stuck", "silence past threshold flips the view once");
+  assert.ok(!states.slice(states.indexOf("stuck")).includes("busy"), "no flapping while silent");
+});
+
+test("simpleStateOf reports error only as idle-after-failure", () => {
+  const running = {
+    status: { kind: "running", sinceSeq: 0, phase: "thinking", lastEventAt: 0 },
+    stall: null,
+  } as const;
+  assert.equal(simpleStateOfSync(running), "busy");
+  const failedIdle = {
+    status: { kind: "idle", lastTurnOutcome: { kind: "failed", reason: "boom", failure: "unknown" } },
+    stall: null,
+  } as const;
+  assert.equal(simpleStateOfSync(failedIdle), "error");
+  const stuckBeatsBusy = { ...running, stall: { sinceSeq: 0, silentForMs: 99 } };
+  assert.equal(simpleStateOfSync(stuckBeatsBusy), "stuck");
+});
+
+test("reduceStatus: compaction and retry are running phases; tool progress only moves the clock", async () => {
+  const { initialStatus, reduceStatus } = await import("../packages/oar/src/observe/agent-status.js");
+  let status = reduceStatus(initialStatus, promptRecord);
+  status = reduceStatus(status, event([{ kind: "tool_call_started", callId: "c", tool: "bash" }], { receivedAt: 1 }));
+  status = reduceStatus(status, event([{ kind: "tool_call_progress", callId: "c", output: "…" }], { receivedAt: 2 }));
+  assert.deepEqual(status.kind === "running" ? [status.phase, status.lastEventAt] : status, [{ tool: "bash", callId: "c" }, 2]);
+  status = reduceStatus(status, event([{ kind: "compaction_started", trigger: "threshold" }], { receivedAt: 3 }));
+  assert.equal(status.kind === "running" ? status.phase : status.kind, "compacting");
+  status = reduceStatus(status, event([{ kind: "compaction_ended", outcome: "completed" }], { receivedAt: 4 }));
+  status = reduceStatus(status, event([{ kind: "retry", attempt: 1 }], { receivedAt: 5 }));
+  assert.equal(status.kind === "running" ? status.phase : status.kind, "waiting_model");
+});
+
+test("coalesceText keeps two assistant messages apart by messageId", () => {
+  const seen: string[] = [];
+  const observer = flat(coalesceText((item) => {
+    seen.push(item.kind === "text_delta" ? `${item.messageId ?? "-"}:${item.text}` : item.kind);
+  }));
+  observer(event([{ kind: "text_delta", text: "Got", messageId: "m1" }]));
+  observer(event([{ kind: "text_delta", text: " it.", messageId: "m1" }]));
+  observer(event([{ kind: "text_delta", text: "Done.", messageId: "m2" }]));
+  observer(event([{ kind: "text_delta", text: "a" }]));
+  observer(event([{ kind: "text_delta", text: "b" }]));
+  observer(event([{ kind: "turn_ended", outcome: { kind: "completed" } }]));
+  assert.deepEqual(seen, ["m1:Got it.", "m2:Done.", "-:ab", "turn_ended"]);
+});
+
+
+test.each(["completed", "aborted", "failed"] satisfies ("completed" | "aborted" | "failed")[])("compaction ending %s outside a turn keeps idle and its last outcome", async (outcome) => {
+  const { initialStatus, reduceStatus, statusOf } = await import("../packages/oar/src/observe/agent-status.js");
+  const boundary = event([{ kind: "compaction_ended", outcome, trigger: "auto" }]);
+  expect(reduceStatus(initialStatus, boundary)).toEqual(initialStatus);
+  const ended = event([{ kind: "turn_ended", outcome: { kind: "completed" } }]);
+  const idle = reduceStatus(initialStatus, ended);
+  expect(reduceStatus(idle, boundary)).toEqual(idle);
+  expect(statusOf([ended, boundary]).value).toEqual(idle);
+});

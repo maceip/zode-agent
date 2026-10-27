@@ -1,0 +1,20 @@
+{
+  "title": "@comma-agents/core",
+  "pages": [
+    "agents",
+    "flows",
+    "strategy",
+    "hub",
+    "prompts",
+    "hooks",
+    "tools",
+    "skills",
+    "mcp",
+    "context",
+    "credentials",
+    "sandbox",
+    "model",
+    "defaults",
+    "errors"
+  ]
+}

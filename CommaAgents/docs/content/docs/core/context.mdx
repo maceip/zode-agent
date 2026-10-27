@@ -1,0 +1,83 @@
+---
+title: Conversation Context
+description: Per-agent conversation records and JSONL import/export.
+---
+
+# Conversation Context
+
+Conversation context is per-agent state. Each agent created with `createAgent` stores canonical conversation records and derives the structured message history used for its next model call.
+
+## createConversationContext
+
+Creates an empty `ConversationContext`.
+
+```ts
+import {
+  createConversationContext,
+  createConversationRecord,
+} from "@comma-agents/core";
+
+const context = createConversationContext();
+
+const record = createConversationRecord({
+  agentName: "assistant",
+  userMessage: "What is TypeScript?",
+  responseMessages: [{ role: "assistant", content: "A typed JavaScript superset." }],
+  text: "A typed JavaScript superset.",
+  usage: { promptTokens: 42, completionTokens: 12 },
+  finishReason: "stop",
+});
+
+context.appendRecord(record);
+
+console.log(context.records());
+console.log(context.messages());
+```
+
+## Retention
+
+Context retention is non-destructive. Superseded records remain available from
+`records()` and JSONL export, but `messages()` excludes them from the next model
+call.
+
+```ts
+const context = createConversationContext({
+  rollingWindow: 40,
+  compaction: { keepRecent: 8, summarize: async (records) => summarize(records) },
+});
+
+await context.prepareForCall({ agentName: "assistant" });
+```
+
+## Import And Export
+
+Contexts can import and export records directly or as newline-delimited JSON. Run stores and other persistence layers decide where the JSONL lives; the context owns only the conversation record contract.
+
+```ts
+const jsonl = context.exportJsonl();
+
+const restored = createConversationContext();
+restored.importJsonl(jsonl);
+
+console.log(restored.exportRecords());
+```
+
+## Types
+
+### ConversationContext
+
+The context instance returned by `createConversationContext`.
+
+<AutoTypeTable path="../packages/core/src/conversation-context/conversation-context.types.ts" name="ConversationContext" />
+
+### ConversationRecord
+
+A single agent call record with replay messages, exact usage, and finish metadata.
+
+<AutoTypeTable path="../packages/core/src/conversation-context/conversation-context.types.ts" name="ConversationRecord" />
+
+### ConversationHistory
+
+An ordered collection of conversation records.
+
+<AutoTypeTable path="../packages/core/src/conversation-context/conversation-context.types.ts" name="ConversationHistory" />

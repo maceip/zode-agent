@@ -1,0 +1,416 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { PROTOCOL_VERSION } from "@agentonweb/connector-contract";
+import { COOKIE_SCOPES_STORAGE_KEY, CREDENTIAL_STORAGE_KEY, STATE_STORAGE_KEY, type StateUpdate, type SurfaceCommand } from "./shared.js";
+
+const transport = vi.hoisted(() => ({
+  discover: vi.fn(), connect: vi.fn(), close: vi.fn(), request: vi.fn(),
+  callbacks: undefined as undefined | {
+    pending(url: string): void; ready(credential?: string): void;
+    rejected(code: string, message: string): void; closed(): void;
+  },
+}));
+vi.mock("./connector-client.js", async (original) => ({
+  ...await original<typeof import("./connector-client.js")>(),
+  discoverRuntimes: transport.discover,
+  ConnectorClient: class {
+    constructor(callbacks: NonNullable<typeof transport.callbacks>) { transport.callbacks = callbacks; }
+    connect = transport.connect; close = transport.close; request = transport.request;
+  },
+}));
+
+const runtime = { id: "native-test", displayName: "Native test", surfaceKind: "web", capabilities: { translucency: true, optionTap: true } };
+const available = { kind: "available", protocolVersion: PROTOCOL_VERSION, runtime, endpoint: "ws://127.0.0.1:3847", approvalUrl: "http://127.0.0.1:3080/" };
+const nativeSurface = { runtimeId: runtime.id, displayName: runtime.displayName, url: "http://localhost:3080/",
+  cookie: { name: "native-session", value: "private-session-cookie", maxAgeSeconds: 60 } };
+const tab = { id: 1, url: "https://example.org/", windowId: 1 };
+let data: Record<string, unknown>;
+let chromeMock: ReturnType<typeof createChrome>;
+
+function event() { return { addListener: vi.fn() }; }
+function createChrome() {
+  return {
+    runtime: { id: "extension-test", onMessage: event() },
+    permissions: { request: vi.fn(async () => true), contains: vi.fn(async () => true) },
+    commands: { onCommand: event(), getAll: vi.fn(async () => [
+      { name: "mode-chill", shortcut: "Ctrl+1" },
+      { name: "mode-focus", shortcut: "Ctrl+2" },
+      { name: "mode-watch", shortcut: "Ctrl+3" },
+    ]) }, action: { onClicked: event() },
+    alarms: { create: vi.fn(async () => {}), onAlarm: event() },
+    tabs: { query: vi.fn(async () => [tab]), sendMessage: vi.fn(async (_id: number, _message: StateUpdate | SurfaceCommand) => {}), onRemoved: event(), onActivated: event(),
+      update: vi.fn(async () => {}), create: vi.fn(async () => {}) },
+    windows: { update: vi.fn(async () => {}), onFocusChanged: event(), WINDOW_ID_NONE: -1 },
+    storage: { session: { get: vi.fn(async () => ({})), set: vi.fn(async () => {}), remove: vi.fn(async () => {}) }, local: {
+      setAccessLevel: vi.fn(async () => {}), get: vi.fn(async () => structuredClone(data)),
+      set: vi.fn(async (values: Record<string, unknown>) => { Object.assign(data, structuredClone(values)); }),
+    } },
+    cookies: {
+      onChanged: event(),
+      getPartitionKey: vi.fn(async () => ({ partitionKey: { topLevelSite: "https://example.org" } })),
+      set: vi.fn(async (_details: unknown) => ({ name: "native-session" })), remove: vi.fn(async () => ({})),
+    },
+    declarativeNetRequest: { getSessionRules: vi.fn(async () => [{ id: 1_000_999 }]), updateSessionRules: vi.fn(async (_update: { addRules?: unknown[]; removeRuleIds?: number[] }) => {}) },
+  };
+}
+async function boot() {
+  await import("./background.js");
+  await vi.waitFor(() => expect(chromeMock.tabs.sendMessage).toHaveBeenCalled());
+}
+async function message(type: string, sender = { id: "extension-test", frameId: 0, tab }, fields: Record<string, unknown> = {}) {
+  const listener = chromeMock.runtime.onMessage.addListener.mock.calls[0]![0];
+  return new Promise<any>((resolve) => {
+    if (!listener({ source: "agentonweb-content", type, ...fields }, sender, resolve)) resolve(undefined);
+  });
+}
+
+beforeEach(() => {
+  vi.resetModules(); vi.clearAllMocks(); data = {}; chromeMock = createChrome();
+  vi.stubGlobal("chrome", chromeMock);
+  transport.discover.mockResolvedValue([available]); transport.request.mockResolvedValue(nativeSurface);
+});
+afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
+
+describe("cross-browser native connection lifecycle", () => {
+  it("restores a delegated cookie removed while its connector remains connected", async () => {
+    await boot();
+    await message("runtime.connect", undefined, { runtimeId: runtime.id });
+    transport.callbacks!.ready("saved-credential");
+    await vi.waitFor(() => expect(chromeMock.cookies.set).toHaveBeenCalledOnce());
+    const changed = chromeMock.cookies.onChanged.addListener.mock.calls[0]?.[0];
+    expect(changed).toBeTypeOf("function");
+    changed({ removed: true, cause: "explicit", cookie: { domain: "localhost", name: nativeSurface.cookie.name } });
+    await vi.waitFor(() => expect(chromeMock.cookies.set).toHaveBeenCalledTimes(2));
+    expect((await message("state.get")).result.connection).toBe("connected");
+  });
+  it("persists bounded read attention IDs before acknowledging and restores them after a worker restart", async () => {
+    data = { [STATE_STORAGE_KEY]: { readAttentionIds: [null, 12, '', 'x'.repeat(201), 'already-read'] } };
+    await boot();
+    expect((await message("state.get")).result.readAttentionIds).toEqual(['already-read']);
+    await message("agent.attention.read", undefined, { attentionId: 'new-read' });
+    expect(data[STATE_STORAGE_KEY]).toMatchObject({ readAttentionIds: ['already-read', 'new-read'] });
+    vi.resetModules(); chromeMock = createChrome(); vi.stubGlobal("chrome", chromeMock);
+    await boot();
+    expect((await message("state.get")).result.readAttentionIds).toEqual(['already-read', 'new-read']);
+  });
+  it.each([undefined, "invalid", "chill", "focus", "watch"])("defaults to Chill and preserves saved mode %s", async (mode) => {
+    data = { [STATE_STORAGE_KEY]: { mode } };
+    await boot();
+    expect((await message("state.get")).result).toMatchObject({
+      mode: mode === "focus" || mode === "watch" ? mode : "chill", opacity: 0.6,
+    });
+  });
+
+  it("persists dismissal through background restart and clears it only on explicit visibility changes", async () => {
+    await boot();
+    await message("visibility.set", undefined, { visible: false });
+    expect(data[STATE_STORAGE_KEY]).toMatchObject({ dismissed: true });
+    vi.resetModules();
+    chromeMock = createChrome();
+    vi.stubGlobal("chrome", chromeMock);
+    await boot();
+    expect((await message("state.get")).result.dismissed).toBe(true);
+    await message("mode.set", undefined, { mode: "focus" });
+    expect((await message("state.get")).result.dismissed).toBe(true);
+    await message("visibility.set", undefined, { visible: true });
+    expect(data[STATE_STORAGE_KEY]).toMatchObject({ dismissed: false });
+    expect(await message("visibility.set", undefined, { visible: "false" })).toBeUndefined();
+  });
+
+  it("toggles only the clicked tab without switching modes or connecting", async () => {
+    data = { [STATE_STORAGE_KEY]: { mode: "focus" } };
+    await boot();
+    chromeMock.tabs.sendMessage.mockClear();
+    const onClick = chromeMock.action.onClicked.addListener.mock.calls[0]![0];
+    onClick(tab);
+    await vi.waitFor(() => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(tab.id, {
+      source: "agentonweb-background", type: "surface.toggle", state: expect.objectContaining({ mode: "focus" }),
+    }));
+    expect(chromeMock.tabs.sendMessage).toHaveBeenCalledOnce();
+    expect(transport.connect).not.toHaveBeenCalled();
+    expect(transport.discover).not.toHaveBeenCalled();
+  });
+
+  it("mode shortcuts reveal only the active tab while preserving shared mode updates", async () => {
+    const otherTab = { ...tab, id: 2, url: "https://example.net/" };
+    chromeMock.tabs.query.mockResolvedValue([tab, otherTab]);
+    await boot();
+    chromeMock.tabs.sendMessage.mockClear();
+    const onCommand = chromeMock.commands.onCommand.addListener.mock.calls[0]![0];
+    onCommand("mode-watch", otherTab);
+    await vi.waitFor(() => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(otherTab.id, {
+      source: "agentonweb-background", type: "surface.show", state: expect.objectContaining({ mode: "watch" }),
+    }));
+    const commands = chromeMock.tabs.sendMessage.mock.calls.filter(([, message]) => message.type !== "state.update");
+    expect(commands).toHaveLength(1);
+    expect(commands[0]![0]).toBe(otherTab.id);
+    expect((await message("state.get")).result.mode).toBe("watch");
+    expect(transport.connect).not.toHaveBeenCalled();
+  });
+
+  it("returns current mode bindings on initial state and explicit refresh without persisting them", async () => {
+    await boot();
+    expect((await message("state.get")).modeShortcuts).toEqual(await chromeMock.commands.getAll());
+    chromeMock.commands.getAll.mockResolvedValue([{ name: "mode-focus", shortcut: "" }]);
+    expect((await message("mode.shortcuts.get")).result).toEqual([{ name: "mode-focus", shortcut: "" }]);
+    expect(JSON.stringify(data[STATE_STORAGE_KEY])).not.toContain("shortcut");
+  });
+
+  it.each(["page", "command"])("deduplicates page and command mode shortcuts when %s arrives first", async (first) => {
+    await boot();
+    chromeMock.tabs.sendMessage.mockClear();
+    const onCommand = chromeMock.commands.onCommand.addListener.mock.calls[0]![0];
+    const shows = () => chromeMock.tabs.sendMessage.mock.calls.filter(([, message]) => message.type === "surface.show");
+    const pageKey = () => message("mode.shortcut", undefined, { mode: "focus" });
+    if (first === "page") await pageKey();
+    else {
+      onCommand("mode-focus", tab);
+      await vi.waitFor(() => expect(shows()).toHaveLength(1));
+    }
+    if (first === "page") onCommand("mode-focus", tab);
+    else await pageKey();
+    // Drain command callbacks and state publication before counting both paths.
+    await message("state.get");
+    expect(shows()).toHaveLength(1);
+    expect(shows()[0]![0]).toBe(tab.id);
+    expect((await message("state.get")).result.mode).toBe("focus");
+  });
+
+  it("keeps different tabs, different modes and later shortcut presses independent", async () => {
+    await boot();
+    let time = 1_000;
+    vi.spyOn(performance, "now").mockImplementation(() => time);
+    chromeMock.tabs.sendMessage.mockClear();
+    const onCommand = chromeMock.commands.onCommand.addListener.mock.calls[0]![0];
+    const shows = () => chromeMock.tabs.sendMessage.mock.calls.filter(([, message]) => message.type === "surface.show");
+    await message("mode.shortcut", undefined, { mode: "focus" });
+    onCommand("mode-focus", { ...tab, id: 2 });
+    await vi.waitFor(() => expect(shows()).toHaveLength(2));
+    onCommand("mode-watch", tab);
+    await vi.waitFor(() => expect(shows()).toHaveLength(3));
+    await message("mode.shortcut", undefined, { mode: "watch" });
+    expect(shows()).toHaveLength(3);
+    time += 251;
+    await message("mode.shortcut", undefined, { mode: "watch" });
+    expect(shows()).toHaveLength(4);
+    // Mode buttons must work even within the keyboard deduplication interval.
+    await message("mode.set", undefined, { mode: "chill" });
+    expect((await message("state.get")).result.mode).toBe("chill");
+    vi.restoreAllMocks();
+  });
+
+  it("uses the active tab when a browser command omits its tab argument", async () => {
+    await boot();
+    chromeMock.tabs.sendMessage.mockClear();
+    chromeMock.commands.onCommand.addListener.mock.calls[0]![0]("mode-focus");
+    await vi.waitFor(() => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(tab.id, expect.objectContaining({ type: "surface.show" })));
+    await message("mode.shortcut", undefined, { mode: "focus" });
+    expect(chromeMock.tabs.sendMessage.mock.calls.filter(([, message]) => message.type === "surface.show")).toHaveLength(1);
+  });
+
+  it("does not let a delayed duplicate of an earlier key reverse a newer mode", async () => {
+    await boot();
+    await message("mode.shortcut", undefined, { mode: "focus" });
+    await message("mode.shortcut", undefined, { mode: "watch" });
+    chromeMock.commands.onCommand.addListener.mock.calls[0]![0]("mode-focus", tab);
+    expect((await message("state.get")).result.mode).toBe("watch");
+  });
+
+  it("ignores toolbar actions on restricted browser pages", async () => {
+    await boot(); chromeMock.tabs.sendMessage.mockClear();
+    const onClick = chromeMock.action.onClicked.addListener.mock.calls[0]![0];
+    onClick({ ...tab, url: "chrome://extensions/" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(chromeMock.tabs.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit connection and keeps credentials out of content-script state", async () => {
+    vi.stubEnv("BROWSER", "firefox");
+    await boot(); expect(transport.connect).not.toHaveBeenCalled();
+    expect(chromeMock.storage.local.setAccessLevel).toHaveBeenCalledWith({ accessLevel: "TRUSTED_CONTEXTS" });
+    await message("runtime.connect"); expect(transport.connect).toHaveBeenCalledWith(available.endpoint, undefined);
+    expect(data[CREDENTIAL_STORAGE_KEY]).toBeUndefined();
+    transport.callbacks!.pending(available.approvalUrl);
+    await vi.waitFor(() => expect(chromeMock.tabs.create).toHaveBeenCalledWith({ url: available.approvalUrl }));
+    transport.callbacks!.ready("private-installation-credential");
+    await vi.waitFor(() => expect(chromeMock.cookies.set).toHaveBeenCalled());
+    const response = await message("state.get");
+    expect(response.result.surface).toMatchObject({ runtimeId: runtime.id, url: nativeSurface.url });
+    expect(data[CREDENTIAL_STORAGE_KEY]).toEqual({ [runtime.id]: "private-installation-credential" });
+    for (const exposed of [response, data[STATE_STORAGE_KEY], chromeMock.tabs.sendMessage.mock.calls]) {
+      expect(JSON.stringify(exposed)).not.toContain("private-installation-credential");
+      expect(JSON.stringify(exposed)).not.toContain("private-session-cookie");
+    }
+    expect(chromeMock.cookies.set).toHaveBeenCalledWith(expect.objectContaining({ httpOnly: true, secure: true, partitionKey: { topLevelSite: "https://example.org" } }));
+  });
+
+  it("publishes an unpaired runtime's management origin while another runtime stays selected", async () => {
+    await boot();
+    await message("runtime.connect");
+    transport.callbacks!.ready("installation-credential");
+    await vi.waitFor(() => expect(chromeMock.cookies.set).toHaveBeenCalled());
+    transport.discover.mockResolvedValue([available, { ...available,
+      runtime: { ...runtime, id: "terminal", displayName: "Local terminal" },
+      endpoint: "ws://127.0.0.1:3848", approvalUrl: "http://localhost:49827/",
+    }]);
+    await message("runtime.connect");
+    const response = await message("state.get");
+    expect(response.result).toMatchObject({ runtimeId: runtime.id, nativeOrigins: expect.arrayContaining(["http://localhost:49827"]) });
+    expect(response.result.surfaces).toEqual([expect.objectContaining({ runtimeId: runtime.id })]);
+    expect(transport.connect).toHaveBeenCalledOnce();
+  });
+
+  it("returns a tab from a removed revoked runtime to an already connected workspace", async () => {
+    const temporary = { ...available, runtime: { ...runtime, id: "temporary", displayName: "Local terminal · acceptance" },
+      endpoint: "ws://127.0.0.1:3848", approvalUrl: "http://localhost:49827/" };
+    transport.discover.mockResolvedValue([available, temporary]);
+    await boot();
+    await message("runtime.connect", undefined, { runtimeId: runtime.id });
+    transport.callbacks!.ready("primary-credential");
+    await vi.waitFor(() => expect(chromeMock.cookies.set).toHaveBeenCalled());
+    transport.request.mockResolvedValue({ ...nativeSurface, runtimeId: "temporary", url: temporary.approvalUrl,
+      cookie: { ...nativeSurface.cookie, name: "temporary-session" } });
+    await message("runtime.connect", undefined, { runtimeId: "temporary" });
+    transport.callbacks!.ready("temporary-credential");
+    await vi.waitFor(async () => expect((await message("state.get")).result.surface?.runtimeId).toBe("temporary"));
+    transport.callbacks!.rejected("REVOKED", "Connection revoked.");
+    transport.callbacks!.closed();
+    await vi.waitFor(async () => expect((await message("state.get")).result.connection).toBe("disconnected"));
+    transport.discover.mockResolvedValue([available]);
+    await message("runtime.connect");
+    const response = await message("state.get");
+    expect(response.result).toMatchObject({ connection: "connected", runtimeId: runtime.id,
+      surface: { runtimeId: runtime.id }, runtimes: [{ id: runtime.id, displayName: runtime.displayName }] });
+    expect(transport.connect).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a selection after removing the tab's revoked runtime without pairing another runtime", async () => {
+    await boot();
+    await message("runtime.connect");
+    transport.callbacks!.ready("temporary-credential");
+    await vi.waitFor(() => expect(chromeMock.cookies.set).toHaveBeenCalled());
+    transport.callbacks!.rejected("REVOKED", "Connection revoked.");
+    transport.callbacks!.closed();
+    await vi.waitFor(async () => expect((await message("state.get")).result.connection).toBe("disconnected"));
+    const other = { ...available, runtime: { ...runtime, id: "other", displayName: "Other workspace" }, endpoint: "ws://127.0.0.1:3848" };
+    transport.discover.mockResolvedValue([other]);
+    await message("runtime.connect");
+    const response = await message("state.get");
+    expect(response.result).toMatchObject({ connection: "disconnected", error: "Choose a local workspace to connect.",
+      runtimes: [{ id: "other", displayName: "Other workspace" }] });
+    expect(response.result.runtimeId).toBeUndefined();
+    expect(response.result.surface).toBeUndefined();
+    expect(transport.connect).toHaveBeenCalledOnce();
+    expect(chromeMock.tabs.create).not.toHaveBeenCalled();
+  });
+
+  it("isolates Chrome HTTP and WebSocket authentication from stale first-party cookies", async () => {
+    await boot();
+    expect(chromeMock.declarativeNetRequest.updateSessionRules).toHaveBeenCalledWith({ removeRuleIds: [1_000_999] });
+    await message("runtime.connect");
+    transport.callbacks!.ready("private-chrome-credential");
+    await vi.waitFor(() => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(tab.id, expect.objectContaining({
+      state: expect.objectContaining({ surface: expect.objectContaining({ runtimeId: runtime.id }) }),
+    })));
+    expect(chromeMock.cookies.set).toHaveBeenCalledWith(expect.objectContaining({ httpOnly: true, secure: true, partitionKey: { topLevelSite: "https://example.org" } }));
+    expect(chromeMock.declarativeNetRequest.updateSessionRules).toHaveBeenCalledWith(expect.objectContaining({ addRules: [expect.objectContaining({
+      action: { type: "modifyHeaders", requestHeaders: [{ header: "Cookie", operation: "set", value: "native-session=private-session-cookie" }] },
+      condition: expect.objectContaining({ regexFilter: "^(http|ws)://localhost:3080/", tabIds: [tab.id] }),
+    })] }));
+    for (const exposed of [await message("state.get"), data, chromeMock.tabs.sendMessage.mock.calls]) {
+      expect(JSON.stringify(exposed)).not.toContain("private-session-cookie");
+    }
+    transport.callbacks!.rejected("REVOKED", "Connection revoked.");
+    await vi.waitFor(() => expect(chromeMock.declarativeNetRequest.updateSessionRules).toHaveBeenCalledWith({ removeRuleIds: [1_000_001] }));
+  });
+
+  it("uses a tab-bound HTTP lease and a local HttpOnly cookie for Safari WebSockets", async () => {
+    vi.stubEnv("BROWSER", "safari");
+    await boot();
+    await message("runtime.connect");
+    transport.callbacks!.ready("private-safari-credential");
+    await vi.waitFor(() => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(tab.id, expect.objectContaining({
+      state: expect.objectContaining({ surface: expect.objectContaining({ runtimeId: runtime.id }) }),
+    })));
+    expect(chromeMock.permissions.contains).toHaveBeenCalledOnce();
+    expect(chromeMock.permissions.request).not.toHaveBeenCalled();
+    expect(chromeMock.cookies.set).toHaveBeenCalledWith(expect.objectContaining({
+      url: nativeSurface.url, httpOnly: true, secure: false, sameSite: "no_restriction",
+    }));
+    expect(chromeMock.cookies.set.mock.calls[0]![0]).not.toHaveProperty("partitionKey");
+    const update = chromeMock.declarativeNetRequest.updateSessionRules.mock.calls
+      .map(([value]) => value)
+      .find((value) => value.addRules?.length);
+    expect(update).toMatchObject({ addRules: [{
+      action: { type: "modifyHeaders", requestHeaders: [{ header: "Cookie", operation: "set", value: "native-session=private-session-cookie" }] },
+      condition: { regexFilter: "^(http|ws)://localhost:3080/", tabIds: [tab.id] },
+    }] });
+  });
+
+  it("keeps Safari native management tabs on first-party cookies after pairing", async () => {
+    vi.stubEnv("BROWSER", "safari");
+    const managementTab = { ...tab, id: 2, url: nativeSurface.url };
+    chromeMock.tabs.query.mockResolvedValue([tab, managementTab]);
+    await boot();
+    await message("runtime.connect");
+    transport.callbacks!.ready("private-safari-credential");
+    await vi.waitFor(() => expect(chromeMock.tabs.sendMessage).toHaveBeenCalledWith(managementTab.id, expect.objectContaining({
+      state: expect.objectContaining({ surface: expect.objectContaining({ url: nativeSurface.url }) }),
+    })));
+    const rules = chromeMock.declarativeNetRequest.updateSessionRules.mock.calls.flatMap(([update]) => update.addRules ?? []);
+    expect(rules).toEqual([expect.objectContaining({ condition: expect.objectContaining({ tabIds: [tab.id] }) })]);
+    // Still identify the native origin in content state so its own page hides
+    // the overlay, while the website retains its delegated iframe session.
+    const response = await message("state.get", { id: "extension-test", frameId: 0, tab: managementTab });
+    expect(response.result.surfaces).toEqual([expect.objectContaining({ url: nativeSurface.url })]);
+  });
+
+  it("cleans persisted cookie scopes after a cold start and revoked authorization", async () => {
+    data = {
+      [STATE_STORAGE_KEY]: { runtimeId: runtime.id, opacity: 0.23 },
+      [CREDENTIAL_STORAGE_KEY]: { [runtime.id]: "saved-credential" },
+      [COOKIE_SCOPES_STORAGE_KEY]: [{ runtimeId: runtime.id, url: "https://localhost:3080/", name: "native-session", partitionKey: { topLevelSite: "https://stored.example" } }],
+    };
+    await boot(); await vi.waitFor(() => expect(transport.connect).toHaveBeenCalledWith(available.endpoint, "saved-credential"));
+    transport.callbacks!.ready();
+    await vi.waitFor(() => expect(chromeMock.declarativeNetRequest.updateSessionRules).toHaveBeenCalledWith(expect.objectContaining({ addRules: expect.any(Array) })));
+    transport.callbacks!.rejected("REVOKED", "Connection revoked."); transport.callbacks!.closed();
+    await vi.waitFor(() => expect(data[COOKIE_SCOPES_STORAGE_KEY]).toEqual([]));
+    expect(chromeMock.cookies.remove).toHaveBeenCalledWith(expect.objectContaining({ partitionKey: { topLevelSite: "https://stored.example" } }));
+    expect(data[CREDENTIAL_STORAGE_KEY]).toEqual({});
+    const response = await message("state.get");
+    expect(response.result).toMatchObject({ connection: "disconnected", opacity: 0.23 });
+    expect(response.result.surface).toBeUndefined();
+  });
+
+  it("registers a persistent alarm that retries an authorized runtime when offline", async () => {
+    data = { [STATE_STORAGE_KEY]: { runtimeId: runtime.id }, [CREDENTIAL_STORAGE_KEY]: { [runtime.id]: "saved-credential" } };
+    transport.discover.mockResolvedValue([]);
+    await boot(); await vi.waitFor(() => expect(transport.discover).toHaveBeenCalledOnce());
+    expect(chromeMock.alarms.create).toHaveBeenCalledWith("agentonweb-reconnect", { periodInMinutes: 0.5 });
+    const onAlarm = chromeMock.alarms.onAlarm.addListener.mock.calls[0]![0];
+    transport.discover.mockResolvedValue([available]);
+    onAlarm({ name: "agentonweb-reconnect" });
+    await vi.waitFor(() => expect(transport.connect).toHaveBeenCalledWith(available.endpoint, "saved-credential"));
+  });
+
+  it("restores matching surface and dock selection after the persisted runtime was removed", async () => {
+    data = { [STATE_STORAGE_KEY]: { runtimeId: "removed-acceptance-runtime", mode: "chill", opacity: 0.6 },
+      [CREDENTIAL_STORAGE_KEY]: { [runtime.id]: "saved-credential" } };
+    await boot();
+    transport.callbacks!.ready();
+    await vi.waitFor(() => expect(chromeMock.cookies.set).toHaveBeenCalled());
+    const response = await message("state.get");
+    expect(response.result).toMatchObject({ connection: "connected", runtimeId: runtime.id,
+      runtime, surface: { runtimeId: runtime.id }, runtimes: [{ id: runtime.id, displayName: runtime.displayName }] });
+    expect(transport.connect).toHaveBeenCalledExactlyOnceWith(available.endpoint, "saved-credential");
+    expect(chromeMock.tabs.create).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(data[STATE_STORAGE_KEY]).toMatchObject({ runtimeId: runtime.id }));
+  });
+
+  it("rejects privileged requests from another extension or an iframe", async () => {
+    await boot();
+    expect(await message("runtime.connect", { id: "other-extension", frameId: 0, tab })).toBeUndefined();
+    expect(await message("runtime.connect", { id: "extension-test", frameId: 2, tab })).toBeUndefined();
+    expect(transport.connect).not.toHaveBeenCalled();
+  });
+});

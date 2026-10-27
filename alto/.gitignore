@@ -1,0 +1,10 @@
+node_modules/
+dist/
+/tmp/
+.codex-cordis/
+schemas/codex/
+.DS_Store
+*.log
+native/ghostty/build/
+native/ghostty/vendor/
+native/ghostty/.cache/

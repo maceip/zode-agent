@@ -1,0 +1,102 @@
+.model-defaults-settings .model-defaults-description,
+.model-defaults-settings .model-defaults-note {
+  margin: 0;
+  color: var(--settings-helper-text);
+  font-size: var(--type-supporting);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.model-defaults-settings .settings-row {
+  flex-wrap: wrap;
+}
+
+.model-defaults-settings .settings-row-copy {
+  flex: 1 1 150px;
+}
+
+.model-defaults-settings .settings-row-control {
+  flex: 0 1 240px;
+  max-width: 100%;
+}
+
+.model-defaults-settings .settings-row select {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  text-overflow: ellipsis;
+}
+
+.model-defaults-settings .model-defaults-select {
+  position: relative;
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+}
+
+.model-defaults-settings .model-defaults-select select {
+  padding-right: calc(var(--space-5) + var(--space-1));
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: none;
+  cursor: pointer;
+}
+
+.model-defaults-settings .model-defaults-select > svg {
+  position: absolute;
+  top: 50%;
+  right: var(--space-2);
+  transform: translateY(-50%);
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  pointer-events: none;
+}
+
+.model-defaults-settings .model-defaults-select:focus-within > svg {
+  color: var(--text);
+}
+
+.model-defaults-settings .model-defaults-select select:disabled + svg {
+  opacity: 0.55;
+}
+
+.model-defaults-settings .model-defaults-load {
+  min-height: var(--control-default);
+  padding: var(--space-1) var(--space-3);
+  color: var(--text);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-row);
+  background: var(--panel-solid);
+  font-size: var(--type-supporting);
+  cursor: pointer;
+}
+
+.model-defaults-settings .model-defaults-load:hover {
+  background: var(--surface-hover);
+}
+
+.model-defaults-settings button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.model-defaults-settings .model-defaults-note button {
+  padding: 0;
+  color: var(--accent);
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.model-defaults-status {
+  min-height: 1.5em;
+  color: var(--settings-helper-text);
+  font-size: var(--type-supporting);
+}
+
+.model-defaults-error {
+  color: var(--red);
+}

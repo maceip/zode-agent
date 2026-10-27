@@ -1,0 +1,40 @@
+.cordis-math {
+  color: inherit;
+}
+
+.cordis-math-inline {
+  display: inline-block;
+  margin: 0 0.035em;
+  max-width: 100%;
+  vertical-align: -0.09em;
+}
+
+.cordis-math-inline .katex {
+  font-size: 1.16em;
+}
+
+.cordis-math-display {
+  display: block;
+  margin: 1.15em 0 1.35em;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.15em 1em 0.3em;
+  text-align: center;
+}
+
+.cordis-math-display .katex-display {
+  margin: 0;
+  min-width: max-content;
+}
+
+.cordis-math-display .katex {
+  color: var(--text-strong);
+  font-size: 1.19em;
+}
+
+.cordis-math .katex-error {
+  color: var(--danger);
+  font-family: var(--mono);
+  font-size: 0.88em;
+}

@@ -1,0 +1,130 @@
+# AgentOnWeb
+
+**[English](README.md)** · **[简体中文](README.zh-CN.md)**
+
+**把你原生的编程助手带到你正在使用的网页上。**
+
+AgentOnWeb 将你的编程工作区带到你当前打开的页面上。一边看视频、查阅文档，或保持某个网站在视野中，一边与你的助手协作——然后无需离开对话即可切回原页面。
+
+**直接在网页上使用 Codex、Claude Code 或 Pi。** 在内置终端中打开项目，查看正在运行的会话，在任务完成或需要审批时收到提醒。点击会话即可回到对应终端。AgentOnWeb 也支持完整的 **DeepSeek Harness (DSH)** 工作区，保留会话、工具、审批、模型及插件。
+
+| 模式 | 功能 |
+| --- | --- |
+| **Chill（轻松）** | 在半透明的工作区中工作，网页在背后依然可见。可调整透明度以适应页面。 |
+| **Focus（专注）** | 为同一工作区切换不透明背景，专注编程。 |
+| **Watch（观看）** | 隐藏工作区，正常使用网页，同时保留一个小型 dock，随时唤回你的助手。 |
+
+切换模式不会中断会话。在 Chill 模式下，双击 **Option / Alt** 可与网页交互；再次双击即可返回工作区。
+
+## 观看演示
+
+[![在 YouTube 上观看 AgentOnWeb 演示](docs/assets/agentonweb-demo-cover.png)](https://www.youtube.com/watch?v=s083RpD38HU)
+
+**[中文演示](https://www.youtube.com/watch?v=DV8s9z-w4GE)** · **[English demo](https://www.youtube.com/watch?v=s083RpD38HU)**
+
+演示包含 Chill、Focus、Watch、透明度调节，以及在真实编程会话中与网页交互的过程。
+
+## 安装与使用教程
+
+**[中文教程](https://www.youtube.com/watch?v=kyeRpiG3asg)** · **[English tutorial](https://www.youtube.com/watch?v=CIfW76WAcwA)**
+
+100 秒演示 DSH 准备、Chrome 商店安装、Connect 连接授权、生成第一个代码文件，以及 Chill、Focus、Watch 的使用方式。两条视频均附字幕和章节时间点。
+
+## 获取扩展
+
+| 浏览器 | 商店安装 |
+| --- | --- |
+| Chrome | [从 Chrome 应用商店安装](https://chromewebstore.google.com/detail/agentonweb/lhbmeokjjcmklamnepcechnpcdjgkcoe) |
+| Firefox | [从 Firefox 附加组件安装](https://addons.mozilla.org/en-US/firefox/addon/agentonweb/) |
+
+## 使用 Codex、Claude Code 和 Pi
+
+适用于 **macOS + Chrome**。请先安装 [Node.js 22.19+](https://nodejs.org/en/download)，并安装、登录你要使用的 CLI（Codex、Claude Code 或 Pi 1.1+）。
+
+### 1. 一键配置终端
+
+在 Mac 的“终端”中运行一次：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/HeftyKoo/AgentOnWeb/main/scripts/install.sh | bash
+```
+
+安装器会配置本机终端、登录自动启动和 Chrome 连接，先检测 `PATH` 中的 Codex / Claude Code / Pi，再显示多选框菜单，默认勾选全部已检测到的 CLI。方向键移动，空格切换勾选，A 全选/全不选，I 反选，回车确认；清空勾选可只配置终端服务，Ctrl+C 或 Esc 取消。已有的 CLI 设置会保留。也可以用 `aow setup --agents codex,claude`、`--agents all` 或 `--agents none` 显式选择。
+
+安装命令兼容 zsh、bash 和 fish。如果 Node 命令目录已在 PATH 中且可写，安装器会在其中创建 `aow` 入口，同一个终端安装后即可运行 `aow service`，无需 source。新开的 zsh/bash 窗口及检测到的 fish 也会配置 `aow` 路径。如果该目录受保护或已有其他程序的 `aow` 命令，可直接运行 `"$HOME/.local/bin/aow" service`。
+
+### 2. 在网页上使用编程助手
+
+打开任意网站，点击 AgentOnWeb，在它的终端中进入项目目录并启动 Codex：
+
+```sh
+cd ~/你的项目
+codex
+```
+
+要接收会话通知，在 Codex 中打开 `/hooks`，审查并信任 **AgentOnWeb session status**，然后新建一个 Codex 会话。已安装的 hooks 只需信任一次。
+
+使用 Claude Code 时，在同一终端运行 `claude`。安装器会在 `CLAUDE_CONFIG_DIR/settings.json`（默认 `~/.claude/settings.json`）中添加观察性 hooks。在 Claude Code `/hooks` 中查看 **AgentOnWeb session status**，然后启动新会话。单独修复或移除该集成可运行 `aow claude-hooks install` 或 `aow claude-hooks uninstall`；模型、权限、其他 hooks 和历史记录都会保留。
+
+使用 Pi 1.1+ 时，在同一终端运行 `pi`。配置会在 `PI_CODING_AGENT_DIR`（默认 `~/.pi/agent`）下添加 `extensions/agentonweb.ts`，保留设置和其他 extensions。重新启动 Pi 或运行 `/reload` 加载。单独修复或移除可运行 `aow pi-extension install` 或 `aow pi-extension uninstall`，然后 `/reload`。完成通知会等待 Pi 的最终结束事件；extension 弹出确认或输入对话框时，浏览器会提示你回到终端处理。
+
+点击终端标签栏的 **+** 打开另一个项目，点击标签切换，双击名称重命名，点击 **×** 关闭。隐藏工作区或刷新网页不会中断正在运行的会话。
+
+终端主机 0.4.3 每天检查 npm 正式版，并在本地管理页显示更新提醒。运行 `aow check-update` 可立即检查，`aow check-update --disable` 可关闭自动检查。退出或关闭所有终端后，在 Mac 的独立“终端”窗口运行 `aow update` 升级；`aow service restart` 用于加载已安装的新代码。CLI 0.4.3 还支持通过 `aow update --force` 重新安装并重启已核实归属的旧服务，这会结束其活动任务。如果旧 CLI 提示无法准备更新，请先完成终端任务，运行 `aow service uninstall`，再重新运行安装命令一次。
+
+[安装与常见问题](docs/one-command-setup.md) · [终端指南](packages/terminal-host/README.md)
+
+## 使用 DeepSeek Harness
+
+### 1. 配置 DSH
+
+你需要 **Node.js 22.19+**、**DeepSeek Harness**，以及在 DSH 中配置好的模型服务商凭据。浏览器扩展会连接运行在你电脑上的 DSH。
+
+如果尚未安装 DSH：
+
+```sh
+npm install -g @deepseek-ai/dsh@latest
+```
+
+在 DSH 中配置服务商凭据（例如 `DEEPSEEK_API_KEY`），然后安装 AgentOnWeb 集成并启动工作区：
+
+```sh
+dsh plugin --profile web add @agentonweb/dsh-surface@0.4.0
+dsh web
+```
+
+使用扩展期间请保持 `dsh web` 运行。如果安装插件时 DSH 已在运行，请重启它。模型凭据保存在 DSH 中；你无需在扩展中输入 API 密钥。
+
+### 2. 连接你的浏览器
+
+1. 安装并启用浏览器扩展，然后打开一个普通网站。
+2. 点击扩展工具栏图标或右下角的 dock 打开 AgentOnWeb。展开 dock，点击 **+**，选择 **DeepSeek Harness**，按提示点击 **Connect（连接）**。
+3. 在打开的 DSH 页面中，点击 **Allow connection（允许连接）**。
+4. 回到你的网站，开始在 DSH 工作区中工作。
+
+Safari 可能还会请求允许访问网站以及本地会话存储。按照浏览器提示完成连接即可。
+
+授权后，只要 DSH 在运行，浏览器就会自动重新连接。你可以通过 **DSH Settings（设置）→ AgentOnWeb → Revoke connection（撤销连接）** 移除访问权限。
+
+## 日常操作
+
+通过 dock 在本地终端与 DSH 工作区之间切换，两边的会话都会继续运行。
+
+使用右下角的 dock 切换 **Chill**、**Focus** 或 **Watch**。默认打开 Chill 模式，并带有透明度滑块。关闭面板或使用工具栏图标可将其隐藏；dock 始终可用，便于重新打开。
+
+| 操作 | macOS | Windows / Linux |
+| --- | --- | --- |
+| 显示或隐藏 AgentOnWeb | `Control+0` | `Alt+0` |
+| Chill / Focus / Watch | `Control+1 / 2 / 3` | `Alt+1 / 2 / 3` |
+| 切换工作区 | `` Control+` `` | `` Alt+` `` |
+| 在 Chill 模式下切换工作区与网页的交互 | 双击 `Option` | 双击 `Alt` |
+
+快捷键的可用性取决于浏览器及已有的按键绑定。你可以在浏览器的扩展快捷键设置中调整。AgentOnWeb 适用于普通 HTTP(S) 网站；浏览器受保护的页面（如扩展设置页）无法承载工作区。
+
+## 开发
+
+源码安装、浏览器构建及验证步骤请参阅[开发文档](docs/development.md)，打包与发布请参阅[发布指南](docs/releasing.md)。
+
+## 链接
+
+[报告问题](https://github.com/HeftyKoo/AgentOnWeb/issues) · [隐私政策](https://heftykoo.github.io/AgentOnWeb/privacy.html) · [更新记录](CHANGELOG.md)

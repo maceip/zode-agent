@@ -1,0 +1,234 @@
+import assert from "node:assert/strict";
+import { test } from "vitest";
+import type { Frame, RawEvent } from "../../packages/oar/src/contracts/session.js";
+import { awaitTurnEnd, graphOf, promptAndWait, usageOf, viewOf } from "../../packages/oar/src/observe/index.js";
+import {
+  GROK_EXTENSION_NOTIFICATIONS,
+  grokContextUsage,
+  grokPromptTokens,
+} from "../../packages/oar/src/runtimes/grok/session.js";
+import { createAcpProjectionState, projectAcpUpdate } from "../../packages/oar/src/shared/acp/projection.js";
+import { acpLineageOf } from "../../packages/oar/src/shared/acp/records.js";
+import { asRecord } from "../../packages/oar/src/shared/json.js";
+import { describe, start } from "../fixtures/acp-session-support.js";
+import { steer } from "../fixtures/steer.js";
+
+// Frames as grok 1.0.25 (f7e67d6988e2) sent them on 2026-09-11, tapped below
+// the ACP SDK (experiments/grok-wire-tap.ts → oar-trial-run/live-grok-tap/
+// wire.jsonl) and recorded in oar-trial-run/live-grok-c/subagent.voyage.jsonl
+// (seqs 52, 54, 121) and live-grok-a/basic.voyage.jsonl (seq 49); ids
+// shortened, signatures dropped.
+const PARENT = "01a08f46-34e0-7480-a07c-c11300ff7f7f";
+const CHILD = "01a08f46-deb8-7fb1-85aa-73d96c437da7";
+
+test("grok lineage: subagent_spawned / subagent_progress name the pair snake_case under `update`", () => {
+  const spawned = {
+    sessionId: PARENT,
+    update: {
+      sessionUpdate: "subagent_spawned",
+      subagent_id: CHILD,
+      attempt_id: "at1.a3ea6e36f3bf4a0aa6825795cc27794a",
+      parent_session_id: PARENT,
+      parent_prompt_id: "c088ff51-053d-4e9a-a801-ba1ae504ba2a",
+      child_session_id: CHILD,
+      subagent_type: "general-purpose",
+      description: "Echo CHILD-OK-7731",
+      effective_context_source: "new",
+      model: "grok-4.6",
+    },
+  };
+  assert.deepEqual(acpLineageOf(spawned), { parent: PARENT, child: CHILD });
+  const progress = { sessionId: PARENT, update: { sessionUpdate: "subagent_progress", subagent_id: CHILD, parent_session_id: PARENT, child_session_id: CHILD, turn_count: 1 } };
+  assert.deepEqual(acpLineageOf(progress), { parent: PARENT, child: CHILD });
+});
+
+test("grok lineage: subagent_finished names only the child; the parent is the envelope's session", () => {
+  const finished = {
+    sessionId: PARENT,
+    update: { sessionUpdate: "subagent_finished", subagent_id: CHILD, child_session_id: CHILD, status: "completed", output: "CHILD-OK-7731", will_wake: false },
+    _meta: { eventId: `${PARENT}-100`, agentTimestampMs: 1_789_110_195_312 },
+  };
+  assert.deepEqual(acpLineageOf(finished), { parent: PARENT, child: CHILD });
+});
+
+test("lineage is never fabricated: no pair, a self pair, or a vendor kind without ids yields null", () => {
+  assert.equal(acpLineageOf({ sessionId: PARENT, update: { sessionUpdate: "model_changed", model_id: "grok-4.6" } }), null);
+  assert.equal(acpLineageOf({ sessionId: PARENT, update: { sessionUpdate: "turn_completed", prompt_id: "p", stop_reason: "end_turn" } }), null);
+  assert.equal(acpLineageOf({ sessionId: PARENT, update: { child_session_id: PARENT } }), null);
+  assert.equal(acpLineageOf({ upserted: [{ sessionId: PARENT }], removed: [] }), null);
+  // The flat camelCase spelling (fixture / earlier assumption) still links.
+  assert.deepEqual(acpLineageOf({ parentSessionId: "p", sessionId: "c", kind: "spawned" }), { parent: "p", child: "c" });
+});
+
+test("grok prompt answer: `_meta.usage` is the prompt's ledger, `_meta.totalTokens` the context count", () => {
+  const answer = {
+    stopReason: "end_turn",
+    _meta: {
+      sessionId: PARENT,
+      promptId: "bc31f0cd-83fd-44e1-a24f-e48ad481647c",
+      totalTokens: 16_825,
+      modelId: "grok-4.6",
+      inputTokens: 16_791,
+      outputTokens: 34,
+      cachedReadTokens: 1280,
+      reasoningTokens: 28,
+      usage: { inputTokens: 16_791, outputTokens: 34, totalTokens: 16_825, cachedReadTokens: 1280, cacheCreationTokens: 0, reasoningTokens: 28, modelCalls: 1 },
+    },
+  };
+  // #161: the ledger's cachedReadTokens / cacheCreationTokens are the cache parts of its input.
+  assert.deepEqual(grokPromptTokens(answer), { input: 16_791, output: 34, cacheRead: 1280, cacheWrite: 0, reasoning: 28 });
+  assert.deepEqual(grokContextUsage(answer), { tokens: 16_825, contextWindow: null, percent: null });
+  assert.equal(grokPromptTokens({ stopReason: "end_turn" }), null);
+  assert.equal(grokPromptTokens({ stopReason: "cancelled", _meta: { totalTokens: 5 } }), null);
+  // A half ledger is no ledger: the missing side is never invented as 0.
+  assert.equal(grokPromptTokens({ stopReason: "end_turn", _meta: { usage: { inputTokens: 12 } } }), null);
+  // A ledger without a cache field has no such part, never a 0 for it.
+  assert.deepEqual(grokPromptTokens({ stopReason: "end_turn", _meta: { usage: { inputTokens: 12, outputTokens: 3, cachedReadTokens: 8 } } }), { input: 12, output: 3, cacheRead: 8 });
+  assert.deepEqual(grokPromptTokens({ stopReason: "end_turn", _meta: { usage: { inputTokens: 12, outputTokens: 3 } } }), { input: 12, output: 3 });
+  assert.equal(grokPromptTokens({ stopReason: "end_turn", _meta: { usage: { outputTokens: 3, modelCalls: 1 } } }), null);
+});
+
+// The closing `tool_call_update` of a run_terminal_command as grok 1.0.25
+// sent it on 2026-09-22 (scratch run, seq 191): the readable output is the
+// ACP `content` block, `rawOutput.output` is a byte array, and the exit
+// status lives only on `rawOutput`.
+test("grok bash end: output is the content block's text, not the rawOutput byte array; exit_code becomes exitCode", () => {
+  const state = createAcpProjectionState();
+  projectAcpUpdate(state, { toolCallId: "call-bash", title: "run_terminal_command", rawInput: { command: "node --test" }, sessionUpdate: "tool_call" });
+  const ended = projectAcpUpdate(state, {
+    toolCallId: "call-bash",
+    status: "completed",
+    content: [{ type: "content", content: { type: "text", text: "✔ add (0.27ms)\n✔ mul (0.06ms)\n" } }],
+    rawOutput: { type: "Bash", output: [226, 156, 148, 32, 97, 100, 100], output_for_prompt: "exit: 0\n✔ add (0.27ms)\n", exit_code: 0, signal: null, timed_out: false, command: "node --test" },
+    sessionUpdate: "tool_call_update",
+  });
+  assert.deepEqual(ended, [{ kind: "tool_call_ended", callId: "call-bash", content: [{ type: "text", text: "✔ add (0.27ms)\n✔ mul (0.06ms)\n" }], result: "ok", exitCode: 0 }]);
+  // A signal exit is grok's `exit_code: null`; a rawOutput without the key says nothing.
+  projectAcpUpdate(state, { toolCallId: "call-killed", title: "run_terminal_command", sessionUpdate: "tool_call" });
+  const killed = projectAcpUpdate(state, { toolCallId: "call-killed", status: "failed", rawOutput: { type: "Bash", exit_code: null, signal: "SIGKILL" }, sessionUpdate: "tool_call_update" });
+  assert.deepEqual(killed, [{ kind: "tool_call_ended", callId: "call-killed", content: [{ type: "other", value: { type: "Bash", exit_code: null, signal: "SIGKILL" } }], result: "failed", exitCode: null }]);
+  projectAcpUpdate(state, { toolCallId: "call-read", title: "read_file", sessionUpdate: "tool_call" });
+  const read = projectAcpUpdate(state, { toolCallId: "call-read", status: "completed", rawOutput: { type: "ReadFile", FileContent: { content: "x" } }, sessionUpdate: "tool_call_update" });
+  assert.deepEqual(read, [{ kind: "tool_call_ended", callId: "call-read", content: [{ type: "other", value: { type: "ReadFile", FileContent: { content: "x" } } }], result: "ok" }]);
+});
+
+const grokProfile = {
+  extensionNotifications: GROK_EXTENSION_NOTIFICATIONS,
+  promptContextUsage: grokContextUsage,
+  promptTokenUsage: grokPromptTokens,
+};
+
+// oxlint-disable-next-line eslint/max-statements, eslint/max-lines-per-function -- One child spawn, live/replay attribution and no double-counting asserted together.
+test("a grok child session gets its graph edge from the vendor session_notification, and its records keep their own id", async () => {
+  const session = await start(grokProfile);
+  const run = await promptAndWait(session, "spawn-child-grok");
+  assert.equal(run.kind, "ended");
+  assert.deepEqual(session.graph().nodes.map((node) => node.id), ["fake-session", "fake-child-grok"]);
+  assert.deepEqual(session.graph().edges, [{ parent: "fake-session", child: "fake-child-grok", via: "tool_call" }]);
+  const vendor = session.records().filter((record) => record.kind === "frame" && record.body.type === "_x.ai/session_notification");
+  assert.equal(vendor.length, 5, "spawned, progress, the child's response_completed + turn_completed, finished: each recorded verbatim");
+  const lifecycle = vendor.filter((record) => record.sessionId === "fake-session");
+  assert.deepEqual(
+    lifecycle.map((record) => (record.kind === "frame" ? asRecord(asRecord(record.body.native)?.update)?.sessionUpdate : null)),
+    ["subagent_spawned", "subagent_progress", "subagent_finished"],
+    "a frame that names a child but carries the parent's envelope is the parent's",
+  );
+  for (const record of vendor) {
+    assert.ok(record.kind === "frame");
+    assert.deepEqual(record.body.events, record === lifecycle[0] ? [{ kind: "session_linked", parent: "fake-session", child: "fake-child-grok", via: "tool_call" }] : []);
+  }
+  const [spawned] = lifecycle;
+  assert.ok(spawned?.kind === "frame");
+  assert.deepEqual(spawned.body.native, {
+    sessionId: "fake-session",
+    update: { sessionUpdate: "subagent_spawned", subagent_id: "fake-child-grok", parent_session_id: "fake-session", child_session_id: "fake-child-grok", subagent_type: "general-purpose", description: "Echo", model: "fixture-model-x" },
+  });
+  // The child's own frames (standard updates AND the vendor ledgers whose
+  // envelope names the child, live seqs 78, 119, 120) carry the child's id.
+  const child = session.records().filter((record) => record.sessionId === "fake-child-grok");
+  assert.deepEqual(child.map((record) => describe(record)), [
+    "event user_message_chunk",
+    "event agent_message_chunk → text:child-says-hi",
+    "event _x.ai/session_notification",
+    "event _x.ai/session_notification",
+  ]);
+  assert.deepEqual(
+    child.slice(2).map((record) => (record.kind === "frame" ? asRecord(record.body.native) : null)),
+    [
+      { sessionId: "fake-child-grok", update: { sessionUpdate: "response_completed", usage: { input_tokens: 80, output_tokens: 8, cache_read_input_tokens: 0 } } },
+      { sessionId: "fake-child-grok", update: { sessionUpdate: "turn_completed", prompt_id: "child-prompt", stop_reason: "end_turn", usage: { inputTokens: 80, outputTokens: 8, totalTokens: 88, modelCalls: 1 } } },
+    ],
+  );
+  assert.ok(child.every((record) => record.agentPath.length === 0));
+  // The root's prompt ledger already sums the child's calls (live seq 159);
+  // the child's own ledgers are native-only and never folded a second time.
+  assert.deepEqual(session.usage().value, { total: { input: 200, output: 20 } });
+  // oxlint-disable-next-line typescript/no-unsafe-assignment, unicorn/prefer-structured-clone -- JSON persistence must retain native lineage, not the live kernel's memory.
+  const persisted: RawEvent[] = JSON.parse(JSON.stringify(session.records()));
+  assert.deepEqual(graphOf(persisted), session.graph());
+  assert.deepEqual(usageOf(persisted, session.id), session.usage());
+  assert.deepEqual(viewOf(persisted).usage, session.usage().value);
+  assert.deepEqual(session.contextUsage().value, { tokens: 300, contextWindow: null, percent: null });
+  await session.dispose();
+});
+
+// oxlint-disable-next-line eslint/max-statements -- two turns, the fold after each, and both stamped events.
+test("grok per-prompt ledgers accumulate into the session total, cache parts included, stamped cumulative on each answer", async () => {
+  const session = await start(grokProfile);
+  const first = await promptAndWait(session, "grok-usage");
+  assert.equal(first.kind, "ended");
+  assert.deepEqual(session.usage().value, { total: { input: 100, output: 7, cacheRead: 64, cacheWrite: 0 } });
+  const second = await promptAndWait(session, "grok-usage");
+  assert.equal(second.kind, "ended");
+  assert.deepEqual(session.usage().value, { total: { input: 200, output: 14, cacheRead: 128, cacheWrite: 0 } });
+  assert.deepEqual(session.contextUsage().value, { tokens: 1002, contextWindow: null, percent: null });
+  const answers = session.records().flatMap((record) => (record.kind === "frame" && record.body.type === "session/prompt" ? [record.body.events] : []));
+  assert.deepEqual(answers, [
+    [{ kind: "turn_ended", outcome: { kind: "completed" } }, { kind: "usage", usage: { context: { tokens: 1001, contextWindow: null, percent: null }, tokens: { input: 100, output: 7, cacheRead: 64, cacheWrite: 0 } } }],
+    [{ kind: "turn_ended", outcome: { kind: "completed" } }, { kind: "usage", usage: { context: { tokens: 1002, contextWindow: null, percent: null }, tokens: { input: 200, output: 14, cacheRead: 128, cacheWrite: 0 } } }],
+  ]);
+  await session.dispose();
+});
+
+const QUEUE_CHANGED = { sessionId: "fake-session", entries: [{ id: "queue-1", version: 0, kind: "prompt", text: "grok-usage", position: 0 }] };
+
+async function queueChangedRecords(profile: Parameters<typeof start>[0]): Promise<readonly Frame[]> {
+  const session = await start(profile);
+  const run = await promptAndWait(session, "grok-usage");
+  assert.equal(run.kind, "ended");
+  await session.dispose();
+  return session.records().filter((record): record is Frame => record.kind === "frame" && record.body.type === "_x.ai/queue/changed");
+}
+
+test("a listed vendor method (`_x.ai/queue/changed`) reaches the stream verbatim under the root", async () => {
+  const [queue, ...rest] = await queueChangedRecords(grokProfile);
+  assert.ok(queue !== undefined && rest.length === 0);
+  assert.deepEqual(queue.body, { type: "_x.ai/queue/changed", native: QUEUE_CHANGED, events: [] });
+  assert.equal(queue.sessionId, "fake-session");
+});
+
+test("the same push on an unlisted method is a frame oar never sees (the SDK discards it before any handler)", async () => {
+  assert.deepEqual(await queueChangedRecords({ promptContextUsage: grokContextUsage, promptTokenUsage: grokPromptTokens }), []);
+});
+
+// live-grok-b/steer.voyage.jsonl: the cancelled answer (seq 63) bills its one
+// model call (16776/222), the closing answer (seq 158) ITS OWN two calls
+// (34420/279, `modelCalls: 2`): two per-prompt ledgers, so the session sum
+// is 51196/501 and neither call is counted twice. Their cache reads
+// (640, 19968) sum the same way; neither ledger names a cache write, so the
+// total has no `cacheWrite`.
+test("a send-now steer's two answers are two per-prompt ledgers: summed once, stamped cumulative", async () => {
+  const session = await start({ ...grokProfile, steerSupersedesPrompt: true, steerParams: () => ({ _meta: { sendNow: true } }) });
+  const base = await session.prompt("grok-steer-base");
+  assert.equal(base.response.body.kind, "accepted");
+  const steered = await steer(session, "grok-steer-new");
+  assert.equal(steered.response.body.kind, "accepted");
+  assert.deepEqual(await awaitTurnEnd(session, base.request.seq), { kind: "completed" });
+  const answers = session.records().flatMap((record) => (record.kind === "frame" && record.body.type === "session/prompt" ? [record.body.events] : []));
+  assert.deepEqual(answers, [
+    [{ kind: "usage", usage: { context: { tokens: 16_998, contextWindow: null, percent: null }, tokens: { input: 16_776, output: 222, cacheRead: 640 } } }],
+    [{ kind: "turn_ended", outcome: { kind: "completed" } }, { kind: "usage", usage: { context: { tokens: 17_405, contextWindow: null, percent: null }, tokens: { input: 51_196, output: 501, cacheRead: 20_608 } } }],
+  ]);
+  assert.deepEqual(session.usage().value, { total: { input: 51_196, output: 501, cacheRead: 20_608 } });
+  await session.dispose();
+});

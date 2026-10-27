@@ -1,0 +1,197 @@
+use anyhow::{bail, Result};
+// `SocketAddr` + the `http` transport are only reached by the `--transport http`
+// arm, which is axum-only and gated with `http-server` (#5048). The stdio arm
+// (the default, used by Claude Desktop / Cursor) works under `mcp` alone.
+#[cfg(feature = "http-server")]
+use std::net::SocketAddr;
+
+use crate::core::logging::CliLogDefault;
+
+#[cfg(feature = "http-server")]
+use super::http::{run_http, HttpServerConfig};
+use super::module::ServerSession;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpTransport {
+    Stdio,
+    Http,
+}
+
+pub fn run_stdio_from_cli(args: &[String]) -> Result<()> {
+    let mut verbose = false;
+    let mut transport = McpTransport::Stdio;
+    let mut bind_host = "127.0.0.1".to_string();
+    let mut port: u16 = 9300;
+    let mut auth_token: Option<String> = None;
+
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-v" | "--verbose" => {
+                verbose = true;
+                index += 1;
+            }
+            "--transport" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --transport"))?;
+                transport = match value.as_str() {
+                    "stdio" => McpTransport::Stdio,
+                    "http" => McpTransport::Http,
+                    other => bail!("unknown --transport value `{other}` (expected stdio or http)"),
+                };
+                index += 2;
+            }
+            "--host" => {
+                bind_host = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --host"))?
+                    .clone();
+                index += 2;
+            }
+            "--port" => {
+                let raw = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --port"))?;
+                port = raw
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid --port value `{raw}`"))?;
+                index += 2;
+            }
+            "--auth-token" => {
+                let token = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --auth-token"))?;
+                if token.trim().is_empty() {
+                    bail!("--auth-token must not be empty");
+                }
+                auth_token = Some(token.trim().to_string());
+                index += 2;
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            other => bail!("unknown mcp arg: {other}"),
+        }
+    }
+
+    init_mcp_logging(verbose);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    match transport {
+        McpTransport::Stdio => {
+            log::debug!("[mcp_server] starting stdio MCP server");
+            rt.block_on(run_stdio_module())?;
+        }
+        McpTransport::Http => {
+            #[cfg(feature = "http-server")]
+            {
+                let bind_addr: SocketAddr =
+                    format!("{bind_host}:{port}").parse().map_err(|err| {
+                        anyhow::anyhow!("invalid bind address `{bind_host}:{port}`: {err}")
+                    })?;
+                log::debug!(
+                    "[mcp_server] starting HTTP/SSE MCP server bind={bind_addr} auth={}",
+                    auth_token.is_some()
+                );
+                rt.block_on(run_http(HttpServerConfig {
+                    bind_addr,
+                    auth_token,
+                }))?;
+            }
+            // Built without the axum transport (#5048): the stdio path above
+            // still works; `--transport http` reports the build fact.
+            #[cfg(not(feature = "http-server"))]
+            {
+                let _ = (&bind_host, port, &auth_token);
+                bail!("mcp --transport http unavailable: built without the http-server feature");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_stdio_module() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let config = crate::core::runtime::DispatchCtx::process_default()
+        .load_config()
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let session = ServerSession::open(&config).await?;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let result = async {
+        let mut input = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        let mut output = tokio::io::stdout();
+        while let Some(line) = input.next_line().await? {
+            let snapshot = session
+                .submit(serde_json::Map::new(), line, &cancellation)
+                .await?;
+            if let tinymcp_bus::ServerOperationState::Complete {
+                response: Some(response),
+            } = snapshot.state
+            {
+                output.write_all(response.as_bytes()).await?;
+                output.write_all(b"\n").await?;
+                output.flush().await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    let cleanup = session.close().await;
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+/// Initialize logging for the MCP server.
+///
+/// MCP servers run as subprocesses of clients (Claude Desktop, Cursor, …) which
+/// surface the server's stderr to the user when something goes wrong. We
+/// therefore always install the tracing subscriber — otherwise `log::error!` /
+/// `log::warn!` events get silently dropped and field-debugging requires
+/// re-running with `--verbose`.
+///
+/// Default level is `warn` to keep the stderr stream quiet under normal use
+/// while still surfacing problems; `--verbose` promotes it to `debug` so
+/// `[mcp_server]` traces become visible. A user-set `RUST_LOG` always wins.
+fn init_mcp_logging(verbose: bool) {
+    if std::env::var_os("RUST_LOG").is_none() {
+        let level = if verbose { "debug" } else { "warn" };
+        std::env::set_var("RUST_LOG", level);
+    }
+    crate::core::logging::init_for_cli_run(verbose, CliLogDefault::Global);
+}
+
+fn print_help() {
+    eprintln!("Usage: openhuman-core mcp [options]");
+    eprintln!();
+    eprintln!("Start an opt-in Model Context Protocol server.");
+    eprintln!();
+    eprintln!("Transports:");
+    eprintln!("  (default)           stdio — newline-delimited JSON-RPC on stdin/stdout");
+    eprintln!("  --transport http    Streamable HTTP + SSE on a local bind address");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -v, --verbose           Log at debug level on stderr");
+    eprintln!("  --transport <stdio|http>  Transport (default: stdio)");
+    eprintln!("  --host <addr>           Bind host for HTTP transport (default: 127.0.0.1)");
+    eprintln!("  --port <port>           Bind port for HTTP transport (default: 9300)");
+    eprintln!("  --auth-token <token>    Require Authorization: Bearer <token> on HTTP requests");
+    eprintln!();
+    eprintln!("Tools exposed (stdio and HTTP):");
+    eprintln!("  core.list_tools, core.tool_instructions");
+    eprintln!("  agent.list_subagents, agent.run_subagent");
+    eprintln!("  memory.recall, memory.fetch, memory.list, memory.learn, memory.forget");
+    eprintln!();
+    eprintln!("Logging is written to stderr. Stdio protocol messages use stdout only.");
+}
+
+#[cfg(test)]
+#[path = "stdio_tests.rs"]
+mod tests;

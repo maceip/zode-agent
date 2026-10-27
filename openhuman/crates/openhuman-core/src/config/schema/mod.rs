@@ -1,0 +1,188 @@
+//! Configuration schema: types and defaults for config.toml.
+//!
+//! Split into submodules; this module re-exports the main `Config` and all public types.
+
+pub mod cloud_providers;
+pub use cloud_providers::{generate_provider_id, is_slug_reserved, AuthStyle, CloudProviderCreds};
+
+fn generate_provider_id_with_prefix(prefix: &str, slug: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut suffix = String::with_capacity(5);
+    let mut seed = nanos as usize;
+    for _ in 0..5 {
+        suffix.push(chars[seed % chars.len()] as char);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        seed = (seed >> 33) ^ seed;
+    }
+    let safe_slug: String = slug
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(20)
+        .collect();
+    format!("{prefix}_{safe_slug}_{suffix}")
+}
+pub mod ephemeral_route;
+pub use ephemeral_route::{EphemeralRoute, EPHEMERAL_ROUTE_SLUG};
+pub mod resolved_endpoints;
+pub use resolved_endpoints::ResolvedEndpoints;
+mod agent;
+mod autonomy;
+mod capability_providers;
+mod channels;
+mod cli_overrides;
+#[doc(hidden)]
+pub use cli_overrides::AppliedInferenceOverride;
+mod computer;
+pub use computer::{ComputerConfig, DecisionModel};
+mod context;
+mod cron;
+mod dashboard;
+mod desktop;
+pub use desktop::DesktopConfig;
+mod channel_voice;
+mod defaults;
+mod hooks;
+pub use hooks::HooksConfig;
+pub mod components;
+pub use components::ComponentsConfig;
+pub mod hosting;
+pub use hosting::HostingConfig;
+pub mod storage;
+pub use storage::StorageConfig;
+pub mod profile_layout;
+pub use profile_layout::{users_dir, ProfileLayout};
+mod identity_cost;
+mod inbound_debounce;
+pub(crate) mod load;
+pub(crate) use load::config_from_toml_str;
+pub(crate) use load::source::storage_schema::collection_specs as config_storage_collections;
+#[cfg(feature = "legacy-import")]
+pub(crate) use load::source::storage_schema::upgrade_records as upgrade_config_records;
+pub use load::{
+    action_dir_env_override, active_user_marker_path, active_workspace_dir,
+    active_workspace_dir_cached, active_workspace_snapshot, clear_active_user, default_action_dir,
+    default_files_dir, default_projects_dir, default_root_openhuman_dir, pre_login_user_dir,
+    read_active_user_id, resolve_action_dir, resolve_files_dir, user_openhuman_dir,
+    write_active_user_id, PRE_LOGIN_USER_ID,
+};
+// Crate-internal: the invalidation half of the cached active workspace. The
+// marker writers in `load_user_state` call it from outside `load`; the
+// write-through half stays inside `load`, where the two resolvers live. Every
+// other caller reads through `active_workspace_dir_cached`.
+pub(crate) use load::invalidate_active_workspace;
+// Crate-internal: the workspace→config-dir resolver, reused by the cloud
+// embedder's keyless credential-scope resolution (mirrors `config::load`).
+pub(crate) use load::resolve_config_dir_for_workspace;
+// Contract shared with `core::observability::expected_error_kind`: the loader
+// appends this marker to a config-read failure when the file's owner differs
+// from the reading process, and the classifier keys on it to keep that case
+// paging. Exported so the classifier tests pin the real constant.
+pub(crate) use load::CONFIG_OWNER_MISMATCH_MARKER;
+pub mod claude_agent_sdk;
+pub use claude_agent_sdk::ClaudeAgentSdkConfig;
+mod inbound;
+mod inbound_sources;
+mod local_ai;
+pub(crate) mod memory;
+mod modules;
+mod observability;
+mod privacy;
+mod proxy;
+mod routes;
+mod runtime;
+mod runtime_local_jail;
+mod scheduler_gate;
+mod security;
+mod task_sources;
+mod tokenjuice;
+mod tools;
+mod update;
+mod web_chat_config;
+
+pub use agent::{
+    AgentConfig, OrchestratorModelConfig, RequiredOutputContract, TeamModelConfig, ToolSearchConfig,
+};
+pub use autonomy::AutonomyConfig;
+pub use capability_providers::{CapabilityProviderConfig, CapabilityProviderTrustState};
+pub use channel_voice::{ChannelVoiceConfig, ChannelVoiceOverride, VoiceReplyMode};
+pub use channels::{
+    ChannelsConfig, DingTalkConfig, DiscordConfig, EmailConfig, IMessageConfig, IrcConfig,
+    LarkConfig, LarkReceiveMode, LinqConfig, MattermostConfig, QQConfig, SignalConfig, SlackConfig,
+    StreamMode, TelegramConfig, WhatsAppConfig, YuanbaoConfig,
+};
+pub(crate) use cli_overrides::set_cli_inference_overrides;
+pub use context::{CompactionSettings, CompactionStrategy, ContextConfig};
+pub use cron::CronConfig;
+pub use dashboard::{DashboardConfig, DiagramViewerConfig, EventStreamConfig, ModelHealthConfig};
+pub use identity_cost::{
+    BudgetAction, BudgetPeriod, BudgetPolicy, BudgetScope, CostConfig, ModelPricing,
+};
+pub use inbound::{InboundConfig, InboundSourceConfig};
+pub use inbound_debounce::{InboundDebounceConfig, InboundDebounceOverride};
+pub use local_ai::{LocalAiConfig, LocalAiUsage};
+pub use memory::{
+    migrate_legacy_source, MemoryAgentConfig, MemoryConfig, MemoryConversationsConfig,
+    MemoryEngineSettings, MemoryLayoutMode, MemorySourceConfig, MemorySourceKind, RecallSettings,
+    MEMORY_CORTEXDB_KEY_NAME,
+};
+pub use modules::{
+    module_source_env_for, ModuleOverride, ModuleSourceMode, ModulesConfig, MODULE_SOURCE_ENV,
+};
+pub use observability::{AgentTracingBackend, AgentTracingConfig, ObservabilityConfig};
+pub use privacy::{PrivacyConfig, PrivacyMode};
+pub use proxy::{
+    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
+    ProxyConfig, ProxyScope,
+};
+pub use routes::{EmbeddingRouteConfig, ModelRouteConfig};
+pub use runtime::{
+    DockerRuntimeConfig, ReliabilityConfig, RuntimeConfig, SchedulerConfig, ShellConfig,
+};
+pub use runtime_local_jail::LocalJailConfig;
+pub use scheduler_gate::{PauseReason, Policy, SchedulerGateConfig, SchedulerGateMode};
+pub use security::{
+    AuditConfig, ResourceLimitsConfig, SandboxBackend, SandboxConfig, SecurityConfig,
+};
+pub use task_sources::TaskSourcesConfig;
+pub use tokenjuice::TokenjuiceConfig;
+pub use tools::{
+    BrowserComputerUseConfig, BrowserConfig, ComposioConfig, ComposioDirectBaseUrls,
+    ComposioHostCredential, CurlConfig, GitbooksConfig, HttpHeader, HttpRequestConfig,
+    IntegrationToggle, IntegrationsConfig, LegacySearchInputs, McpAuthConfig, McpClientConfig,
+    McpClientIdentityConfig, McpServerConfig, McpToolExposure, MultimodalConfig,
+    MultimodalFileConfig, PresentationMode, ProviderRoute, SearchConfig, SearchEngineCredentials,
+    SearchHostCredential, SearchProviderSettings, SearxngConfig, SecretsConfig, SeltzConfig,
+    UnknownKeyedSearchProvider, WebSearchConfig, COMPOSIO_MODE_BACKEND, COMPOSIO_MODE_DIRECT,
+    COMPOSIO_MODE_DISABLED, MANAGED_SEARCH_PROVIDERS, SEARCH_ENGINE_BRAVE, SEARCH_ENGINE_DISABLED,
+    SEARCH_ENGINE_EXA, SEARCH_ENGINE_MANAGED, SEARCH_ENGINE_PARALLEL, SEARCH_ENGINE_QUERIT,
+    SEARCH_ENGINE_TAVILY, SEARCH_PROVIDERS, SEARCH_ROLES, SEARCH_ROLE_ANSWER, SEARCH_ROLE_CONTENTS,
+    SEARCH_ROLE_SEARCH,
+};
+pub use update::{UpdateConfig, UpdateRestartStrategy};
+pub use web_chat_config::WebChatConfig;
+mod voice_server;
+pub use voice_server::{SttEngine, VoiceServerConfig};
+pub mod voice_live;
+pub mod voice_providers;
+pub use voice_live::LiveVoiceConfig;
+pub use voice_providers::{
+    generate_voice_provider_id, is_voice_slug_reserved, BuiltinVoiceProvider, VoiceCapability,
+    VoiceProviderCreds, BUILTIN_VOICE_PROVIDERS,
+};
+mod types;
+pub(crate) use types::ConfigDocumentSnapshot;
+pub use types::*;

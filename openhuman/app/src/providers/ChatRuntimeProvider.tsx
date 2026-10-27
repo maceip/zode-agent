@@ -1,0 +1,2183 @@
+import debug from 'debug';
+import { useCallback, useEffect, useRef } from 'react';
+
+import { useFollowupSuggestionEvents } from '../features/conversations/aui/useFollowupSuggestionEvents';
+import { useRunQueueEvents } from '../features/conversations/aui/useRunQueueEvents';
+import { requestUsageRefresh } from '../hooks/usageRefresh';
+import { useRefetchSnapshotOnTurnEnd } from '../hooks/useRefetchSnapshotOnTurnEnd';
+import {
+  createSkillToolChainLatencyTracker,
+  SKILL_TOOL_CHAIN_TARGET_MS,
+} from '../lib/ai/skillToolChainLatency';
+import { chatErrorCopyText } from '../lib/chatErrorCopy';
+import { useT } from '../lib/i18n/I18nContext';
+import { classifyReplyDeliveryFailure } from '../lib/userErrors/classify';
+import { ingestRuntimeErrorSignal } from '../lib/userErrors/report';
+import { maybeParseWorkflowProposalTool } from '../lib/workflows/workflowProposal';
+import { withCoalescedDeltas } from '../services/chatDeltaCoalescer';
+import {
+  type ChatApprovalDecidedEvent,
+  type ChatApprovalRequestEvent,
+  type ChatCancelledEvent,
+  type ChatContextCompactingEvent,
+  type ChatDoneEvent,
+  type ChatErrorEvent,
+  type ChatEventListeners,
+  type ChatInferenceHeartbeatEvent,
+  type ChatInferenceStartEvent,
+  type ChatInterimEvent,
+  type ChatIterationStartEvent,
+  type ChatPlanReviewRequestEvent,
+  type ChatRunModeChangedEvent,
+  type ChatSegmentEvent,
+  type ChatSubagentDoneEvent,
+  type ChatSubagentTextDeltaEvent,
+  type ChatSubagentThinkingDeltaEvent,
+  type ChatTextDeltaEvent,
+  type ChatThreadGoalClearedEvent,
+  type ChatThreadGoalUpdatedEvent,
+  type ChatThreadTodosChangedEvent,
+  type ChatToolCallEvent,
+  type ChatToolResultEvent,
+  type CostSource,
+  type ProactiveMessageEvent,
+  segmentText,
+  subscribeChatEvents,
+} from '../services/chatService';
+import { socketService } from '../services/socketService';
+import { store } from '../store';
+import {
+  appendSubagentStreamDelta,
+  beginInferenceTurn,
+  bumpInferenceHeartbeatForThread,
+  cancelUnresolvedTurnTimeline,
+  clearInferenceStatusForThread,
+  clearParallelRequest,
+  clearPendingApprovalForThread,
+  clearPendingApprovalIfRequest,
+  clearPendingPlanReviewForThread,
+  clearPendingPlanReviewIfRequest,
+  clearProcessingForThread,
+  clearStreamingAssistantForThread,
+  clearTurnApprovalForThread,
+  dropDetachedApprovalsForThread,
+  endInferenceTurn,
+  fetchAndHydrateCompletedTurnState,
+  fetchAndHydrateTurnState,
+  liveTurnStarted,
+  markInferenceTurnStreaming,
+  parseToolFailure,
+  recordChatTurnUsage,
+  recordSubagentTranscriptTool,
+  resolvePendingApprovalForThread,
+  resolveSubagentTranscriptTool,
+  setInferenceStatusForThread,
+  setPendingApprovalForThread,
+  setPendingPlanReviewForThread,
+  setStreamingAssistantForThread,
+  setToolTimelineForThread,
+  setWorkflowProposalForThread,
+  streamDeltaReceived,
+  subagentAwaitingUser,
+  subagentDone,
+  subagentIterationStarted,
+  subagentSpawned,
+  subagentToolCallReceived,
+  subagentToolResultReceived,
+  toolArgsDeltaReceived,
+  toolCallReceived,
+  toolResultReceived,
+  turnSettled,
+  upsertArtifactFailedForThread,
+  upsertArtifactInProgressForThread,
+  upsertArtifactReadyForThread,
+} from '../store/chatRuntimeSlice';
+import { useAppDispatch, useAppSelector } from '../store/hooks';
+import { pendingFollowupCompleted } from '../store/queueSlice';
+import { setRunMode } from '../store/runModeSlice';
+import { selectSocketStatus } from '../store/socketSelectors';
+import { clearThreadGoal, setThreadGoal } from '../store/threadGoalSlice';
+import {
+  addInferenceResponse,
+  applyChannelEvent,
+  CHAT_ERROR_METADATA_KEY,
+  clearThreadInferenceActive,
+  createNewThread,
+  generateThreadTitleIfNeeded,
+  loadThreadMessages,
+  setActiveThread,
+  setSelectedThread,
+  TIMING_METADATA_KEY,
+} from '../store/threadSlice';
+import { setThreadTodos } from '../store/threadTodosSlice';
+import { reportUserError } from '../store/userErrorsSlice';
+import { IS_PROD } from '../utils/config';
+import { AssistantUiRuntimeProvider } from './AssistantUiRuntimeProvider';
+import { isProactiveConversationSurface, proactiveThreadPins } from './proactiveThreadPins';
+
+const logChatRuntime = debug('openhuman:chat-runtime');
+
+const SEGMENT_DELIVERY_TTL_MS = 5 * 60 * 1000;
+const MAX_SEGMENT_DELIVERIES = 100;
+
+type SegmentDelivery = { segments: Map<number, string>; createdAt: number; lastSeenAt: number };
+
+type ThreadSliceState = ReturnType<typeof store.getState>['thread'];
+
+/**
+ * Whether a thread should be treated as occupied for proactive delivery — a
+ * thread is only a valid target when it is provably "fresh" (holds no
+ * messages). We check the in-memory message cache and the persisted
+ * `messageCount` snapshot, so a thread that already has a conversation
+ * server-side (but whose messages aren't loaded into the cache yet) is still
+ * treated as occupied and never reused.
+ *
+ * Crucially, *unknown* thread metadata counts as occupied: when only a
+ * rehydrated `selectedThreadId` is present (e.g. before `loadThreads`
+ * resolves, or after caches were reset while selection was preserved),
+ * `state.threads.find` returns `undefined`. Treating that as fresh would let
+ * a proactive event append into a conversation we simply haven't loaded yet.
+ * We fail closed and open a new thread instead. See #3713.
+ */
+function threadHasMessages(state: ThreadSliceState, threadId: string): boolean {
+  const cached = state.messagesByThreadId[threadId];
+  if (cached && cached.length > 0) return true;
+  if (threadId === state.selectedThreadId && state.messages.length > 0) return true;
+  const thread = state.threads.find(t => t.id === threadId);
+  // Unknown metadata → fail closed (occupied) rather than risk interrupting an
+  // unloaded conversation.
+  if (!thread) return true;
+  return thread.messageCount > 0;
+}
+
+function rtLog(message: string, fields?: Record<string, string | number | null | undefined>) {
+  if (IS_PROD) return;
+  if (fields && Object.keys(fields).length > 0) {
+    const parts = Object.entries(fields)
+      .filter(([, v]) => v !== undefined && v !== '' && v !== null)
+      .map(([k, v]) => `${k}=${v}`);
+    logChatRuntime('[chat-runtime] %s %s', message, parts.join(' '));
+  } else {
+    logChatRuntime('[chat-runtime] %s', message);
+  }
+}
+
+/**
+ * Per-call identity for a tool event's dedupe key: the call id, or — for a
+ * provider that sends none — the core-stamped `seq`. Without it two id-less
+ * calls of the same tool in one round shared a key and the second was dropped
+ * as a "duplicate"; a genuine redelivery repeats the same `seq`, so it still
+ * dedupes.
+ */
+function toolEventIdentity(event: { tool_call_id?: string; seq?: number }): string {
+  if (event.tool_call_id) return event.tool_call_id;
+  return event.seq !== undefined ? `seq:${event.seq}` : '';
+}
+
+/** Bound on the per-request "last delta seq" map (see `isReplayedDelta`). */
+const MAX_DELTA_SEQ_ENTRIES = 200;
+
+function segmentDeliveryKey(threadId: string, requestId?: string | null): string {
+  return `${threadId}:${requestId ?? 'none'}`;
+}
+
+function pruneSegmentDeliveries(deliveries: Map<string, SegmentDelivery>, now = Date.now()) {
+  for (const [key, delivery] of deliveries) {
+    if (now - delivery.createdAt > SEGMENT_DELIVERY_TTL_MS) {
+      deliveries.delete(key);
+    }
+  }
+
+  while (deliveries.size > MAX_SEGMENT_DELIVERIES) {
+    let oldestKey: string | undefined;
+    let oldestLastSeenAt = Number.POSITIVE_INFINITY;
+    for (const [key, delivery] of deliveries) {
+      if (delivery.lastSeenAt < oldestLastSeenAt) {
+        oldestKey = key;
+        oldestLastSeenAt = delivery.lastSeenAt;
+      }
+    }
+    if (!oldestKey) break;
+    deliveries.delete(oldestKey);
+  }
+}
+
+function getOrCreateSegmentDelivery(
+  deliveries: Map<string, SegmentDelivery>,
+  key: string,
+  now = Date.now()
+): SegmentDelivery {
+  pruneSegmentDeliveries(deliveries, now);
+  const existing = deliveries.get(key);
+  if (existing) {
+    existing.lastSeenAt = now;
+    return existing;
+  }
+  const delivery = { segments: new Map<number, string>(), createdAt: now, lastSeenAt: now };
+  deliveries.set(key, delivery);
+  pruneSegmentDeliveries(deliveries, now);
+  return delivery;
+}
+
+function takeSegmentDelivery(
+  deliveries: Map<string, SegmentDelivery>,
+  key: string,
+  now = Date.now()
+): SegmentDelivery | undefined {
+  pruneSegmentDeliveries(deliveries, now);
+  const delivery = deliveries.get(key);
+  deliveries.delete(key);
+  return delivery;
+}
+
+function deleteSegmentDelivery(deliveries: Map<string, SegmentDelivery>, key: string) {
+  pruneSegmentDeliveries(deliveries);
+  deliveries.delete(key);
+}
+
+// Delivery is complete iff every expected segment_index arrived. Do NOT also
+// compare reconstructed segments against event.full_response — the server
+// trims each segment and normalises joiners during segmentation
+// (presentation.rs::segment_for_delivery), while full_response keeps the raw
+// LLM text. A byte-equality check therefore fails on virtually every
+// multi-segment turn and triggers the reconciliation path, producing a
+// duplicate assistant message.
+function hasCompleteSegmentDelivery(
+  event: ChatDoneEvent,
+  delivery: SegmentDelivery | undefined
+): boolean {
+  const expected = event.segment_total ?? 0;
+  if (expected <= 0 || !delivery) return false;
+  if (delivery.segments.size < expected) return false;
+  for (let i = 0; i < expected; i += 1) {
+    if (!delivery.segments.has(i)) return false;
+  }
+  return true;
+}
+
+function chatDoneExtraMetadata(event: ChatDoneEvent): Record<string, unknown> | undefined {
+  // Stamp the producing turn's request id so the final answer can be grouped
+  // with its per-turn process trail (Phase 4 anchoring, Option B — see the
+  // companion plan). `citations` is merged in when present.
+  const meta: Record<string, unknown> = {};
+  if (event.citations?.length) meta.citations = event.citations;
+  if (event.request_id) meta.requestId = event.request_id;
+  // Carried through to `metadata.timing` on the converted `ThreadMessageLike`
+  // (`assistantUiMessages.ts`), which is what the vendored `MessageTiming`
+  // element (`useMessageTiming()`) reads to show TTFT/total/tok-s on a
+  // settled reply. `chat_done.timing` is the only place these numbers exist —
+  // there is no per-message timing RPC.
+  if (event.timing) meta[TIMING_METADATA_KEY] = event.timing;
+  return Object.keys(meta).length > 0 ? meta : undefined;
+}
+
+/**
+ * `extraMetadata` for the assistant message a failed turn appends.
+ *
+ * Stamped for every `error_type` (not just `guardrail`) so `ChatErrorNotice`
+ * and any future per-type copy can key off it without a second message shape;
+ * only `guardrail` renders the vendored `GuardrailNotice` card today (the
+ * card needs a `GuardrailPayload` no other `error_type` carries).
+ */
+function chatErrorExtraMetadata(event: ChatErrorEvent): Record<string, unknown> {
+  return { [CHAT_ERROR_METADATA_KEY]: { errorType: event.error_type, guardrail: event.guardrail } };
+}
+
+/**
+ * `extraMetadata` for the partial reply a `chat_cancelled` turn persists.
+ *
+ * `stopped: true` is the flag `assistantUiMessages.ts` reads to give the
+ * message `status: { type: 'incomplete', reason: 'cancelled' }`, which is
+ * what makes `thread.tsx` render the vendored `StoppedRun` element instead of
+ * the plain text. `cancelReason`/`supersededBy` ride through unchanged on
+ * `metadata.custom.extraMetadata` (that converter's existing pass-through) so
+ * `StoppedRunSlot` can pick "Stopped" vs "Replaced by a newer message".
+ */
+function chatCancelledExtraMetadata(event: ChatCancelledEvent): Record<string, unknown> {
+  return {
+    stopped: true,
+    ...(event.cancel_reason ? { cancelReason: event.cancel_reason } : {}),
+    ...(event.superseded_by ? { supersededBy: event.superseded_by } : {}),
+    ...(event.request_id ? { requestId: event.request_id } : {}),
+  };
+}
+
+/**
+ * Message id for a reply the CORE already persisted before announcing it.
+ *
+ * Core-initiated turns (`client_id === 'system'`: background sub-agent result
+ * delivery and system flows) write their own closing message through the
+ * conversation store, keyed
+ * `agent:<run_id>` — and only then emit `chat_done` / `chat_error` with that
+ * run id as `request_id`. Reusing the same id here makes our own
+ * `addInferenceResponse` append collapse onto the core's row (the conversation
+ * store is idempotent by message id) instead of persisting a second copy that
+ * rendered as a duplicate reply under the answer (#5933). Interactive turns
+ * keep their generated ids: nothing else has persisted them.
+ */
+function corePersistedMessageId(event: {
+  client_id?: string;
+  request_id?: string;
+}): string | undefined {
+  return event.client_id === 'system' && event.request_id ? `agent:${event.request_id}` : undefined;
+}
+
+/**
+ * Message id for a delivered reply, shared with the core.
+ *
+ * Since #6034 the core stores an unsegmented reply before it announces it, on
+ * every surface that carries a workspace — interactive turns and forked lanes,
+ * not just the core-initiated ones {@link corePersistedMessageId} covers. Both
+ * writers therefore derive the id from the same `request_id`, which is what
+ * makes our append collapse onto the core's row rather than add a second copy
+ * of the answer (#5933).
+ *
+ * A segmented `chat_done` is excluded on purpose: the core leaves those rows to
+ * us (one per segment), so there is nothing to collapse onto and a shared id
+ * would make several segments fight over one row.
+ */
+function deliveredReplyMessageId(event: {
+  request_id?: string;
+  segment_total?: number | null;
+}): string | undefined {
+  if (event.segment_total) return undefined;
+  return event.request_id ? `agent:${event.request_id}` : undefined;
+}
+
+/**
+ * Message id for a proactive message addressed to a real thread.
+ *
+ * Origin-bound cron delivery persists its reply into the conversation that
+ * asked for it and names that row in `persisted_message_id` before emitting
+ * `proactive_message`. Reusing the id collapses our append onto the core's
+ * row. Without the field no row exists (a turn id is not unique per message),
+ * so a generated id is used.
+ */
+function proactiveMessageId(event: {
+  thread_id: string;
+  persisted_message_id?: string;
+}): string | undefined {
+  if (event.thread_id.startsWith('proactive:')) return undefined;
+  return event.persisted_message_id || undefined;
+}
+
+/**
+ * Map a `chat_done` event's holistic usage onto the `recordChatTurnUsage`
+ * payload. Prefers the structured `usage` object (tokens + cost + context window
+ * + per-sub-agent breakdown); falls back to the deprecated flat token fields for
+ * any older core that still emits them.
+ */
+function chatTurnUsagePayload(event: ChatDoneEvent): {
+  inputTokens: number;
+  outputTokens: number;
+  cachedTokens?: number;
+  costUsd?: number | null;
+  costSource?: CostSource;
+  contextWindow?: number;
+  contextTokens?: number;
+  threadId?: string;
+  subAgents?: Array<{
+    agentId: string;
+    inputTokens: number;
+    outputTokens: number;
+    costUsd: number | null;
+  }>;
+} {
+  const u = event.usage;
+  if (u) {
+    return {
+      inputTokens: u.input_tokens,
+      outputTokens: u.output_tokens,
+      cachedTokens: u.cached_input_tokens,
+      costUsd: u.cost_usd,
+      costSource: u.cost_source,
+      contextWindow: u.context_window,
+      contextTokens: u.context_tokens,
+      threadId: event.thread_id,
+      subAgents: (u.subagents ?? []).map(s => ({
+        agentId: s.agent_id,
+        inputTokens: s.input_tokens,
+        outputTokens: s.output_tokens,
+        costUsd: s.cost_usd ?? null,
+      })),
+    };
+  }
+  return {
+    inputTokens: event.total_input_tokens ?? 0,
+    outputTokens: event.total_output_tokens ?? 0,
+    threadId: event.thread_id,
+  };
+}
+
+// `maybeParseWorkflowProposalTool` / `parseWorkflowProposal` moved to
+// `lib/workflows/workflowProposal.ts` so the live socket handlers below and
+// the persisted-message rehydration path (`threadSlice.loadThreadMessages`)
+// share one content-based parser. See that module's doc comment.
+
+const ChatRuntimeProvider = ({ children }: { children: React.ReactNode }) => {
+  const dispatch = useAppDispatch();
+  const snapshotPollingRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    snapshotPollingRef.current = controller;
+    return () => controller.abort();
+  }, []);
+  // Latest translator for the long-lived socket handlers below: a failed turn's
+  // copy is rendered in the locale active when the error arrives.
+  const { t } = useT();
+  const tRef = useRef(t);
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
+  const { refetch: refetchSnapshot } = useRefetchSnapshotOnTurnEnd();
+  const socketStatus = useAppSelector(selectSocketStatus);
+  // The core's run queue (`queue_item_*`) → `queueSlice` → the composer queue.
+  useRunQueueEvents(socketStatus === 'connected');
+  // The core's `chat_suggestions` → `followupSuggestionsSlice` → follow-up chips.
+  useFollowupSuggestionEvents(socketStatus === 'connected');
+  const toolTimelineByThread = useAppSelector(state => state.chatRuntime.toolTimelineByThread);
+  const inferenceStatusByThread = useAppSelector(
+    state => state.chatRuntime.inferenceStatusByThread
+  );
+  const streamingAssistantByThread = useAppSelector(
+    state => state.chatRuntime.streamingAssistantByThread
+  );
+
+  const seenChatEventsRef = useRef<Map<string, number>>(new Map());
+  const segmentDeliveriesRef = useRef<Map<string, SegmentDelivery>>(new Map());
+  const proactiveThreadCreationPromiseRef = useRef<Promise<string | null> | null>(null);
+  const proactiveDispatchQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const toolTimelineRef = useRef(toolTimelineByThread);
+  const inferenceStatusRef = useRef(inferenceStatusByThread);
+  const streamingAssistantRef = useRef(streamingAssistantByThread);
+  // Measures wall-clock of each turn's tool chain against the 60s target
+  // (#4273, AC3). Single instance for the provider's lifetime; observability
+  // only — it never gates or cancels a turn.
+  const skillLatencyRef = useRef(createSkillToolChainLatencyTracker());
+  // Threads that had a turn in flight when the socket dropped, held across the
+  // gap so the reconnect can rejoin their rooms and re-read them (#6034).
+  const interruptedThreadsRef = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    toolTimelineRef.current = toolTimelineByThread;
+  }, [toolTimelineByThread]);
+
+  useEffect(() => {
+    inferenceStatusRef.current = inferenceStatusByThread;
+  }, [inferenceStatusByThread]);
+
+  useEffect(() => {
+    streamingAssistantRef.current = streamingAssistantByThread;
+  }, [streamingAssistantByThread]);
+
+  // Highest `seq` seen on a text/thinking delta, per thread+request.
+  const lastDeltaSeqRef = useRef<Map<string, number>>(new Map());
+
+  /**
+   * Whether a streamed text/thinking delta is a redelivery. The core stamps a
+   * per-request monotonic `seq` on every event and the socket delivers in
+   * order, so a delta at or below the last seen `seq` for its request has
+   * already been appended — appending it again duplicates text in the live
+   * preview and the processing transcript. Deltas without a `seq` (older
+   * cores) are always accepted.
+   */
+  const isReplayedDelta = (event: {
+    thread_id: string;
+    request_id?: string;
+    seq?: number;
+  }): boolean => {
+    if (event.seq === undefined || !event.request_id) return false;
+    const key = `${event.thread_id}:${event.request_id}`;
+    const seen = lastDeltaSeqRef.current;
+    const last = seen.get(key);
+    if (last !== undefined && event.seq <= last) {
+      rtLog('delta_replay_drop', {
+        thread: event.thread_id,
+        request: event.request_id,
+        seq: event.seq,
+      });
+      return true;
+    }
+    seen.delete(key);
+    seen.set(key, event.seq);
+    while (seen.size > MAX_DELTA_SEQ_ENTRIES) {
+      const oldest = seen.keys().next().value;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
+    return false;
+  };
+
+  const markChatEventSeen = (
+    key: string,
+    meta?: { threadId?: string; requestId?: string }
+  ): boolean => {
+    const now = Date.now();
+    const cache = seenChatEventsRef.current;
+    const ttlMs = 10 * 60_000;
+    const maxEntries = 500;
+
+    if (cache.has(key)) {
+      rtLog('dedupe_drop', {
+        key: key.length > 160 ? `${key.slice(0, 160)}…` : key,
+        thread: meta?.threadId,
+        request: meta?.requestId,
+      });
+      return false;
+    }
+    cache.set(key, now);
+
+    for (const [existingKey, timestamp] of cache) {
+      if (now - timestamp > ttlMs) {
+        cache.delete(existingKey);
+      }
+    }
+
+    while (cache.size > maxEntries) {
+      const oldest = cache.keys().next().value;
+      if (!oldest) break;
+      cache.delete(oldest);
+    }
+    return true;
+  };
+
+  const proactiveMessageDigest = (input: string): string => {
+    // Small non-cryptographic digest to keep dedupe keys bounded.
+    let hash = 2166136261;
+    for (let i = 0; i < input.length; i += 1) {
+      hash ^= input.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  };
+
+  const resolveVisibleThreadForProactive = useCallback(
+    async (incomingThreadId: string): Promise<string | null> => {
+      if (!incomingThreadId.startsWith('proactive:')) {
+        return incomingThreadId;
+      }
+
+      const state = store.getState().thread;
+
+      // A proactive *conversation surface* (today the realtime voice session's
+      // `proactive:voice`) delivers many sequential turns under one synthetic id.
+      // Once it has resolved to a visible thread, pin that thread and keep
+      // delivering into it for the rest of the session. Without the pin, the
+      // fresh-or-create rule below spawns a brand-new thread on every turn after
+      // the first — turn 1 fills the fresh thread, turn 2+ sees it as occupied and
+      // creates another — flooding the list with one "Chat …" thread per voice
+      // turn. The pin is dropped when its thread no longer exists (deleted) so we
+      // re-resolve instead of delivering into a dead thread.
+      const isConversationSurface = isProactiveConversationSurface(incomingThreadId);
+      if (isConversationSurface) {
+        const pinned = proactiveThreadPins.get(incomingThreadId);
+        if (pinned) {
+          if (state.threads.some(t => t.id === pinned)) {
+            return pinned;
+          }
+          proactiveThreadPins.delete(incomingThreadId);
+        }
+      }
+
+      // Reuse an existing thread for proactive delivery ONLY when it is
+      // fresh (no messages). Injecting a morning brief / scheduled-job
+      // update into a thread that already holds a conversation interrupts
+      // the active chat flow (#3713). Candidate priority is selected >
+      // first thread; if the candidate already has messages we fall
+      // through and open a dedicated new thread instead. An in-flight
+      // inference thread always has at least the user's message, so it is
+      // never considered fresh — that is why `activeThreadIds` is no
+      // longer used as a target here.
+      const candidateThreadId = state.selectedThreadId ?? state.threads[0]?.id ?? null;
+      if (candidateThreadId && !threadHasMessages(state, candidateThreadId)) {
+        if (isConversationSurface) {
+          proactiveThreadPins.set(incomingThreadId, candidateThreadId);
+        }
+        return candidateThreadId;
+      }
+
+      if (proactiveThreadCreationPromiseRef.current) {
+        return proactiveThreadCreationPromiseRef.current;
+      }
+
+      const createPromise: Promise<string | null> = (async () => {
+        try {
+          const newThread = await dispatch(createNewThread()).unwrap();
+          dispatch(setSelectedThread(newThread.id));
+          if (isConversationSurface) {
+            proactiveThreadPins.set(incomingThreadId, newThread.id);
+          }
+          return newThread.id;
+        } catch (error) {
+          rtLog('proactive_thread_create_failed', {
+            err: error instanceof Error ? error.message : String(error),
+          });
+          return null;
+        } finally {
+          proactiveThreadCreationPromiseRef.current = null;
+        }
+      })();
+      proactiveThreadCreationPromiseRef.current = createPromise;
+
+      try {
+        return await createPromise;
+      } finally {
+        // no-op: cleared in createPromise.finally
+      }
+    },
+    [dispatch]
+  );
+
+  useEffect(() => {
+    if (socketStatus !== 'connected') return;
+    // A terminal snapshot must survive a socket subscription refresh, but
+    // cannot outlive the provider that owns its store projection.
+    const snapshotPolling = snapshotPollingRef.current;
+    if (!snapshotPolling) return;
+
+    /**
+     * Tell the user a finished reply could not be shown.
+     *
+     * The turn ran and was paid for, and by this point neither writer left a
+     * row — so a console line is the wrong place for it. An in-thread message
+     * is not an option either: writing one needs the very append that just
+     * failed. The shell's notice panel is the surface that does not depend on
+     * the thread store.
+     */
+    const reportLostReply = (threadId: string) => {
+      const descriptor = classifyReplyDeliveryFailure(threadId);
+      if (descriptor) dispatch(reportUserError({ descriptor, at: Date.now() }));
+    };
+
+    /**
+     * Put a delivered reply back on screen after our own append failed.
+     *
+     * Since #6034 the core stores an unsegmented reply before it announces it,
+     * so a failed `threads_message_append` is almost always a lost *render*
+     * rather than a lost answer: re-reading the thread brings the core's row
+     * into the cache and the reply appears without the user re-asking.
+     *
+     * The residual case — neither writer stored it — is reported at error
+     * level rather than through the dev-only debug channel. It cannot be
+     * surfaced as an in-thread message, because writing one needs the same
+     * append that just failed.
+     */
+    const recoverDeliveredReply = async (event: ChatDoneEvent, cause: unknown) => {
+      const expectedId = deliveredReplyMessageId(event);
+      try {
+        await dispatch(loadThreadMessages(event.thread_id)).unwrap();
+      } catch (refetchError) {
+        console.error(
+          '[chat-runtime] a delivered reply could not be appended or re-read; it may be missing from this thread',
+          {
+            threadId: event.thread_id,
+            requestId: event.request_id,
+            appendError: cause instanceof Error ? cause.message : String(cause),
+            refetchError:
+              refetchError instanceof Error ? refetchError.message : String(refetchError),
+          }
+        );
+        reportLostReply(event.thread_id);
+        return;
+      }
+      const recovered = expectedId
+        ? (store.getState().thread.messagesByThreadId[event.thread_id] ?? []).some(
+            m => m.id === expectedId
+          )
+        : false;
+      if (recovered) {
+        rtLog('chat_done_recovered_from_store', {
+          thread: event.thread_id,
+          request: event.request_id,
+        });
+        return;
+      }
+      console.error('[chat-runtime] a delivered reply is absent from the thread after a refetch', {
+        threadId: event.thread_id,
+        requestId: event.request_id,
+        appendError: cause instanceof Error ? cause.message : String(cause),
+      });
+      reportLostReply(event.thread_id);
+    };
+
+    const reloadQueuedFollowup = async (threadId: string, requestId: string) => {
+      const pending = (store.getState().queue.pendingFollowupsByThread[threadId] ?? []).some(
+        item => item.requestId === requestId
+      );
+      if (!pending) return;
+      try {
+        await dispatch(loadThreadMessages(threadId)).unwrap();
+        dispatch(pendingFollowupCompleted({ threadId, requestId }));
+      } catch (error) {
+        rtLog('queued_followup_reload_failed', {
+          thread: threadId,
+          request: requestId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+
+    const finishChatDoneTurn = async (event: ChatDoneEvent, path: string) => {
+      if (snapshotPolling.signal.aborted) return;
+      // One store update: freeze the turn's trail, end the tail, reveal the
+      // persisted reply in the tail's slot. See `turnSettled`.
+      rtLog('turn_settled', { thread: event.thread_id, request: event.request_id, path });
+      dispatch(turnSettled({ threadId: event.thread_id, requestId: event.request_id }));
+      rtLog('refresh_usage_counter', {
+        thread: event.thread_id,
+        request: event.request_id,
+        reason: 'chat_done',
+      });
+      requestUsageRefresh();
+      rtLog('snapshot_refetch_queued', {
+        thread: event.thread_id,
+        request: event.request_id,
+        reason: 'chat_done',
+        path,
+      });
+      refetchSnapshot();
+      // The core persists a queued user row under the runner lease before
+      // emitting this matching terminal event. Reload that authoritative row
+      // instead of appending a duplicate from the frontend.
+      await reloadQueuedFollowup(event.thread_id, event.request_id);
+      if (snapshotPolling.signal.aborted) return;
+      dispatch(endInferenceTurn({ threadId: event.thread_id }));
+      dispatch(clearThreadInferenceActive(event.thread_id));
+      // Snapshot polling can outlive this completed turn. Capture the rows it
+      // owns before awaiting it so a newer turn on the same thread is never
+      // cancelled by this recovery path.
+      const unresolvedRowIds = (
+        store.getState().chatRuntime.toolTimelineByThread[event.thread_id] ?? []
+      )
+        .filter(entry => entry.status === 'running' && entry.subagent?.mode !== 'async')
+        .map(entry => entry.id);
+      // Socket reducers keep only the current iteration's prose in the live
+      // buffer. Once the turn settles, replace that partial projection with
+      // the core's completed snapshot, whose ordered transcript contains every
+      // parent and sub-agent event from the whole turn. Doing this here (after
+      // ending the live lifecycle) matters: `hydrateRuntimeFromSnapshot`
+      // intentionally refuses to overwrite an actively streaming turn.
+      const completedSnapshot = await dispatch(
+        fetchAndHydrateCompletedTurnState(event.thread_id, { signal: snapshotPolling.signal })
+      )
+        .unwrap()
+        .catch(error => {
+          if (snapshotPolling.signal.aborted) return null;
+          throw error;
+        });
+      if (snapshotPolling.signal.aborted) return;
+      if (!completedSnapshot) {
+        dispatch(
+          cancelUnresolvedTurnTimeline({ threadId: event.thread_id, rowIds: unresolvedRowIds })
+        );
+      }
+    };
+
+    rtLog('subscribe_chat_events', { socket: socketStatus });
+    // Deltas are coalesced per frame; every other event flushes them first so
+    // ordering holds. See `chatDeltaCoalescer`.
+    const coalesced = withCoalescedDeltas<ChatTextDeltaEvent, ChatEventListeners>(
+      {
+        onChannelEvent: event => {
+          if (!event.openhuman_message_id) return;
+          dispatch(applyChannelEvent(event));
+        },
+        onInferenceStart: (event: ChatInferenceStartEvent) => {
+          rtLog('inference_start', { thread: event.thread_id, request: event.request_id });
+          // Fresh turn: drop the previous turn's live processing transcript so a
+          // new turn's narration/steps don't append onto the old one.
+          dispatch(clearProcessingForThread({ threadId: event.thread_id }));
+          // A queued primary follow-up starts with a clean timeline. Parallel
+          // branches have their own lane and must not erase the primary rows.
+          if (
+            !event.request_id ||
+            store.getState().chatRuntime.parallelRequestThreads[event.request_id] === undefined
+          ) {
+            dispatch(setToolTimelineForThread({ threadId: event.thread_id, entries: [] }));
+          }
+          // A turn this window did not send (one started right after a Stop,
+          // from another window, or queued) has no lifecycle yet, or a finished
+          // one: begin it here so its stream renders live, not after a reload.
+          const parallel =
+            !!event.request_id &&
+            store.getState().chatRuntime.parallelRequestThreads[event.request_id] !== undefined;
+          const lifecycle =
+            store.getState().chatRuntime.inferenceTurnLifecycleByThread[event.thread_id];
+          if (!parallel && lifecycle !== 'started' && lifecycle !== 'streaming') {
+            dispatch(beginInferenceTurn({ threadId: event.thread_id }));
+          }
+          dispatch(markInferenceTurnStreaming({ threadId: event.thread_id }));
+          if (event.request_id) {
+            dispatch(liveTurnStarted({ threadId: event.thread_id, requestId: event.request_id }));
+          }
+          dispatch(
+            setInferenceStatusForThread({
+              threadId: event.thread_id,
+              status: { phase: 'thinking', iteration: 0, maxIterations: 0 },
+            })
+          );
+        },
+        onInferenceHeartbeat: (event: ChatInferenceHeartbeatEvent) => {
+          // #4270: liveness beat — bump the per-thread counter so the
+          // Conversations silence timer rearms even when the turn is in a long
+          // prefill / buffered-reasoning phase that emits no other progress.
+          rtLog('inference_heartbeat', { thread: event.thread_id, request: event.request_id });
+          // A parallel (forked) turn streams into its own lane and must NOT keep
+          // the thread's primary silence timer alive — otherwise a sibling branch
+          // would mask a stalled primary turn. Mirror the text/thinking-delta
+          // routing: ignore heartbeats owned by a parallel request.
+          if (store.getState().chatRuntime.parallelRequestThreads[event.request_id] !== undefined) {
+            return;
+          }
+          dispatch(bumpInferenceHeartbeatForThread({ threadId: event.thread_id }));
+        },
+        onIterationStart: (event: ChatIterationStartEvent) => {
+          const prev = inferenceStatusRef.current[event.thread_id];
+          rtLog('iteration_start', {
+            thread: event.thread_id,
+            request: event.request_id,
+            iteration: event.round,
+          });
+          dispatch(
+            setInferenceStatusForThread({
+              threadId: event.thread_id,
+              status: {
+                phase: 'thinking',
+                iteration: event.round,
+                maxIterations: prev?.maxIterations ?? 0,
+              },
+            })
+          );
+        },
+        onContextCompacting: (event: ChatContextCompactingEvent) => {
+          rtLog('context_compacting', { thread: event.thread_id, request: event.request_id });
+          const runtime = store.getState().chatRuntime;
+          // A parallel branch's compaction is its own, and a superseded turn's
+          // is stale: the thread's status line describes its live primary turn.
+          if (runtime.parallelRequestThreads[event.request_id] !== undefined) {
+            return;
+          }
+          const live = runtime.liveRequestIdByThread[event.thread_id];
+          if (live !== undefined && live !== event.request_id) {
+            return;
+          }
+          const prev = runtime.inferenceStatusByThread[event.thread_id];
+          dispatch(
+            setInferenceStatusForThread({
+              threadId: event.thread_id,
+              status: {
+                phase: 'compacting',
+                iteration: event.round,
+                maxIterations: prev?.maxIterations ?? 0,
+              },
+            })
+          );
+        },
+        onToolCall: (event: ChatToolCallEvent) => {
+          const prev = store.getState().chatRuntime.inferenceStatusByThread[event.thread_id];
+          dispatch(
+            setInferenceStatusForThread({
+              threadId: event.thread_id,
+              status: {
+                ...(prev ?? { iteration: event.round, maxIterations: 0 }),
+                phase: 'tool_use',
+                activeTool: event.tool_name,
+              },
+            })
+          );
+
+          const eventKey = `tool_call:${event.thread_id}:${event.request_id ?? 'none'}:${event.round}:${event.tool_name}:${toolEventIdentity(event)}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+
+          // Start (or extend) the tool-chain latency window for this turn (#4273).
+          // Key by thread+request (same scheme as segment delivery) so parallel /
+          // forked turns that share a thread_id keep independent chains (#4288).
+          skillLatencyRef.current.noteToolCall(
+            segmentDeliveryKey(event.thread_id, event.request_id)
+          );
+
+          // Merge + processing-pointer are now a single reducer (Phase 3) — no
+          // getState()/full-array rebuild in the provider.
+          dispatch(
+            toolCallReceived({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+              round: event.round,
+              toolName: event.tool_name,
+              toolCallId: event.tool_call_id,
+              displayLabel: event.tool_display_label,
+              displayDetail: event.tool_display_detail,
+              args: event.args,
+            })
+          );
+        },
+        onToolResult: (event: ChatToolResultEvent) => {
+          const eventKey = `tool_result:${event.thread_id}:${event.request_id ?? 'none'}:${event.round}:${event.tool_name}:${event.success}:${toolEventIdentity(event)}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+
+          // Settle the matching row in the reducer (Phase 3) — no getState() /
+          // full-array rebuild. A no-op when no row matches.
+          dispatch(
+            toolResultReceived({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+              round: event.round,
+              toolName: event.tool_name,
+              toolCallId: event.tool_call_id,
+              success: event.success,
+              output: event.output,
+              failure: event.failure,
+              args: event.args,
+              elapsedMs: event.elapsed_ms,
+              structured: event.structured,
+              displayLabel: event.tool_display_label,
+              displayDetail: event.tool_display_detail,
+            })
+          );
+
+          // Agent-first Workflow authoring (issue B4): a completed
+          // `propose_workflow` call carries a `workflow_proposal` JSON payload
+          // in `output` — surface it as a `WorkflowProposalCard` above the
+          // composer. The tool only validates; only the card's "Save & enable"
+          // action ever calls `flows_create`, so this dispatch alone can never
+          // create a flow.
+          const mainProposal = maybeParseWorkflowProposalTool(
+            event.tool_name,
+            event.success,
+            event.output
+          );
+          if (mainProposal) {
+            rtLog('workflow proposal parsed (main agent)', {
+              thread: event.thread_id,
+              tool: event.tool_name,
+              name: mainProposal.name,
+            });
+            dispatch(
+              setWorkflowProposalForThread({ threadId: event.thread_id, proposal: mainProposal })
+            );
+          }
+
+          const current = store.getState().chatRuntime.inferenceStatusByThread[event.thread_id];
+          if (!current) return;
+          dispatch(
+            setInferenceStatusForThread({
+              threadId: event.thread_id,
+              status: { ...current, phase: 'thinking', activeTool: undefined },
+            })
+          );
+        },
+        onSubagentSpawned: event => {
+          // Event-seen guard, matching `onToolCall`/`onToolResult`. This socket
+          // reconnects and redelivers freely (13+ times in one measured
+          // session), and a replayed `subagent_spawned` that lands AFTER
+          // `subagent_awaiting_user` looks exactly like a same-task resume —
+          // the reducer would clear the pause and the
+          // question would vanish while the child was still blocked. `seq` is
+          // the core's own answer to this: `(request_id, seq)` is stamped per
+          // emission (`publish_seq_stamped`), so a redelivery repeats the pair
+          // and a real resume never does. The reducer keeps its own durable
+          // check for the case this bounded cache has already evicted.
+          const eventKey = `subagent_spawned:${event.thread_id}:${event.request_id ?? 'none'}:${event.seq ?? `${event.round}:${event.skill_id}:${event.tool_name}`}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          ) {
+            return;
+          }
+          const prev = store.getState().chatRuntime.inferenceStatusByThread[event.thread_id];
+          dispatch(
+            setInferenceStatusForThread({
+              threadId: event.thread_id,
+              status: {
+                ...(prev ?? { iteration: event.round, maxIterations: 0 }),
+                phase: 'subagent',
+                activeSubagent: event.tool_name,
+              },
+            })
+          );
+
+          // Collapse the parent spawn/delegate row into the subagent row (one
+          // entry per delegation) — merge now lives in the reducer (Phase 3).
+          dispatch(
+            subagentSpawned({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+              round: event.round,
+              rowId: `${event.thread_id}:subagent:${event.skill_id}:${event.tool_name}`,
+              taskId: event.skill_id,
+              agentId: event.tool_name,
+              displayName: event.subagent?.display_name,
+              workerThreadId: event.subagent?.worker_thread_id,
+              mode: event.subagent?.mode,
+              dedicatedThread: event.subagent?.dedicated_thread,
+              // Identity of THIS emission, carried into the reducer so it can
+              // tell a resume from a replay without depending on the cache above.
+              spawnEventId: `${event.request_id ?? 'none'}:${event.seq ?? 'noseq'}`,
+              // Real tool_call_id of the spawn/delegate call, when the core sent
+              // one — lets the reducer attach this activity to that exact row
+              // instead of guessing it heuristically.
+              parentCallId: event.subagent?.parent_call_id,
+            })
+          );
+        },
+        onSubagentAwaitingUser: (event: ChatSubagentDoneEvent) => {
+          // Same guard, mirrored: a replayed `subagent_awaiting_user` arriving
+          // after the child has resumed would re-park a running row.
+          const eventKey = `subagent_awaiting_user:${event.thread_id}:${event.request_id ?? 'none'}:${event.seq ?? `${event.round}:${event.skill_id}:${event.tool_name}`}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          ) {
+            return;
+          }
+          dispatch(
+            subagentAwaitingUser({
+              threadId: event.thread_id,
+              rowId: `${event.thread_id}:subagent:${event.skill_id}:${event.tool_name}`,
+              // The core puts the child's `ask_user_clarification` question in
+              // `message` (progress_bridge.rs:1055). It is the only copy of the
+              // question the frontend ever receives.
+              question: event.message,
+            })
+          );
+        },
+        onSubagentDone: (event: ChatSubagentDoneEvent) => {
+          dispatch(
+            subagentDone({
+              threadId: event.thread_id,
+              rowId: `${event.thread_id}:subagent:${event.skill_id}:${event.tool_name}`,
+              taskId: event.skill_id,
+              success: event.success,
+              iterations: event.subagent?.iterations,
+              elapsedMs: event.subagent?.elapsed_ms,
+              outputChars: event.subagent?.output_chars,
+              output: event.subagent?.output,
+            })
+          );
+
+          // A detached sub-agent's spend reaches the composer here or nowhere.
+          //
+          // The parent turn's `chat_done` fired before this child finished, and
+          // for a detached spawn the child's usage never entered the parent's
+          // ledger — `detached_child()` sets `parent_subagent_usage` to `None` —
+          // so `holistic_last_turn_usage` folded nothing and the reported totals
+          // are parent-only. The core populates these fields ONLY when that is
+          // the case, so adding them unconditionally is correct: for a blocking
+          // spawn they are absent, because its spend is already inside the
+          // `chat_done` figures (tokens AND cost). See #6459.
+          const childInput = event.subagent?.input_tokens;
+          const childOutput = event.subagent?.output_tokens;
+          if (childInput !== undefined || childOutput !== undefined) {
+            dispatch(
+              recordChatTurnUsage({
+                threadId: event.thread_id,
+                // The child's tokens go at the TOP level because that is what
+                // `applyTurnUsage` folds into the thread totals the composer
+                // shows — mirroring `chat_done`, whose top-level figures are
+                // already parent+child. The `subAgents` entry below is the
+                // per-agent breakdown, not the total.
+                inputTokens: childInput ?? 0,
+                outputTokens: childOutput ?? 0,
+                cachedTokens: event.subagent?.cached_input_tokens ?? 0,
+                // `null` (cost not known) is kept so the thread shows no
+                // price; an absent field means "nothing to add".
+                costUsd: event.subagent?.cost_usd === undefined ? 0 : event.subagent.cost_usd,
+                subAgentSpendOnly: true,
+                subAgents: [
+                  {
+                    agentId: event.tool_name ?? 'subagent',
+                    inputTokens: childInput ?? 0,
+                    outputTokens: childOutput ?? 0,
+                    costUsd: event.subagent?.cost_usd === undefined ? 0 : event.subagent.cost_usd,
+                  },
+                ],
+              })
+            );
+          }
+
+          const current = store.getState().chatRuntime.inferenceStatusByThread[event.thread_id];
+          if (!current) return;
+          dispatch(
+            setInferenceStatusForThread({
+              threadId: event.thread_id,
+              status: { ...current, phase: 'thinking', activeSubagent: undefined },
+            })
+          );
+        },
+        onSubagentIterationStart: event => {
+          const taskId = event.subagent?.task_id ?? event.skill_id;
+          const agentId = event.subagent?.agent_id ?? event.tool_name;
+          dispatch(
+            subagentIterationStarted({
+              threadId: event.thread_id,
+              rowId: `${event.thread_id}:subagent:${taskId}:${agentId}`,
+              childIteration: event.subagent?.child_iteration,
+              childMaxIterations: event.subagent?.child_max_iterations,
+            })
+          );
+        },
+        onSubagentToolCall: event => {
+          const taskId = event.subagent?.task_id ?? event.skill_id;
+          const agentId = event.subagent?.agent_id;
+          if (!agentId) return;
+          const rowId = `${event.thread_id}:subagent:${taskId}:${agentId}`;
+          // Reducer owns the toolCalls upsert (dedup on call_id) — no getState().
+          dispatch(
+            subagentToolCallReceived({
+              threadId: event.thread_id,
+              rowId,
+              callId: event.tool_call_id,
+              toolName: event.tool_name,
+              iteration: event.subagent?.child_iteration,
+              args: event.args,
+              displayName: event.tool_display_label,
+              detail: event.tool_display_detail,
+            })
+          );
+          // Mirror the call into the ordered transcript so the drawer renders it
+          // right after the text that triggered it (self-guarded / self-deduped).
+          dispatch(
+            recordSubagentTranscriptTool({
+              threadId: event.thread_id,
+              rowId,
+              callId: event.tool_call_id,
+              toolName: event.tool_name,
+              iteration: event.subagent?.child_iteration,
+              args: event.args,
+              displayName: event.tool_display_label,
+              detail: event.tool_display_detail,
+            })
+          );
+        },
+        onSubagentToolResult: event => {
+          // Phase 5c: the Flows prompt bar / canvas copilot route to the
+          // `workflow_builder` specialist via delegation (`build_workflow`), so a
+          // `propose_workflow`/`revise_workflow` proposal is produced INSIDE the
+          // delegated worker and arrives here (not on `onToolResult`). This
+          // extraction must run BEFORE the timeline-entry guards below: under
+          // the workflow_builder subagent's heavy event volume, the progress
+          // channel (bounded, `try_send`) can drop earlier events, so the
+          // timeline row for this call may never have been created — gating
+          // proposal extraction on finding that row silently drops the
+          // proposal and the Accept/Reject card never renders (bug). The
+          // extraction only needs `tool_name`/`success`/`output`, all present
+          // directly on the event, with no timeline dependency. Surface it on
+          // the PARENT thread (`event.thread_id`, which the progress bridge
+          // always stamps with the parent request's thread, not the child's)
+          // so the same `WorkflowProposalCard` the direct-tool path uses
+          // renders it. Still validate-only — the card's explicit Save is the
+          // sole persistence gate.
+          const subagentProposal = maybeParseWorkflowProposalTool(
+            event.tool_name,
+            event.success,
+            event.output
+          );
+          if (subagentProposal) {
+            rtLog('workflow proposal parsed (delegated worker)', {
+              thread: event.thread_id,
+              tool: event.tool_name,
+              name: subagentProposal.name,
+            });
+            dispatch(
+              setWorkflowProposalForThread({
+                threadId: event.thread_id,
+                proposal: subagentProposal,
+              })
+            );
+          }
+
+          const taskId = event.subagent?.task_id ?? event.skill_id;
+          const agentId = event.subagent?.agent_id;
+          if (!agentId) return;
+          const rowId = `${event.thread_id}:subagent:${taskId}:${agentId}`;
+          // Reducer owns the nested toolCall settle (no-op if the call is absent).
+          dispatch(
+            subagentToolResultReceived({
+              threadId: event.thread_id,
+              rowId,
+              callId: event.tool_call_id,
+              success: event.success,
+              elapsedMs: event.subagent?.elapsed_ms,
+              outputChars: event.subagent?.output_chars,
+              result: event.output,
+              failure: event.failure,
+            })
+          );
+          dispatch(
+            resolveSubagentTranscriptTool({
+              threadId: event.thread_id,
+              rowId,
+              callId: event.tool_call_id,
+              success: event.success,
+              elapsedMs: event.subagent?.elapsed_ms,
+              outputChars: event.subagent?.output_chars,
+              result: event.output,
+              failure: event.success ? undefined : parseToolFailure(event.failure),
+            })
+          );
+        },
+        onSubagentTextDelta: (event: ChatSubagentTextDeltaEvent) => {
+          const taskId = event.subagent?.task_id;
+          const agentId = event.subagent?.agent_id;
+          if (!taskId || !agentId || !event.delta) return;
+          dispatch(
+            appendSubagentStreamDelta({
+              threadId: event.thread_id,
+              rowId: `${event.thread_id}:subagent:${taskId}:${agentId}`,
+              kind: 'text',
+              delta: event.delta,
+              iteration: event.subagent?.child_iteration,
+            })
+          );
+        },
+        onSubagentThinkingDelta: (event: ChatSubagentThinkingDeltaEvent) => {
+          const taskId = event.subagent?.task_id;
+          const agentId = event.subagent?.agent_id;
+          if (!taskId || !agentId || !event.delta) return;
+          dispatch(
+            appendSubagentStreamDelta({
+              threadId: event.thread_id,
+              rowId: `${event.thread_id}:subagent:${taskId}:${agentId}`,
+              kind: 'thinking',
+              delta: event.delta,
+              iteration: event.subagent?.child_iteration,
+            })
+          );
+        },
+        onSegment: (event: ChatSegmentEvent) => {
+          const eventKey = `segment:${event.thread_id}:${event.request_id}:${event.segment_index}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+          const content = segmentText(event);
+          const deliveryKey = segmentDeliveryKey(event.thread_id, event.request_id);
+          const delivery = getOrCreateSegmentDelivery(segmentDeliveriesRef.current, deliveryKey);
+          delivery.segments.set(event.segment_index, content);
+          void dispatch(
+            addInferenceResponse({
+              content,
+              threadId: event.thread_id,
+              // Stamp the producing turn's request id so the timeline projection
+              // can group this answer with its per-turn process trail (Phase 4
+              // anchoring, Option B — see the companion plan). `citations` is
+              // merged in when present.
+              extraMetadata: {
+                ...(event.citations?.length ? { citations: event.citations } : {}),
+                ...(event.request_id ? { requestId: event.request_id } : {}),
+              },
+            })
+          );
+        },
+        onInterim: (event: ChatInterimEvent) => {
+          // One interim per round — `round` is a stable per-turn dedup key that
+          // survives socket reconnect/replay (a re-delivered frame must not
+          // append the narration bubble twice).
+          const eventKey = `interim:${event.thread_id}:${event.request_id}:${event.round}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+          const content = event.full_response?.trim() ?? '';
+          if (!content) return;
+          // Narration is NOT promoted to a chat message any more.
+          //
+          // It used to be persisted here via `addInferenceResponse({ isInterim })`,
+          // which gave it a lifetime no other progress signal has: thinking is
+          // wiped at `chat_done`, tool rows collapse, but narration bubbles
+          // ("Let me get the data for both.", "The HTML is hard to parse…")
+          // stayed in the thread forever, wedged between the question and the
+          // answer they were superseded by.
+          //
+          // It is already captured twice over without this: `streamDeltaReceived`
+          // coalesces every `content` delta into `processingByThread` as a
+          // `narration` transcript item (chatRuntimeSlice), and the core persists
+          // the same thing server-side as `TranscriptItem::Narration`, kept after
+          // completion so a reload replays it. The inline rail and the Agent
+          // Process Source panel both render that transcript — so narration is
+          // still fully visible while the turn runs, and still inspectable after,
+          // just not as a permanent chat bubble.
+          //
+          // The event is still consumed (not dropped upstream) for its dedup key
+          // and the preview reset below, both of which are round-scoped.
+          rtLog('interim_narration_observed', {
+            thread: event.thread_id,
+            request: event.request_id,
+            round: event.round,
+          });
+          // Drop the round's narration from the live streaming preview, which
+          // accumulates across the whole turn under one request_id. This matters
+          // MORE now: without it the same text renders both in the rail (as a
+          // transcript item) and in the preview tail. Reset synchronously so the
+          // next round's deltas start from an empty buffer.
+          const cr = store.getState().chatRuntime;
+          const existing = cr.streamingAssistantByThread[event.thread_id];
+          if (existing && existing.requestId === event.request_id) {
+            dispatch(
+              setStreamingAssistantForThread({
+                threadId: event.thread_id,
+                streaming: {
+                  requestId: existing.requestId,
+                  content: '',
+                  thinking: existing.thinking,
+                },
+              })
+            );
+          }
+        },
+        onTextDelta: event => {
+          // Redelivered frames are dropped before coalescing (`accept` below).
+          // Parallel-vs-primary routing + processing transcript now live in the
+          // reducer (Phase 3) — no getState() in the provider.
+          dispatch(
+            streamDeltaReceived({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+              round: event.round,
+              delta: event.delta,
+              channel: 'content',
+            })
+          );
+        },
+        onThinkingDelta: event => {
+          dispatch(
+            streamDeltaReceived({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+              round: event.round,
+              delta: event.delta,
+              channel: 'thinking',
+              at: Date.now(),
+            })
+          );
+        },
+        onToolArgsDelta: event => {
+          // Match + append + decorate now live in the reducer (Phase 3).
+          dispatch(
+            toolArgsDeltaReceived({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+              round: event.round,
+              delta: event.delta,
+              toolName: event.tool_name,
+              toolCallId: event.tool_call_id,
+            })
+          );
+        },
+        onProactiveMessage: (event: ProactiveMessageEvent) => {
+          const messageDigest = proactiveMessageDigest(event.full_response ?? '');
+          const eventKey = `proactive:${event.thread_id}:${event.request_id ?? 'none'}:${messageDigest}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+
+          proactiveDispatchQueueRef.current = proactiveDispatchQueueRef.current.then(async () => {
+            try {
+              const targetThreadId = await resolveVisibleThreadForProactive(event.thread_id);
+              if (!targetThreadId) return;
+              rtLog('proactive_message', {
+                from: event.thread_id,
+                to: targetThreadId,
+                request: event.request_id,
+              });
+              await dispatch(
+                addInferenceResponse({
+                  content: event.full_response,
+                  threadId: targetThreadId,
+                  messageId: proactiveMessageId(event),
+                  // Stamp the producing turn's request id when present (Phase 4
+                  // anchoring); proactive events may omit it, in which case the
+                  // message falls back to the legacy single-anchor turn.
+                  extraMetadata: event.request_id ? { requestId: event.request_id } : undefined,
+                })
+              );
+            } catch (error) {
+              rtLog('proactive_dispatch_failed', {
+                from: event.thread_id,
+                request: event.request_id,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          });
+        },
+        onArtifactPending: event => {
+          rtLog('artifact_pending', {
+            thread: event.thread_id,
+            artifact_id: event.artifact_id,
+            kind: event.kind,
+          });
+          dispatch(
+            upsertArtifactInProgressForThread({
+              threadId: event.thread_id,
+              artifactId: event.artifact_id,
+              kind: event.kind,
+              title: event.title,
+              toolCallId: event.tool_call_id,
+              requestId: event.request_id,
+            })
+          );
+        },
+        onArtifactReady: event => {
+          rtLog('artifact_ready', {
+            thread: event.thread_id,
+            artifact_id: event.artifact_id,
+            kind: event.kind,
+            size_bytes: event.size_bytes,
+          });
+          dispatch(
+            upsertArtifactReadyForThread({
+              threadId: event.thread_id,
+              artifactId: event.artifact_id,
+              kind: event.kind,
+              title: event.title,
+              path: event.path,
+              sizeBytes: event.size_bytes,
+              toolCallId: event.tool_call_id,
+              requestId: event.request_id,
+            })
+          );
+        },
+        onArtifactFailed: event => {
+          // Defence-in-depth: producer is expected to pre-truncate the
+          // reason, but cap again here so a leaky producer cannot dump
+          // unbounded provider stderr into client telemetry.
+          rtLog('artifact_failed', {
+            thread: event.thread_id,
+            artifact_id: event.artifact_id,
+            kind: event.kind,
+            error: event.error.slice(0, 80),
+          });
+          dispatch(
+            upsertArtifactFailedForThread({
+              threadId: event.thread_id,
+              artifactId: event.artifact_id,
+              kind: event.kind,
+              title: event.title,
+              error: event.error,
+              requestId: event.request_id,
+            })
+          );
+        },
+        onApprovalRequest: (event: ChatApprovalRequestEvent) => {
+          rtLog('approval_request', {
+            thread: event.thread_id,
+            request: event.request_id,
+            tool: event.tool_name,
+          });
+          // Pull the exact command/target out of the redacted args for display:
+          // shell → command, file write/edit → path, network → url.
+          const a = event.args ?? {};
+          const firstString = (v: unknown): string | undefined =>
+            typeof v === 'string' && v.length > 0 ? v : undefined;
+          const command =
+            firstString(a.command) ??
+            firstString(a.path) ??
+            firstString(a.url) ??
+            firstString(a.target);
+          // `composio_connect` carries the toolkit slug so the inline connect
+          // card (#3993) knows which integration to authorize.
+          const toolkit = firstString(a.toolkit);
+          dispatch(
+            setPendingApprovalForThread({
+              threadId: event.thread_id,
+              approval: {
+                requestId: event.request_id,
+                toolName: event.tool_name,
+                message: event.message,
+                command,
+                toolkit,
+                toolCallId: event.tool_call_id,
+                expiresAt: event.expires_at,
+                ...(event.detached === true ? { detached: true } : {}),
+              },
+            })
+          );
+        },
+        onApprovalDecided: (event: ChatApprovalDecidedEvent) => {
+          rtLog('approval_decided', {
+            thread: event.thread_id,
+            request: event.request_id,
+            resolution: event.resolution,
+          });
+          // Only a server-recorded TERMINAL non-decision (TTL expiry, an
+          // external cancel) needs handling here: an interactive decision made
+          // through THIS client already cleared the entry optimistically
+          // (`useOpenHumanExternalStore`'s `onRespondToToolApproval` /
+          // `ApprovalRequestCard`), and a decision made on another connected
+          // client is covered by the existing turn-end handlers once that
+          // client's turn settles. Clearing eagerly on every `approval_decided`
+          // would race the optimistic clear and, worse, drop a card whose
+          // decision the USER on this client is mid-click on when the event
+          // for a DIFFERENT thread's request arrives.
+          if (!event.thread_id) return;
+          // A detached card (an async sub-agent's) has no turn end of its own
+          // to clear it, so any resolution of exactly that request — a decision
+          // made on another client or by a typed reply, an expiry, a cancel —
+          // removes it here. Matching on `request_id` keeps a different
+          // thread's or a newer request's card.
+          const runtime = store.getState().chatRuntime;
+          const held = runtime.pendingApprovalByThread[event.thread_id];
+          // A detached request can also be waiting in the thread's queue
+          // behind the shown card; its resolution drops it from there.
+          const queued = (runtime.queuedApprovalsByThread?.[event.thread_id] ?? []).some(
+            entry => entry.requestId === event.request_id
+          );
+          if ((held?.detached && held.requestId === event.request_id) || queued) {
+            dispatch(
+              clearPendingApprovalIfRequest({
+                threadId: event.thread_id,
+                requestId: event.request_id,
+              })
+            );
+            return;
+          }
+          if (event.resolution !== 'expired' && event.resolution !== 'cancelled') {
+            return;
+          }
+          dispatch(
+            resolvePendingApprovalForThread({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+              resolution: event.resolution,
+            })
+          );
+        },
+        onPlanReviewRequest: (event: ChatPlanReviewRequestEvent) => {
+          rtLog('plan_review_request', { thread: event.thread_id, request: event.request_id });
+          const steps = Array.isArray(event.args?.steps)
+            ? event.args.steps.filter((s): s is string => typeof s === 'string')
+            : [];
+          dispatch(
+            setPendingPlanReviewForThread({
+              threadId: event.thread_id,
+              review: {
+                requestId: event.request_id,
+                summary: event.message,
+                steps,
+                toolCallId: event.tool_call_id,
+                expiresAt: event.expires_at,
+              },
+            })
+          );
+        },
+        onPlanReviewDecided: event => {
+          rtLog('plan_review_decided', {
+            thread: event.thread_id,
+            request: event.request_id,
+            resolution: event.cancel_reason,
+          });
+          dispatch(
+            clearPendingPlanReviewIfRequest({
+              threadId: event.thread_id,
+              requestId: event.request_id,
+            })
+          );
+        },
+        onThreadTodosChanged: (event: ChatThreadTodosChangedEvent) => {
+          rtLog('thread_todos_changed', {
+            thread: event.thread_id,
+            count: event.todos?.length ?? 0,
+          });
+          dispatch(setThreadTodos({ threadId: event.thread_id, todos: event.todos ?? [] }));
+        },
+        onThreadGoalUpdated: (event: ChatThreadGoalUpdatedEvent) => {
+          rtLog('thread_goal_updated', { thread: event.thread_id, status: event.goal?.status });
+          dispatch(setThreadGoal({ threadId: event.thread_id, goal: event.goal }));
+        },
+        onThreadGoalCleared: (event: ChatThreadGoalClearedEvent) => {
+          rtLog('thread_goal_cleared', { thread: event.thread_id });
+          dispatch(clearThreadGoal({ threadId: event.thread_id }));
+        },
+        onRunModeChanged: (event: ChatRunModeChangedEvent) => {
+          rtLog('run_mode_changed', { thread: event.thread_id, mode: event.mode });
+          dispatch(setRunMode({ threadId: event.thread_id, mode: event.mode }));
+        },
+        /**
+         * `chat_cancelled` (wire-contract.md) — the core-authoritative sibling
+         * of the Stop path in `Conversations.tsx`. It persists the partial
+         * after core confirmation, including `cancel_reason: 'superseded'`
+         * when a newer send interrupts the turn without a Stop click.
+         *
+         * The core keeps emitting `chat_error{error_type:"cancelled"}`
+         * alongside this for one release. That earlier compatibility event
+         * must leave the stream intact until this handler saves it.
+         */
+        onCancelled: (event: ChatCancelledEvent) => {
+          const eventKey = `cancelled:${event.thread_id}:${event.request_id ?? 'none'}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+
+          rtLog('chat_cancelled', {
+            thread: event.thread_id,
+            request: event.request_id,
+            reason: event.cancel_reason,
+            superseded_by: event.superseded_by,
+          });
+
+          // Read the live partial and the existing transcript BEFORE clearing
+          // any runtime state below — those dispatches are what the partial and
+          // the "already persisted?" check would otherwise be racing against.
+          const stateBefore = store.getState();
+          if (
+            event.request_id &&
+            stateBefore.chatRuntime.parallelRequestThreads[event.request_id] !== undefined
+          ) {
+            const requestId = event.request_id;
+            const parallelPartial =
+              stateBefore.chatRuntime.parallelStreamsByThread[event.thread_id]?.[requestId]
+                ?.content ?? '';
+            if (parallelPartial.trim()) {
+              void dispatch(
+                addInferenceResponse({
+                  content: parallelPartial,
+                  threadId: event.thread_id,
+                  extraMetadata: chatCancelledExtraMetadata(event),
+                })
+              ).then(() => dispatch(clearParallelRequest({ requestId })));
+            } else {
+              dispatch(clearParallelRequest({ requestId }));
+            }
+            return;
+          }
+          const liveRequestId =
+            stateBefore.chatRuntime.liveRequestIdByThread[event.thread_id] ??
+            stateBefore.chatRuntime.streamingAssistantByThread[event.thread_id]?.requestId;
+          const sameTurn =
+            !event.request_id || !liveRequestId || event.request_id === liveRequestId;
+          const partial = sameTurn
+            ? (stateBefore.chatRuntime.streamingAssistantByThread[event.thread_id]?.content ?? '')
+            : '';
+          const hasProcessing =
+            sameTurn &&
+            ((stateBefore.chatRuntime.processingByThread[event.thread_id]?.length ?? 0) > 0 ||
+              (stateBefore.chatRuntime.toolTimelineByThread[event.thread_id]?.length ?? 0) > 0);
+          const threadMessages = stateBefore.thread.messagesByThreadId[event.thread_id] ?? [];
+          const alreadyStopped = event.request_id
+            ? threadMessages.some(message => {
+                const meta = message.extraMetadata as
+                  | { stopped?: boolean; requestId?: string }
+                  | undefined;
+                return meta?.stopped === true && meta.requestId === event.request_id;
+              })
+            : false;
+
+          const settle = () => {
+            if (sameTurn) {
+              dispatch(cancelUnresolvedTurnTimeline({ threadId: event.thread_id }));
+            }
+            dispatch(turnSettled({ threadId: event.thread_id, requestId: event.request_id }));
+            if (sameTurn) dispatch(clearThreadInferenceActive(event.thread_id));
+          };
+          // An answer can consist entirely of reasoning, narration or tool
+          // activity. Persist an empty stopped row to anchor that trail too.
+          if (!alreadyStopped && (partial.trim().length > 0 || hasProcessing)) {
+            void dispatch(
+              addInferenceResponse({
+                content: partial,
+                threadId: event.thread_id,
+                extraMetadata: chatCancelledExtraMetadata(event),
+              })
+            ).then(settle);
+          } else {
+            settle();
+          }
+        },
+        onDone: event => {
+          const eventKey = `done:${event.thread_id}:${event.request_id ?? 'none'}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+
+          rtLog('chat_done', {
+            thread: event.thread_id,
+            request: event.request_id,
+            segments: event.segment_total,
+            input_tokens: event.total_input_tokens,
+            output_tokens: event.total_output_tokens,
+          });
+
+          // Close the tool-chain latency window and surface overruns of the 60s
+          // target (#4273, AC3). Observability only — never blocks the turn.
+          const latency = skillLatencyRef.current.finishChain(
+            segmentDeliveryKey(event.thread_id, event.request_id),
+            { ok: true }
+          );
+          if (latency) {
+            rtLog('skill_tool_chain_latency', {
+              thread: event.thread_id,
+              request: event.request_id,
+              elapsed_ms: latency.elapsedMs,
+              tools: latency.toolCount,
+              within_target: latency.withinTarget ? 'true' : 'false',
+            });
+            if (!latency.withinTarget) {
+              console.warn(
+                `[skill-latency] tool chain on thread ${event.thread_id} took ${latency.elapsedMs}ms ` +
+                  `across ${latency.toolCount} tool(s) — exceeds the ${SKILL_TOOL_CHAIN_TARGET_MS}ms target`
+              );
+            }
+          }
+
+          // Parallel (forked) turn: resolve only its own lane. The primary turn's
+          // stream / status / lifecycle / active marker may still be running, so
+          // we must NOT clear them here. Segmented parallel turns already
+          // persisted via `onSegment` (keyed by thread+request); a single-bubble
+          // parallel turn persists its full response now.
+          if (
+            event.request_id !== undefined &&
+            store.getState().chatRuntime.parallelRequestThreads[event.request_id] !== undefined
+          ) {
+            const parallelRequestId = event.request_id;
+            dispatch(recordChatTurnUsage(chatTurnUsagePayload(event)));
+            if (!event.segment_total && event.full_response.length > 0) {
+              void (async () => {
+                try {
+                  await dispatch(
+                    addInferenceResponse({
+                      content: event.full_response,
+                      threadId: event.thread_id,
+                      messageId: deliveredReplyMessageId(event),
+                      extraMetadata: chatDoneExtraMetadata(event),
+                    })
+                  ).unwrap();
+                  void dispatch(
+                    generateThreadTitleIfNeeded({
+                      threadId: event.thread_id,
+                      assistantMessage: event.full_response,
+                    })
+                  );
+                } catch (error) {
+                  rtLog('parallel_chat_done_append_failed', {
+                    thread: event.thread_id,
+                    request: event.request_id,
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                  await recoverDeliveredReply(event, error);
+                }
+              })();
+            }
+            dispatch(clearParallelRequest({ requestId: parallelRequestId }));
+            requestUsageRefresh();
+            return;
+          }
+
+          const deliveryKey = segmentDeliveryKey(event.thread_id, event.request_id);
+          const segmentDelivery = takeSegmentDelivery(segmentDeliveriesRef.current, deliveryKey);
+          const completeSegmentDelivery = hasCompleteSegmentDelivery(event, segmentDelivery);
+
+          dispatch(recordChatTurnUsage(chatTurnUsagePayload(event)));
+          // A parked gate cannot outlive its turn, so those go now — except a
+          // detached one (an async sub-agent's), which is still waiting.
+          dispatch(clearTurnApprovalForThread({ threadId: event.thread_id }));
+          dispatch(clearPendingPlanReviewForThread({ threadId: event.thread_id }));
+          // Nothing the turn RENDERED is cleared here. The streaming buffer, the
+          // status line and the running rows used to be torn down first, before
+          // the reply was even persisted, and every one of those was a render:
+          // the answer vanished, then reappeared above its own tools, then the
+          // tools moved back and remounted collapsed. The live tail now stays as
+          // it is until `finishChatDoneTurn` swaps it for the persisted reply in
+          // one `turnSettled` update (the reply row is hidden behind the tail
+          // until then — see `buildRuntimeMessages`).
+          //
+          // Rows still `running` are NOT forced to `success` here. The core now
+          // forwards every queued progress event before `chat_done`, so a row
+          // still running at this point genuinely has no result — marking it
+          // successful invented an outcome. The settled turn_state snapshot /
+          // transcript projection settles it (to its real status, or
+          // `cancelled`).
+          if (!event.segment_total) {
+            void (async () => {
+              try {
+                await dispatch(
+                  addInferenceResponse({
+                    content: event.full_response,
+                    threadId: event.thread_id,
+                    messageId: deliveredReplyMessageId(event),
+                    extraMetadata: chatDoneExtraMetadata(event),
+                  })
+                ).unwrap();
+                void dispatch(
+                  generateThreadTitleIfNeeded({
+                    threadId: event.thread_id,
+                    assistantMessage: event.full_response,
+                  })
+                );
+              } catch (error) {
+                rtLog('chat_done_append_failed', {
+                  thread: event.thread_id,
+                  request: event.request_id,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+                await recoverDeliveredReply(event, error);
+              }
+              await finishChatDoneTurn(event, 'proactive');
+            })();
+            return;
+          }
+
+          if (!completeSegmentDelivery && event.full_response.length > 0) {
+            rtLog('chat_done_segment_reconcile', {
+              thread: event.thread_id,
+              request: event.request_id,
+              expected: event.segment_total,
+              received: segmentDelivery?.segments.size ?? 0,
+              full_len: event.full_response.length,
+            });
+            void (async () => {
+              try {
+                await dispatch(
+                  addInferenceResponse({
+                    content: event.full_response,
+                    threadId: event.thread_id,
+                    messageId: corePersistedMessageId(event),
+                    extraMetadata: chatDoneExtraMetadata(event),
+                  })
+                ).unwrap();
+                void dispatch(
+                  generateThreadTitleIfNeeded({
+                    threadId: event.thread_id,
+                    assistantMessage: event.full_response,
+                  })
+                );
+              } catch (error) {
+                rtLog('chat_done_reconcile_append_failed', {
+                  thread: event.thread_id,
+                  request: event.request_id,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+              await finishChatDoneTurn(event, 'segment_reconcile');
+            })();
+            return;
+          }
+
+          void dispatch(
+            generateThreadTitleIfNeeded({
+              threadId: event.thread_id,
+              assistantMessage: event.full_response,
+            })
+          );
+          void finishChatDoneTurn(event, 'ordinary');
+        },
+        onError: event => {
+          const eventKey = `error:${event.thread_id}:${event.request_id ?? 'none'}:${event.error_type}`;
+          if (
+            !markChatEventSeen(eventKey, { threadId: event.thread_id, requestId: event.request_id })
+          )
+            return;
+
+          rtLog('chat_error', {
+            thread: event.thread_id,
+            request: event.request_id,
+            err: event.error_type,
+          });
+
+          // A failed turn still closes its latency window so the chain timer never
+          // leaks into a later turn on the same thread (#4273, AC3).
+          const errLatency = skillLatencyRef.current.finishChain(
+            segmentDeliveryKey(event.thread_id, event.request_id),
+            { ok: false }
+          );
+          if (errLatency) {
+            rtLog('skill_tool_chain_latency', {
+              thread: event.thread_id,
+              request: event.request_id,
+              elapsed_ms: errLatency.elapsedMs,
+              tools: errLatency.toolCount,
+              within_target: errLatency.withinTarget ? 'true' : 'false',
+              ok: 'false',
+            });
+          }
+
+          // #3931: surface expected, user-actionable provider/billing states
+          // (insufficient BYO credits, managed-budget exhaustion) in the shell's
+          // dedicated error panel — in ADDITION to the inline chat message below.
+          // Additive + defensive: no-op for non-actionable errors, never throws.
+          if (event.error_type !== 'cancelled') {
+            ingestRuntimeErrorSignal(dispatch, {
+              message: event.message,
+              errorType: event.error_type,
+              scope: 'chat',
+              sourceDomain: 'chat',
+            });
+            // #5868: a session_expired chat error means the Rust core already
+            // published DomainEvent::SessionExpired and set signed_out=true, but
+            // the auth:session_expired socket event may have been suppressed
+            // (isBootstrapping guard) or missed. Dispatch the same window event
+            // socketService emits so CoreStateProvider's runReauth() fires the
+            // clearSession() → login redirect path from this side too. The 10s
+            // debounce in runReauth() ensures a concurrent socket event does not
+            // cause a double-clear.
+            if (event.error_type === 'session_expired') {
+              // `reason: 'unconfirmed'` is load-bearing, not defensive. The core
+              // classifies this error with `is_session_expired_message`, which
+              // matches the LOCAL guards "no backend session token" and
+              // "session jwt required" as well as a real backend expiry
+              // (`core/observability.rs`). Those two fire transiently before the
+              // on-disk auth profile has been read — #2758 is the bug where
+              // treating them as definitive forced a re-login even though the
+              // token had survived the restart. `unconfirmed` routes through
+              // `confirmSessionTokenGone()` in `runReauth`, so a signal raised
+              // while the token is still on disk stops short of the destructive
+              // `clearSession()`. A genuine expiry still corroborates and signs
+              // out; only the false positive is filtered.
+              window.dispatchEvent(
+                new CustomEvent('openhuman:session-expired', {
+                  detail: { source: 'chat-error', reason: 'unconfirmed' },
+                })
+              );
+            }
+          }
+
+          // The core sends this compatibility event before `chat_cancelled`.
+          // Leave the live stream and turn intact for that authoritative event.
+          if (event.error_type === 'cancelled') return;
+
+          // Parallel (forked) turn error: resolve only its lane, leaving the
+          // primary turn untouched. Surface a non-cancellation error as a message
+          // so the failed branch is visible.
+          if (
+            event.request_id !== undefined &&
+            store.getState().chatRuntime.parallelRequestThreads[event.request_id] !== undefined
+          ) {
+            deleteSegmentDelivery(
+              segmentDeliveriesRef.current,
+              segmentDeliveryKey(event.thread_id, event.request_id)
+            );
+            const errorContent = chatErrorCopyText(event, tRef.current) || '';
+            void dispatch(
+              addInferenceResponse({
+                content: errorContent,
+                threadId: event.thread_id,
+                extraMetadata: chatErrorExtraMetadata(event),
+              })
+            );
+            requestUsageRefresh();
+            dispatch(clearParallelRequest({ requestId: event.request_id }));
+            return;
+          }
+
+          deleteSegmentDelivery(
+            segmentDeliveriesRef.current,
+            segmentDeliveryKey(event.thread_id, event.request_id)
+          );
+          const currentState = store.getState();
+          const liveRequestId =
+            currentState.chatRuntime.liveRequestIdByThread[event.thread_id] ??
+            currentState.chatRuntime.streamingAssistantByThread[event.thread_id]?.requestId;
+          const olderTurn = Boolean(
+            event.request_id && liveRequestId && event.request_id !== liveRequestId
+          );
+          if (!olderTurn) {
+            dispatch(clearInferenceStatusForThread({ threadId: event.thread_id }));
+            dispatch(clearStreamingAssistantForThread({ threadId: event.thread_id }));
+            dispatch(clearTurnApprovalForThread({ threadId: event.thread_id }));
+            dispatch(clearPendingPlanReviewForThread({ threadId: event.thread_id }));
+
+            const existing = currentState.chatRuntime.toolTimelineByThread[event.thread_id] ?? [];
+            if (existing.length > 0) {
+              const entries = existing.map(entry =>
+                entry.status === 'running' ? { ...entry, status: 'error' as const } : entry
+              );
+              dispatch(setToolTimelineForThread({ threadId: event.thread_id, entries }));
+            }
+          }
+
+          const threadMessages = currentState.thread.messagesByThreadId[event.thread_id] ?? [];
+          const lastMsg = threadMessages[threadMessages.length - 1];
+          // Every error_type — including the generic 'inference' fallback — carries a
+          // user-facing `message` produced by classify_inference_error() in web_errors.rs.
+          // For 'inference' that message is the friendly summary PLUS the real, sanitized
+          // upstream provider error appended as a `> quote` block (secret-scrubbed and
+          // length-capped server-side via with_provider_detail()/sanitize_api_error()), so
+          // surfacing it tells the user *why* the turn failed instead of a blanket apology.
+          // An empty message still becomes an error-status row; assistant-ui
+          // supplies its own fallback in the error card.
+          const errorContent = chatErrorCopyText(event, tRef.current) || '';
+          // A core-owned failure carries a deterministic id, so dedupe on that
+          // rather than on the text. Two runs can fail with byte-identical
+          // content — the same upstream provider message, or the generic
+          // fallback above — and a text check would then read the previous
+          // run's row as this one and drop the current failure from the cache.
+          // Interactive turns have no pre-persisted id and keep the text check.
+          const errorMessageId = corePersistedMessageId(event);
+          const alreadyPresent = errorMessageId
+            ? threadMessages.some(message => message.id === errorMessageId)
+            : lastMsg?.sender === 'agent' && lastMsg?.content === errorContent;
+          if (!alreadyPresent) {
+            void dispatch(
+              addInferenceResponse({
+                content: errorContent,
+                threadId: event.thread_id,
+                messageId: errorMessageId,
+                extraMetadata: chatErrorExtraMetadata(event),
+              })
+            );
+          }
+
+          rtLog('refresh_usage_counter', {
+            thread: event.thread_id,
+            request: event.request_id,
+            reason: 'chat_error',
+          });
+          requestUsageRefresh();
+
+          // The runner persists queued user rows before either successful or
+          // failed terminal events, so reconcile the exact queued request in
+          // both paths.
+          void reloadQueuedFollowup(event.thread_id, event.request_id);
+
+          // The core can start a queued follow-up before delivering the prior
+          // turn's error. Its error card still belongs in the thread, but the
+          // live lifecycle and composer now belong to the follow-up request.
+          if (olderTurn) return;
+
+          // Queued user rows are persisted by their own runner lease. Keep the
+          // pending local projection until each matching terminal event reloads
+          // that row from the core.
+          dispatch(endInferenceTurn({ threadId: event.thread_id }));
+          dispatch(clearThreadInferenceActive(event.thread_id));
+        },
+      },
+      // A redelivered frame must be dropped before it can be merged into text.
+      { accept: event => !isReplayedDelta(event) }
+    );
+    const cleanup = subscribeChatEvents(coalesced.listeners);
+
+    return () => {
+      rtLog('unsubscribe_chat_events');
+      coalesced.dispose();
+      cleanup();
+    };
+  }, [dispatch, resolveVisibleThreadForProactive, socketStatus, refetchSnapshot]);
+
+  // Socket-disconnect reconciliation.
+  //
+  // `activeThreadId` and the per-thread inference lifecycle are only ever
+  // cleared by `chat_done` / `chat_error` events. If the socket drops
+  // mid-turn (Windows sleep/wake, network change, VPN flap) those events
+  // fire on the dead session and never reach us, so the composer stays
+  // disabled until the 2-minute silence timer expires — users perceive
+  // this as being "locked out" of typing.
+  //
+  // When the socket leaves the `connected` state, treat any in-flight
+  // turn on the previous session as unrecoverable: clear the live
+  // inference status, end the lifecycle row, and release `activeThreadId`
+  // so the composer is immediately typeable again. Streaming assistant
+  // text is preserved so the partial reply stays visible.
+  useEffect(() => {
+    if (socketStatus === 'connected') return;
+    const state = store.getState();
+    const lifecycles = state.chatRuntime.inferenceTurnLifecycleByThread;
+    const threadIds = Object.keys(lifecycles);
+    const activeThreadIds = Object.keys(state.thread.activeThreadIds);
+    // Threads holding a detached approval (an async sub-agent's), shown or
+    // queued. Its parent turn may long be over, so it is in neither list
+    // above, but a drop (always the case when the core restarts) can lose the
+    // park or its `approval_decided`. Forget the cards and rejoin the thread
+    // on reconnect: the core replays exactly the parks it still holds.
+    const detachedThreadIds = Object.entries(state.chatRuntime.pendingApprovalByThread)
+      .filter(([, approval]) => approval?.detached)
+      .map(([threadId]) => threadId)
+      .concat(Object.keys(state.chatRuntime.queuedApprovalsByThread ?? {}));
+    if (threadIds.length === 0 && activeThreadIds.length === 0 && detachedThreadIds.length === 0)
+      return;
+    // Remember what was in flight BEFORE the markers are cleared below. The
+    // reconnect handler in `socketService` re-subscribes from
+    // `activeThreadIds`, which this effect is about to empty — so without this
+    // snapshot the new socket rejoins only the selected thread's room, and a
+    // turn finishing on any other thread announces itself to a `client_id`
+    // that no longer exists (#6034).
+    interruptedThreadsRef.current = new Set([
+      ...threadIds,
+      ...activeThreadIds,
+      ...detachedThreadIds,
+    ]);
+    for (const threadId of new Set(detachedThreadIds)) {
+      dispatch(dropDetachedApprovalsForThread({ threadId }));
+    }
+    // Abandon any in-flight tool-chain latency windows: a disconnect tears down
+    // these turns without an onDone/onError, so without this the next tool call
+    // on a reused thread would attribute stale elapsed/tool counts (#4288).
+    skillLatencyRef.current.reset();
+    rtLog('socket_disconnect_reconcile', {
+      socket: socketStatus,
+      inFlight: threadIds.length,
+      active: activeThreadIds.length,
+      detached: detachedThreadIds.length,
+    });
+    for (const threadId of threadIds) {
+      dispatch(clearInferenceStatusForThread({ threadId }));
+      // Clear any parked approval/plan-review too: a disconnect before
+      // onDone/onError would otherwise leave the card stuck for a turn that
+      // can't complete.
+      dispatch(clearPendingApprovalForThread({ threadId }));
+      dispatch(clearPendingPlanReviewForThread({ threadId }));
+      dispatch(endInferenceTurn({ threadId }));
+    }
+    // A disconnect kills every in-flight turn on the dead session, so clear all
+    // active markers (setActiveThread(null) clears the whole set).
+    if (activeThreadIds.length > 0) {
+      dispatch(setActiveThread(null));
+    }
+  }, [socketStatus, dispatch]);
+
+  // Heal the threads a disconnect orphaned, once the socket is back.
+  //
+  // Two things are wrong at this moment and neither fixes itself. The new
+  // socket has a new `client_id`, so the only route left to an in-flight turn
+  // is its `thread:<id>` room — and the reconnect handler rejoined just the
+  // selected thread. And a turn that finished while we were away announced its
+  // `chat_done` to nobody: the reply is on disk (the core stores it before
+  // announcing it) but nothing re-reads the thread while the user stays put.
+  // Re-subscribe and re-read, so a reply that landed during the gap appears
+  // instead of looking lost until the thread is reselected (#6034).
+  useEffect(() => {
+    if (socketStatus !== 'connected') return;
+    const interrupted = interruptedThreadsRef.current;
+    if (interrupted.size === 0) return;
+    rtLog('socket_reconnect_heal', { threads: interrupted.size });
+    for (const threadId of [...interrupted]) {
+      // Read only after the room join is acknowledged. Firing both at once
+      // leaves a window where the read misses a reply that lands a moment
+      // later and the turn's `chat_done` goes to a room we have not joined
+      // yet — the reply would then stay invisible until a manual reload.
+      // `subscribeThread` resolves `false` on its own timeout, or immediately
+      // if the socket has already dropped again, so the read is never skipped.
+      void socketService.subscribeThread(threadId).then(joined => {
+        // Forget the thread only once it is provably back in its room. A
+        // socket that dropped again between `connected` and this effect never
+        // emitted, and dropping the id here would strand that thread until the
+        // user reselected it; keeping it means the next connection retries.
+        if (joined) interruptedThreadsRef.current.delete(threadId);
+        // Re-read the messages AND rehydrate the turn snapshot — the same
+        // pair the thread-switch path dispatches (`Conversations.tsx`).
+        // Messages alone recover the final text of a turn that finished in
+        // the gap, but nothing of a turn still running: every frame emitted
+        // while `thread:<id>` had no member was dropped (the emit is
+        // fire-and-forget), so the live lifecycle, iteration counter and tool
+        // timeline can only come back from the core's persisted snapshot.
+        // Without this a turn that outlives the reconnect renders nothing at
+        // all until the user reselects the thread or restarts the app.
+        void dispatch(fetchAndHydrateTurnState(threadId));
+        return dispatch(loadThreadMessages(threadId));
+      });
+    }
+  }, [socketStatus, dispatch]);
+
+  // assistant-ui's runtime is mounted here, INSIDE the subscription provider,
+  // so it sits above every chat surface and below the Redux store this file
+  // already feeds. It is additive: it publishes the runtime context without
+  // taking ownership of any state. See `AssistantUiRuntimeProvider`.
+  return <AssistantUiRuntimeProvider>{children}</AssistantUiRuntimeProvider>;
+};
+
+export default ChatRuntimeProvider;

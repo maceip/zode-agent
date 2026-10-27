@@ -1,0 +1,114 @@
+{
+  "name": "@botiverse/oar",
+  "version": "0.74.0",
+  "description": "A programming interface for all agent harnesses: provider-independent contracts for controlling and observing agent runtimes",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./observe": {
+      "types": "./dist/observe/index.d.ts",
+      "import": "./dist/observe/index.js"
+    },
+    "./kernel": {
+      "types": "./dist/kernel.d.ts",
+      "import": "./dist/kernel.js"
+    },
+    "./brands": {
+      "types": "./dist/brands.d.ts",
+      "import": "./dist/brands.js"
+    },
+    "./forms": {
+      "types": "./dist/forms/index.d.ts",
+      "import": "./dist/forms/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./agents": {
+      "types": "./dist/agents/index.d.ts",
+      "import": "./dist/agents/index.js"
+    },
+    "./agents/report": {
+      "types": "./dist/agents/report.d.ts",
+      "import": "./dist/agents/report.js"
+    },
+    "./community": {
+      "types": "./dist/community/index.d.ts",
+      "import": "./dist/community/index.js"
+    },
+    "./assets/brands/*": "./assets/brands/*",
+    "./browser": {
+      "types": "./dist/browser.d.ts",
+      "import": "./dist/browser.js"
+    },
+    "./pi-durable": {
+      "types": "./dist/pi-durable.d.ts",
+      "import": "./dist/pi-durable.js"
+    },
+    "./runtimes/*": {
+      "types": "./dist/runtimes/*/index.d.ts",
+      "import": "./dist/runtimes/*/index.js"
+    },
+    "./runtimes/pi-durable": null
+  },
+  "files": [
+    "dist",
+    "!dist/.tsbuildinfo",
+    "README.md",
+    "assets"
+  ],
+  "scripts": {
+    "build": "tsrs -p tsconfig.build.json",
+    "typecheck": "tsrs --noEmit",
+    "prepack": "pnpm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/botiverse/oar.git",
+    "directory": "packages/oar"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "@earendil-works/pi-ai": "^1.4.0",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "cross-spawn": "^7.0.6",
+    "undici": "8.10.2",
+    "which": "^2.0.2"
+  },
+  "peerDependencies": {
+    "@cursor/sdk": "1.0.40",
+    "@earendil-works/pi-durable": "~1.4.0",
+    "@earendil-works/chord": "~1.4.0"
+  },
+  "peerDependenciesMeta": {
+    "@cursor/sdk": {
+      "optional": true
+    },
+    "@earendil-works/pi-durable": {
+      "optional": true
+    },
+    "@earendil-works/chord": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@cursor/sdk": "1.0.40",
+    "@types/cross-spawn": "^6.0.6",
+    "@types/which": "^2.0.2",
+    "@earendil-works/pi-durable": "1.4.0",
+    "@earendil-works/chord": "1.4.0"
+  }
+}

@@ -1,0 +1,78 @@
+import { configureStore } from '@reduxjs/toolkit';
+import { fireEvent, render, screen } from '@testing-library/react';
+import { Provider } from 'react-redux';
+import { MemoryRouter } from 'react-router-dom';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { I18nProvider } from '../../../lib/i18n/I18nContext';
+import type { Locale } from '../../../lib/i18n/types';
+import { CoreStateContext } from '../../../providers/coreStateContext';
+import localeReducer from '../../../store/localeSlice';
+import CustomSearchPage from './CustomSearchPage';
+
+const navigateMock = vi.fn();
+const setDraftMock = vi.fn();
+
+vi.mock('react-router-dom', async importOriginal => {
+  const actual = await importOriginal<typeof import('react-router-dom')>();
+  return { ...actual, useNavigate: () => navigateMock };
+});
+
+vi.mock('../../../components/settings/panels/SearchPanel', () => ({
+  default: () => <div data-testid="search-panel">Search Panel</div>,
+}));
+
+vi.mock('../../../providers/CoreStateProvider', () => ({
+  useCoreState: () => ({ snapshot: { sessionToken: 'header.payload.local' } }),
+}));
+
+vi.mock('../OnboardingContext', () => ({
+  useOnboardingContext: () => ({
+    draft: { connectedSources: [] },
+    setDraft: setDraftMock,
+    completeAndExit: vi.fn(),
+  }),
+}));
+
+function renderPage() {
+  const store = configureStore({
+    reducer: { locale: localeReducer },
+    preloadedState: { locale: { current: 'en' as Locale } },
+  });
+
+  return render(
+    <Provider store={store}>
+      <MemoryRouter>
+        <CoreStateContext.Provider
+          value={{ snapshot: { sessionToken: 'header.payload.local' } } as never}>
+          <I18nProvider>
+            <CustomSearchPage />
+          </I18nProvider>
+        </CoreStateContext.Provider>
+      </MemoryRouter>
+    </Provider>
+  );
+}
+
+describe('CustomSearchPage', () => {
+  beforeEach(() => {
+    navigateMock.mockReset();
+    setDraftMock.mockReset();
+  });
+
+  it('renders the configuration panel directly with no default/configure chooser', () => {
+    renderPage();
+
+    expect(screen.getByTestId('search-panel')).toBeInTheDocument();
+    expect(screen.queryByTestId('onboarding-custom-search-step-default')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('onboarding-custom-search-step-configure')).not.toBeInTheDocument();
+  });
+
+  it('skip navigates to the vault step without requiring a key', () => {
+    renderPage();
+
+    fireEvent.click(screen.getByTestId('onboarding-search-skip'));
+
+    expect(navigateMock).toHaveBeenCalledWith('/onboarding/custom/vault');
+  });
+});

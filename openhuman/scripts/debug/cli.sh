@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# Dispatcher for `pnpm debug <cmd> <args…>`.
+# Agent-friendly wrappers around the project's test/run scripts.
+# Commands: unit | e2e | rust | logs | harness-cache-audit | capture | breakdown | web
+
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+usage() {
+  cat <<'EOF'
+Usage: pnpm debug <command> [args]
+
+Commands:
+  unit  [pattern] [-t "<name>"] [--watch] [--verbose]
+        Run Vitest. Full log goes to target/debug-logs/unit-<ts>.log;
+        stdout shows only summary + failure blocks unless --verbose.
+  e2e   <spec> [log-suffix] [--verbose]
+        Run a single WDIO spec via app/scripts/e2e-run-spec.sh.
+        Full log goes to target/debug-logs/e2e-<suffix>-<ts>.log.
+  rust  [test-filter] [--verbose]
+        Run cargo tests with the mock backend (test-rust-with-mock.sh).
+        Full log goes to target/debug-logs/rust-<ts>.log.
+  logs  [list|<run-id>|last] [--head N | --tail N]
+        Inspect saved debug-log files. `last` shows the most recent.
+  harness-cache-audit [options]
+        Run live harness turns over JSON-RPC and summarize transcript token/cache deltas.
+  goals-live [options]
+        Live-test the memory_goals flow (list/add/edit/delete + reflect enrichment),
+        printing the goals_agent's thoughts, tool calls, token usage and cost.
+  capture [--help]
+        Loopback proxy between the core and its inference backend: dumps the
+        exact request bodies the harness sends and prints one line per
+        inference response (serving endpoint, TTFB, prompt/cached tokens,
+        prompt_cache_key). Configure with CAPTURE_* env vars; `--help` lists them.
+  web   [--script <file.mjs>] [--headed] [--keep] [--help]
+        Drive the web SPA in Playwright Chromium against a throwaway stack
+        (mock backend, fresh core, watcher-free Vite), signed in through the
+        real provider button. Artifacts go to target/debug-logs/web-<ts>/.
+  breakdown <req.json> [--response <res>] [--depth N] [--top N] [--json]
+        Token accounting for one captured request: every system-prompt
+        section, tool schema and message priced in tokens, calibrated to the
+        provider's usage.prompt_tokens, plus paragraphs paid for twice.
+
+Flags common to runners:
+  --verbose   Stream full output to stdout in addition to the log file.
+
+Exit code = the underlying tool's exit code.
+EOF
+}
+
+cmd="${1:-}"
+if [ -z "$cmd" ] || [ "$cmd" = "-h" ] || [ "$cmd" = "--help" ]; then
+  usage
+  exit 0
+fi
+shift
+
+case "$cmd" in
+  unit|e2e|rust|logs)
+    exec "$here/${cmd}.sh" "$@"
+    ;;
+  harness-cache-audit)
+    exec node "$here/harness-cache-audit.mjs" "$@"
+    ;;
+  capture)
+    exec node "$here/capture-first-inference.mjs" "$@"
+    ;;
+  breakdown)
+    exec node "$here/prompt-breakdown.mjs" "$@"
+    ;;
+  goals-live)
+    exec node "$here/goals-live.mjs" "$@"
+    ;;
+  web)
+    exec node "$here/web-ui.mjs" "$@"
+    ;;
+  *)
+    echo "[debug] unknown command: $cmd" >&2
+    usage >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,812 @@
+{
+  "version": 2,
+  "plugins": [
+    {
+      "id": "agent",
+      "name": "Agent",
+      "description": "Owns prompt guidance and live harness controls.",
+      "enabled": true,
+      "children": [
+        {
+          "id": "prompt-layer",
+          "name": "Prompt Layer",
+          "description": "Guides Codex to use and safely extend the live Cordis program.",
+          "module": "plugins/prompt-layer.ts",
+          "enabled": true,
+          "config": {
+            "context": "You are running inside Alto. Use the cordis dispatcher to list, describe, and invoke live capabilities. Prefer installed workspace/* and work/* tools for panes and work targets. Before modifying Alto itself (plugins, UI, shell, or Cordis composition), load the alto-authoring skill by invoking cordis_authoring_skill through cordis, then follow its instructions. Inspect cordis_runtime_status for current shell state and IDs. Apply live program changes only through cordis_reprogram; use cordis_propose_change when the user explicitly requests review first. If cordis is unavailable, ask the user to start a new Alto chat."
+          }
+        },
+        {
+          "id": "conversation-titles",
+          "name": "Conversation Titles",
+          "description": "Lets agents maintain concise conversation titles as topics change while preserving manual names.",
+          "module": "plugins/conversation-titles.ts",
+          "client": "plugins/conversation-titles.client.ts",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "control-plane",
+          "name": "Control Plane",
+          "description": "Exposes the stable dispatcher and program-management tools.",
+          "module": "plugins/control-plane.ts",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "claude-acp",
+          "name": "Claude (ACP)",
+          "description": "Runs local Claude sessions through Agent Client Protocol.",
+          "module": "plugins/acp-provider.ts",
+          "enabled": true,
+          "config": {
+            "id": "claude",
+            "label": "Claude",
+            "command": "npx",
+            "args": [
+              "--yes",
+              "@agentclientprotocol/claude-agent-acp@0.81.0"
+            ]
+          }
+        },
+        {
+          "id": "gemini-acp",
+          "name": "Gemini",
+          "description": "Runs local Gemini chats through Agent Client Protocol.",
+          "module": "plugins/acp-provider.ts",
+          "enabled": true,
+          "config": {
+            "id": "gemini",
+            "label": "Gemini",
+            "command": "gemini",
+            "args": [
+              "--acp"
+            ],
+            "env": {
+              "GEMINI_CLI_NO_RELAUNCH": "true"
+            },
+            "setupHint": "Install Gemini CLI and run `gemini` in a terminal to sign in, then select Gemini again."
+          }
+        },
+        {
+          "id": "pi-acp",
+          "name": "Pi",
+          "description": "Runs local Pi sessions through Agent Client Protocol.",
+          "module": "plugins/acp-provider.ts",
+          "enabled": true,
+          "config": {
+            "id": "pi",
+            "label": "Pi",
+            "command": "npx",
+            "args": [
+              "--yes",
+              "pi-acp@0.0.33"
+            ]
+          }
+        },
+        {
+          "id": "agent-chats",
+          "name": "Agent Chats",
+          "description": "Discovers saved agent chats and routes conversations, streaming updates, and approvals to their agent.",
+          "module": "plugins/agent-chats.ts",
+          "enabled": true,
+          "config": {
+            "historyProviders": ["claude"]
+          }
+        },
+        {
+          "id": "remote-agents",
+          "name": "Remote Agents",
+          "description": "Connects chats to persistent remote agents and restores progress after disconnecting.",
+          "module": "plugins/remote-agents.ts",
+          "enabled": true,
+          "config": {}
+        }
+      ]
+    },
+    {
+      "id": "process-runner",
+      "name": "Background Processes",
+      "description": "Runs command launches off the application input thread.",
+      "module": "plugins/process-runner.ts",
+      "enabled": true,
+      "config": {}
+    },
+    {
+      "id": "interface",
+      "name": "Interface",
+      "description": "Owns the replaceable application interface and its isolated services.",
+      "enabled": true,
+      "isolate": {
+        "uiDefaults": true
+      },
+      "intercept": {
+        "logger": {
+          "name": "interface"
+        }
+      },
+      "children": [
+        {
+          "id": "markdown",
+          "name": "Markdown",
+          "description": "Renders rich Markdown in conversation messages.",
+          "client": "plugins/markdown.client.ts",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "code-blocks",
+              "name": "Code Blocks",
+              "description": "Adds syntax highlighting and copy controls to fenced code blocks.",
+              "client": "plugins/code-blocks.client.tsx",
+              "enabled": true,
+              "config": {
+                "showLanguage": true,
+                "showCopyButton": true,
+                "fontSize": 13,
+                "radius": 12
+              }
+            },
+            {
+              "id": "mermaid",
+              "name": "Mermaid Diagrams",
+              "description": "Renders Mermaid diagrams from fenced Markdown blocks.",
+              "client": "plugins/mermaid.client.tsx",
+              "enabled": true,
+              "config": {
+                "showLabel": true,
+                "showCopyButton": true,
+                "maxHeight": 520,
+                "maxSourceCharacters": 30000
+              }
+            },
+            {
+              "id": "math",
+              "name": "Math",
+              "description": "Renders inline and display mathematics.",
+              "client": "plugins/math.client.tsx",
+              "enabled": true,
+              "config": {
+                "singleDollar": true,
+                "inlineScale": 1,
+                "displayScale": 1
+              }
+            },
+            {
+              "id": "markdown-viewer",
+              "name": "Markdown Viewer",
+              "description": "Opens linked Markdown files in a rendered side pane with download controls.",
+              "module": "plugins/markdown-viewer.ts",
+              "client": "plugins/markdown-viewer.client.tsx",
+              "enabled": true,
+              "config": {
+                "maxBytes": 5242880
+              }
+            },
+            {
+              "id": "pdf-viewer",
+              "name": "PDF Viewer",
+              "description": "Opens linked PDF files in a native side pane with search, navigation, and zoom controls.",
+              "module": "plugins/pdf-viewer.ts",
+              "client": "plugins/pdf-viewer.client.tsx",
+              "enabled": true,
+              "config": {
+                "maxBytes": 268435456
+              }
+            }
+          ]
+        },
+        {
+          "id": "session",
+          "name": "Session",
+          "description": "Projects Codex app-server state into the browser interface.",
+          "module": "plugins/session.ts",
+          "client": "plugins/session.client.ts",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "model-defaults",
+          "name": "Model Defaults",
+          "description": "Stores the agent, model, and reasoning choices used for new chats.",
+          "module": "plugins/model-defaults.ts",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "thread-status",
+          "name": "Chat Status",
+          "description": "Tracks running and recently completed work across chat pickers.",
+          "client": "plugins/thread-status.client.ts",
+          "enabled": true,
+          "config": {
+            "finishedRetentionMs": 86400000,
+            "visibleFinishedMs": 5000
+          },
+          "children": [
+            {
+              "id": "workspace-thread-status",
+              "name": "Workspace Chat Status",
+              "description": "Shows running and recently finished chat status on background workspace tabs.",
+              "client": "plugins/workspace-thread-status.client.tsx",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "chat-notifications",
+              "name": "Chat Notifications",
+              "description": "Shows a desktop notification when an agent finishes working in a chat.",
+              "client": "plugins/chat-notifications.client.tsx",
+              "enabled": true,
+              "config": {
+                "enabledByDefault": true,
+                "notifyCurrentChat": false,
+                "playSoundByDefault": false
+              }
+            }
+          ]
+        },
+        {
+          "id": "ui-surfaces",
+          "name": "Chat Interface",
+          "description": "Renders the conversation, settings, and plugin controls.",
+          "module": "plugins/ui-surfaces.ts",
+          "client": "plugins/ui-surfaces.client.tsx",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "composer",
+              "name": "Composer",
+              "description": "Owns the draft editor, attachments, focus, and submission independently of conversation rendering.",
+              "module": "plugins/composer.ts",
+              "client": "plugins/composer.client.tsx",
+              "enabled": true,
+              "config": {},
+              "children": [
+                {
+                  "id": "open-in-ide",
+                  "name": "Editor Button",
+                  "description": "Opens the chat’s workspace in a Neovim pane or the preferred external editor.",
+                  "module": "plugins/open-in-ide.ts",
+                  "client": "plugins/open-in-ide.client.tsx",
+                  "enabled": true,
+                  "config": {
+                    "ide": "cursor",
+                    "destination": "pane"
+                  }
+                }
+              ]
+            },
+            {
+              "id": "theme",
+              "name": "Color Themes",
+              "description": "Controls Alto's appearance mode, chrome palette, shared code colors, and accent.",
+              "client": "plugins/theme.client.tsx",
+              "enabled": true,
+              "config": {
+                "defaultMode": "system",
+                "defaultAccent": "#7c3aed",
+                "defaultChrome": "alto",
+                "defaultCode": "alto"
+              }
+            },
+            {
+              "id": "file-attachments",
+              "name": "File Attachments",
+              "description": "Stages dropped files and submits them to Codex as native file mentions.",
+              "module": "plugins/file-attachments.ts",
+              "client": "plugins/file-attachments.client.ts",
+              "enabled": true,
+              "config": {
+                "maxBytes": 26214400
+              }
+            }
+          ]
+        },
+        {
+          "id": "search",
+          "name": "Quick Search",
+          "description": "Opens commands, chats, and settings through Cmd+K.",
+          "module": "plugins/search.ts",
+          "client": "plugins/search.client.tsx",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "git-support",
+          "name": "Git Support",
+          "description": "Provides cached branch, file, pull request, and check state for Git-aware plugins.",
+          "module": "plugins/git-support.ts",
+          "client": "plugins/git-support.client.ts",
+          "enabled": true,
+          "config": {
+            "localTtlMs": 4000,
+            "remoteTtlMs": 45000
+          },
+          "children": [
+            {
+              "id": "git-thread-details",
+              "name": "Git Chat Details",
+              "description": "Shows PR and check badges for chats whose captured branch has an open pull request.",
+              "client": "plugins/git-thread-details.client.tsx",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "git-pane-status",
+              "name": "Git Pane Status",
+              "description": "Shows stable pull request and branch sync context in chat pane headers.",
+              "client": "plugins/git-pane-status.client.tsx",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "sidebar",
+          "name": "Conversation Sidebar",
+          "description": "Organizes workspaces and conversation history.",
+          "module": "plugins/sidebar.ts",
+          "client": "plugins/sidebar.client.tsx",
+          "enabled": true,
+          "config": {
+            "collapsedByDefault": true,
+            "pinnedByDefault": true,
+            "importCodexWorkspaces": true,
+            "defaultWidth": 246,
+            "minWidth": 196,
+            "maxWidth": 420,
+            "minConversationWidth": 360
+          },
+          "children": [
+            {
+              "id": "scheduled",
+              "name": "Scheduled",
+              "description": "Creates recurring Codex tasks that run locally or through registered scheduling targets.",
+              "module": "plugins/scheduled.ts",
+              "client": "plugins/scheduled.client.tsx",
+              "enabled": true,
+              "config": {},
+              "children": []
+            }
+          ]
+        },
+        {
+          "id": "workspace-layout",
+          "name": "Workspace Layout",
+          "description": "Owns workspace tabs, pane splits, focus, and layout persistence.",
+          "module": "plugins/workspace-layout.ts",
+          "client": "plugins/workspace-layout.client.tsx",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "pane-tabs",
+              "name": "Pane Tabs",
+              "description": "Provides shared tab controls for pane plugins that own multiple resources.",
+              "client": "plugins/pane-tabs.client.tsx",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "workspace-commands",
+              "name": "Workspace Commands",
+              "description": "Applies model-requested pane changes through the live workspace compositor.",
+              "client": "plugins/workspace-commands.client.ts",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "workspace-overview",
+              "name": "Workspace Overview",
+              "description": "Opens new workspace tabs with recent branches, worktrees, pull requests, remote runs, and chats.",
+              "client": "plugins/workspace-overview.client.tsx",
+              "enabled": false,
+              "config": {}
+            },
+            {
+              "id": "pull-requests",
+              "name": "Pull Requests",
+              "description": "Tracks your open GitHub pull requests by review, checks, and merge readiness.",
+              "module": "plugins/pull-requests.ts",
+              "client": "plugins/pull-requests.client.tsx",
+              "enabled": true,
+              "config": {},
+              "children": [
+                {
+                  "id": "pull-requests-hotkeys",
+                  "name": "Pull Request Shortcuts",
+                  "description": "Toggles the pull request panel from the keyboard.",
+                  "client": "plugins/pull-requests-hotkeys.client.ts",
+                  "enabled": true,
+                  "config": {}
+                }
+              ]
+            },
+            {
+              "id": "code-explorer",
+              "name": "Code Navigation",
+              "description": "Provides shared navigation contributions for read-only source and diff panes.",
+              "client": "plugins/code-explorer.client.ts",
+              "enabled": true,
+              "config": {},
+              "children": [
+                {
+                  "id": "source-viewer",
+                  "name": "Source Viewer",
+                  "description": "Opens source files with Vim navigation and line comments for Alto.",
+                  "module": "plugins/source-viewer.ts",
+                  "client": "plugins/source-viewer.client.tsx",
+                  "enabled": true,
+                  "config": {
+                    "maxBytes": 5242880
+                  }
+                },
+                {
+                  "id": "diff-viewer",
+                  "name": "Diff Viewer",
+                  "description": "Renders code review diffs with inline comments that can be sent back to chat.",
+                  "module": "plugins/diff-viewer.ts",
+                  "client": "plugins/diff-viewer.client.tsx",
+                  "enabled": true,
+                  "config": {
+                    "maxBytes": 20971520
+                  },
+                  "children": [
+                    {
+                      "id": "code-tour",
+                      "name": "Code Tour",
+                      "description": "Uses the source chat's selected model and reasoning effort to generate a guided Markdown walkthrough interleaved with focused code diffs.",
+                      "client": "plugins/code-tour.client.tsx",
+                      "enabled": true,
+                      "config": {
+                        "maxPatchBytes": 2000000,
+                        "timeoutMs": 300000
+                      },
+                      "module": "plugins/code-tour.ts"
+                    }
+                  ]
+                },
+                {
+                  "id": "file-tree",
+                  "name": "File Tree",
+                  "description": "Adds an optional project tree to Source and Diff panes.",
+                  "module": "plugins/file-tree.ts",
+                  "client": "plugins/file-tree.client.tsx",
+                  "enabled": true,
+                  "config": {
+                    "limit": 5000
+                  }
+                }
+              ]
+            },
+            {
+              "id": "orchestrator",
+              "name": "Agents",
+              "description": "Shows native subagent status and conversation history from the parent chat.",
+              "module": "plugins/orchestrator.ts",
+              "client": "plugins/orchestrator.client.tsx",
+              "enabled": true,
+              "config": {},
+              "children": [
+                {
+                  "id": "orchestrator-hotkeys",
+                  "name": "Agent Shortcuts",
+                  "description": "Temporarily shows or hides the Agents panel from the keyboard.",
+                  "client": "plugins/orchestrator-hotkeys.client.ts",
+                  "enabled": true,
+                  "config": {}
+                }
+              ]
+            },
+            {
+              "id": "workspace-tab-switcher",
+              "name": "Recent Tabs",
+              "description": "Switches open workspace tabs in most-recently-used order with an Option+Tab popup.",
+              "client": "plugins/workspace-tab-switcher.client.tsx",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "chat-history",
+              "name": "Chat History",
+              "description": "Browse chats chronologically in a full-size History tab.",
+              "module": "plugins/chat-history.ts",
+              "client": "plugins/chat-history.client.tsx",
+              "enabled": true,
+              "config": {},
+              "children": [
+                {
+                  "id": "chat-history-hotkeys",
+                  "name": "History Shortcut",
+                  "description": "Opens chat history with Command\u2013Shift\u2013H.",
+                  "client": "plugins/chat-history-hotkeys.client.ts",
+                  "enabled": true,
+                  "config": {}
+                }
+              ]
+            },
+            {
+              "id": "workspace-tab-groups",
+              "name": "Tab Groups",
+              "description": "Groups workspace tabs with colored labels, collapse controls, and drag-and-drop membership.",
+              "client": "plugins/workspace-tab-groups.client.tsx",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "seal",
+              "name": "Seal",
+              "description": "Receives Neovim prompts in the focused chat or the chat to the left of the active pane, using its existing queue and steering controls.",
+              "module": "plugins/seal.ts",
+              "client": "plugins/seal.client.ts",
+              "enabled": true,
+              "config": {},
+              "children": [
+                {
+                  "id": "seal-context",
+                  "name": "Seal Context",
+                  "description": "Shows a compact selection with a filename and line range while keeping the full editor context out of the chat display.",
+                  "client": "plugins/seal-context.client.tsx",
+                  "enabled": true,
+                  "config": {}
+                }
+              ]
+            },
+            {
+              "id": "todo",
+              "name": "Tasks",
+              "description": "Organizes tasks by project and files chat tabs beneath projects or individual tasks.",
+              "module": "plugins/todo.ts",
+              "client": "plugins/todo.client.tsx",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "work-contexts",
+          "name": "Work Contexts",
+          "description": "Lets each chat choose a branch and the local or remote checkout that executes it.",
+          "module": "plugins/work-contexts.ts",
+          "client": "plugins/work-contexts.client.ts",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "work-actions",
+              "name": "Work Actions",
+              "description": "Lets chat create and select branches, worktrees, registered remote targets, and independent work panes.",
+              "module": "plugins/work-actions.ts",
+              "client": "plugins/work-targets.client.tsx",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "ghostty-terminal",
+          "name": "Ghostty Terminal",
+          "description": "Provides a reusable native Ghostty terminal surface backed by libghostty.",
+          "module": "plugins/ghostty-terminal.ts",
+          "client": "plugins/ghostty-terminal.client.tsx",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "ghostty-workspace",
+              "name": "Ghostty Workspace Panes",
+              "description": "Adds persistent, tabbed Ghostty terminals as a workspace pane type.",
+              "client": "plugins/ghostty-workspace.client.tsx",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "tmux-terminals",
+              "name": "Terminal Persistence",
+              "description": "Keeps terminal sessions running across Alto restarts and reattaches each pane to its saved shell. Requires tmux.",
+              "module": "plugins/tmux-terminals.ts",
+              "client": "plugins/tmux-terminals.client.ts",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "editor-pane",
+              "name": "Neovim Editor",
+              "description": "Opens Neovim in a persistent native workspace pane.",
+              "module": "plugins/editor-pane.ts",
+              "client": "plugins/editor-pane.client.tsx",
+              "enabled": true,
+              "config": {},
+              "children": [{
+                "id": "editor-file-links",
+                "name": "Editor File Links",
+                "description": "Opens source links in the checkout's existing Neovim pane.",
+                "module": "plugins/editor-file-links.ts",
+                "client": "plugins/editor-file-links.client.ts",
+                "enabled": true,
+                "config": {}
+              }]
+            }
+          ]
+        },
+        {
+          "id": "browser",
+          "name": "Browser",
+          "description": "Adds native web browsing panes with persistent tabs and plugin-defined start pages.",
+          "client": "plugins/browser-workspace.client.tsx",
+          "enabled": true,
+          "config": {}
+        },
+        {
+          "id": "steer",
+          "name": "Steering",
+          "description": "Queues, reorders, and steers prompts during active turns.",
+          "module": "plugins/steer.ts",
+          "client": "plugins/steer.client.tsx",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "workspace-steer",
+              "name": "Split Pane Steering",
+              "description": "Renders each chat pane's queued and steering messages.",
+              "client": "plugins/workspace-steer.client.tsx",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "turn-progress",
+          "name": "Turn Progress",
+          "description": "Summarizes the current turn's completed steps, file changes, and review handoff.",
+          "module": "plugins/turn-progress.ts",
+          "client": "plugins/turn-progress.client.tsx",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "workspace-turn-progress",
+              "name": "Split Pane Progress",
+              "description": "Shows each split-pane chat's turn summary and turn-scoped review action.",
+              "client": "plugins/workspace-turn-progress.client.tsx",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "scrollback",
+          "name": "Scrollback",
+          "description": "Adds long-conversation navigation alongside the chat.",
+          "module": "plugins/scrollback.ts",
+          "client": "plugins/scrollback.client.tsx",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "workspace-scrollback",
+              "name": "Split Pane Scrollback",
+              "description": "Adds long-conversation navigation to every chat pane.",
+              "client": "plugins/workspace-scrollback.client.tsx",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "canvas",
+          "name": "Canvas",
+          "description": "Adds a workspace pane for persistent, free-form plugin pages.",
+          "client": "plugins/canvas.client.tsx",
+          "enabled": true,
+          "config": {},
+          "children": [
+            {
+              "id": "canvas-tabs",
+              "name": "Canvas Tabs",
+              "description": "Manages multiple free-form pages in each workspace.",
+              "client": "plugins/canvas-tabs.client.tsx",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "hotkeys",
+          "name": "Hotkeys",
+          "description": "Provides leader-key chords for common application actions.",
+          "client": "plugins/hotkeys.client.tsx",
+          "enabled": true,
+          "config": {
+            "leader": "Alt",
+            "timeoutMs": 1200
+          },
+          "children": [
+            {
+              "id": "hotkeys-composer",
+              "name": "Composer Hotkeys",
+              "description": "Focuses the composer and starts new chats from the keyboard.",
+              "client": "plugins/hotkeys-composer.client.ts",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "hotkeys-sidebar",
+              "name": "Sidebar Hotkeys",
+              "description": "Toggles the conversation sidebar with the leader key.",
+              "client": "plugins/hotkeys-sidebar.client.ts",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "hotkeys-canvas",
+              "name": "Canvas Hotkeys",
+              "description": "Toggles the Canvas with the leader key.",
+              "client": "plugins/hotkeys-canvas.client.ts",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "hotkeys-pane-tabs",
+              "name": "Pane Tab Hotkeys",
+              "description": "Creates a tab inside the focused tabbed pane with a Pane leader chord.",
+              "client": "plugins/hotkeys-pane-tabs.client.ts",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "hotkeys-workspace",
+              "name": "Workspace Hotkeys",
+              "description": "Creates workspace tabs and split chat panes with leader-key shortcuts.",
+              "client": "plugins/hotkeys-workspace.client.ts",
+              "enabled": true,
+              "config": {}
+            },
+            {
+              "id": "hotkeys-editor",
+              "name": "Editor Shortcut",
+              "description": "Opens or focuses a Neovim pane with Command-E.",
+              "client": "plugins/hotkeys-editor.client.ts",
+              "enabled": true,
+              "config": {}
+            }
+          ]
+        },
+        {
+          "id": "recent-chats",
+          "name": "Recent Chats",
+          "description": "Cycles through recently viewed chats when workspace tabs are unavailable.",
+          "client": "plugins/recent-chats.client.tsx",
+          "enabled": true,
+          "config": {
+            "limit": 30,
+            "previewLimit": 10
+          }
+        },
+        {
+          "id": "harpoon",
+          "name": "Harpoon",
+          "description": "Pins chats to stable keyboard-accessible slots.",
+          "client": "plugins/harpoon.client.tsx",
+          "enabled": true,
+          "config": {
+            "slotCount": 9,
+            "prefetch": true
+          }
+        },
+        {
+          "id": "shell-ui",
+          "name": "Application Shell",
+          "description": "Defines the replaceable interface regions and layout.",
+          "module": "plugins/shell-ui.ts",
+          "enabled": true,
+          "config": {}
+        }
+      ]
+    }
+  ]
+}

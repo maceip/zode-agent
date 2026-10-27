@@ -1,0 +1,71 @@
+.file-tree {
+  display: flex;
+  flex: 0 0 clamp(170px, 20%, 238px);
+  min-width: 0;
+  flex-direction: column;
+  border-right: 1px solid var(--border-soft);
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--panel-soft) 54%, var(--canvas));
+}
+
+.file-tree-search {
+  display: flex;
+  flex: 0 0 34px;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 7px 4px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--text-faint);
+  background: color-mix(in srgb, var(--panel-solid) 58%, transparent);
+}
+.file-tree-search:focus-within { border-color: color-mix(in srgb, var(--accent) 28%, var(--border-soft)); }
+.file-tree-search input {
+  min-width: 0;
+  flex: 1 1 auto;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  font-size: 11px;
+}
+.file-tree-search input::placeholder { color: var(--text-faint); }
+
+.file-tree-rows {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 3px 5px 9px;
+  scrollbar-width: thin;
+}
+
+.file-tree-row {
+  display: flex;
+  width: 100%;
+  height: 25px;
+  align-items: center;
+  gap: 5px;
+  padding: 0 7px 0 calc(7px + var(--file-tree-depth) * 12px);
+  overflow: hidden;
+  border: 0;
+  border-radius: 6px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+}
+.file-tree-row:hover { color: var(--text); background: color-mix(in srgb, var(--panel-solid) 72%, transparent); }
+.file-tree-row.is-active { color: var(--text); background: color-mix(in srgb, var(--accent) 10%, var(--panel-solid)); }
+.file-tree-row > svg:first-child { flex: 0 0 auto; transition: transform 120ms ease; }
+.file-tree-row > svg:first-child.is-open { transform: rotate(90deg); }
+.file-tree-row > span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-tree-kind { display: grid; flex: 0 0 14px; place-items: center; color: var(--text-faint); }
+.file-tree-indent { flex: 0 0 11px; }
+.file-tree-state { padding: 18px 8px; color: var(--text-faint); font-size: 11px; text-align: center; }
+
+@container conversation-column (max-width: 680px) {
+  .file-tree { flex-basis: 164px; }
+}

@@ -1,0 +1,664 @@
+/* Side panels share a lighter fill without changing menus or text opacity. */
+:root {
+  --side-panel-background: color-mix(in srgb, var(--sidebar-material) 50%, transparent);
+  --side-panel-backdrop: blur(32px) saturate(112%);
+}
+
+html[data-alto-theme-plugin='active'] {
+  --accent: var(--alto-theme-accent, #7c3aed);
+}
+
+/* The server shell supplies its default palette as inline variables. Theme is
+   an explicit user override, so its accent must win inside that shell too. */
+html[data-alto-theme-plugin='active'] .shell-kernel {
+  --accent: var(--alto-theme-accent, #7c3aed) !important;
+}
+
+html[data-alto-theme='light'] { color-scheme: light; }
+
+html[data-alto-theme='dark'] {
+  color-scheme: dark;
+  color: #c8ccd8;
+  background: #181a20;
+  --bg: #181a20;
+  --canvas: #1d2027;
+  --sidebar: rgba(24, 27, 34, 0.9);
+  --sidebar-material: rgba(28, 31, 39, 0.8);
+  --panel: rgba(37, 40, 49, 0.86);
+  --panel-solid: #262931;
+  --panel-raised: #23262e;
+  --panel-soft: #2d3039;
+  --border: rgba(223, 227, 239, 0.15);
+  --border-soft: rgba(223, 227, 239, 0.09);
+  --border-strong: rgba(223, 227, 239, 0.24);
+  --pane-divider: rgba(223, 227, 239, 0.11);
+  --muted: #989eae;
+  --dim: #747b8d;
+  --text: #c8ccd8;
+  --text-strong: #eceef4;
+  --green: #74b995;
+  --red: #df7b85;
+  --yellow: #c7a261;
+  --shadow-soft: 0 1px 2px rgba(0, 0, 0, 0.16), 0 8px 24px rgba(0, 0, 0, 0.13);
+  --shadow-panel: 0 2px 5px rgba(0, 0, 0, 0.18), 0 18px 45px rgba(0, 0, 0, 0.2);
+  --header-cluster: rgba(36, 39, 48, 0.84);
+  --header-cluster-border: rgba(255, 255, 255, 0.07);
+  --header-cluster-shadow: 0 1px 2px rgba(0, 0, 0, 0.16), 0 7px 20px rgba(0, 0, 0, 0.14);
+  --floating-panel: rgba(38, 41, 51, 0.96);
+  --floating-panel-border: rgba(255, 255, 255, 0.09);
+  --floating-panel-shadow: 0 1px 3px rgba(0, 0, 0, 0.2), 0 18px 48px rgba(0, 0, 0, 0.32);
+  --floating-row-hover: rgba(255, 255, 255, 0.055);
+  --button-background: rgba(42, 45, 55, 0.72);
+  --button-background-hover: rgba(42, 45, 55, 0.9);
+  --button-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  --button-shadow-hover: 0 2px 7px rgba(0, 0, 0, 0.2);
+  --code-block-background: #262931;
+  --code-block-border: rgba(223, 227, 239, 0.09);
+  --code-block-text: #d2d6e2;
+  --code-block-muted: #9299ab;
+  --code-block-hover: rgba(255, 255, 255, 0.055);
+  --code-block-comment: #858c9d;
+  --code-block-punctuation: #aeb5c7;
+  --code-block-keyword: #e879dc;
+  --code-block-function: #76a7ff;
+  --code-block-class: #b79afa;
+  --code-block-string: #72c8a7;
+  --code-block-number: #e4ad6d;
+  --code-block-operator: #b6bdd0;
+  --code-block-variable: #d2d6e2;
+  --code-block-property: #e688be;
+  --code-block-regex: #e3b76e;
+  --code-block-diff-meta: #9299ab;
+  --code-block-diff-deleted: #f095a2;
+  --code-block-diff-deleted-bg: rgba(223, 123, 133, 0.11);
+  --code-block-diff-inserted: #86cba5;
+  --code-block-diff-inserted-bg: rgba(116, 185, 149, 0.11);
+}
+
+html[data-alto-theme='dark'] .shell-kernel {
+  --bg: #181a20 !important;
+  --canvas: #1d2027 !important;
+  --panel: rgba(37, 40, 49, 0.86) !important;
+  --panel-solid: #262931 !important;
+  --text: #c8ccd8 !important;
+  --text-strong: #eceef4 !important;
+  --muted: #989eae !important;
+  --border: rgba(223, 227, 239, 0.15) !important;
+  --border-soft: rgba(223, 227, 239, 0.09) !important;
+}
+
+html[data-alto-theme='dark'] body,
+html[data-alto-theme='dark'] .shell-kernel,
+html[data-alto-theme='dark'] .workspace-layout,
+html[data-alto-theme='dark'] .workspace-pane,
+html[data-alto-theme='dark'] .canvas-pane,
+html[data-alto-theme='dark'] .markdown-viewer-pane,
+html[data-alto-theme='dark'] .diff-viewer-pane,
+html[data-alto-theme='dark'] .ghostty-workspace-pane,
+html[data-alto-theme='dark'] .ghostty-terminal-surface {
+  background: var(--bg);
+}
+
+html[data-alto-theme='dark'] .shell-kernel main {
+  background:
+    radial-gradient(circle at 51% -18%, rgba(76, 66, 112, 0.16), transparent 40%),
+    linear-gradient(135deg, #1f2229 0%, #1c1f26 54%, #191c22 100%);
+}
+
+html[data-alto-theme='dark'] .conversation-pane {
+  background: var(--canvas);
+}
+
+html[data-alto-theme='dark'] .activity-user {
+  background: #272a33;
+}
+
+html[data-alto-theme='dark'] .activity-reasoning,
+html[data-alto-theme='dark'] .activity-command,
+html[data-alto-theme='dark'] .activity-tool,
+html[data-alto-theme='dark'] .composer-inline-code-block {
+  background: rgba(42, 45, 55, 0.78);
+}
+
+html[data-alto-theme='dark'] :is(
+  .composer-workspace-picker,
+  .composer-permission-picker,
+  .composer-model-picker,
+  .skill-picker,
+  .workspace-thread-picker,
+  .workspace-project-picker
+) {
+  border-color: var(--border);
+  background: rgba(39, 42, 52, 0.98);
+  box-shadow: 0 20px 52px rgba(0, 0, 0, 0.3), 0 2px 7px rgba(0, 0, 0, 0.18);
+}
+
+html[data-alto-theme='dark'] :is(
+  .composer-workspace-picker,
+  .composer-permission-picker,
+  .composer-model-picker,
+  .skill-picker
+) button:hover {
+  background: var(--accent-soft);
+}
+
+html[data-alto-theme='dark'] .program-modal {
+  border-color: var(--border);
+  background: #1d2027;
+  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.46), 0 2px 8px rgba(0, 0, 0, 0.24);
+}
+
+html[data-alto-theme='dark'] .program-modal-sidebar {
+  border-color: var(--border-soft);
+  background: rgba(24, 27, 34, 0.9);
+}
+
+html[data-alto-theme='dark'] .program-modal-content { background: #21242c; }
+html[data-alto-theme='dark'] .program-modal-search,
+html[data-alto-theme='dark'] .settings-card {
+  border-color: var(--border);
+  background: rgba(42, 45, 55, 0.72);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.035);
+}
+
+html[data-alto-theme='dark'] .settings-row select {
+  color: var(--text);
+  border-color: var(--border);
+  background: rgba(26, 29, 37, 0.72);
+}
+
+html[data-alto-theme='dark'] .browser-workspace-pane,
+html[data-alto-theme='dark'] .browser-workspace-empty,
+html[data-alto-theme='dark'] .browser-workspace-unavailable {
+  background: var(--canvas);
+}
+
+html[data-alto-theme='dark'] .browser-workspace-toolbar > input {
+  color: var(--text);
+  background: var(--panel-solid);
+}
+
+.theme-settings-card { overflow: visible; }
+
+.theme-mode-picker {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 3px;
+  padding: 3px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-soft) 72%, transparent);
+}
+
+.theme-mode-picker button {
+  min-width: 78px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  color: var(--muted);
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  font: 500 11.5px/1 var(--sans);
+  cursor: pointer;
+}
+
+.theme-mode-picker button:hover { color: var(--text); }
+.theme-mode-picker button.active {
+  color: var(--text-strong);
+  background: var(--panel-solid);
+  box-shadow: 0 1px 3px rgba(28, 32, 44, 0.1);
+}
+
+.theme-accent-control {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.theme-accent-presets {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.theme-accent-preset {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid color-mix(in srgb, var(--text-strong) 12%, transparent);
+  border-radius: 999px;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, white 16%, transparent);
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.theme-accent-preset.is-purple { background: #7c3aed; }
+.theme-accent-preset.is-blue { background: #2563eb; }
+.theme-accent-preset.is-cyan { background: #0891b2; }
+.theme-accent-preset.is-green { background: #16a34a; }
+.theme-accent-preset.is-orange { background: #ea580c; }
+.theme-accent-preset.is-rose { background: #e11d48; }
+.theme-accent-preset.is-graphite { background: #525252; }
+
+.theme-accent-preset:hover {
+  transform: scale(1.08);
+}
+
+.theme-accent-preset[aria-checked='true'] {
+  box-shadow:
+    0 0 0 2px var(--panel-solid),
+    0 0 0 3px var(--text-secondary),
+    inset 0 0 0 1px color-mix(in srgb, white 20%, transparent);
+}
+
+.theme-color-picker {
+  position: relative;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 9px 4px 5px;
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-solid) 72%, transparent);
+  cursor: pointer;
+}
+
+.theme-color-picker input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.theme-color-swatch {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  color: white;
+  border: 1px solid color-mix(in srgb, white 28%, transparent);
+  border-radius: 7px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+
+.theme-color-picker code {
+  color: var(--muted);
+  font: 10.5px/1 var(--mono);
+}
+
+.theme-reset-action {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--type-label);
+}
+
+@container program-overlay (max-width: 680px) {
+  .theme-mode-picker { width: 100%; }
+  .theme-mode-picker button { min-width: 0; }
+  .theme-accent-control { justify-content: flex-start; }
+}
+
+
+.theme-palette-control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.theme-palette-preview {
+  width: var(--control-default);
+  height: var(--control-default);
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-dense);
+}
+
+.theme-palette-preview i {
+  display: block;
+  flex: 1 1 0;
+}
+
+.theme-palette-preview.is-chrome i:nth-child(1) { background: var(--bg); }
+.theme-palette-preview.is-chrome i:nth-child(2) { background: var(--canvas); }
+.theme-palette-preview.is-chrome i:nth-child(3) { background: var(--panel-solid); }
+.theme-palette-preview.is-code { background: var(--code-block-background); }
+.theme-palette-preview.is-code i:nth-child(1) { background: var(--code-block-keyword); }
+.theme-palette-preview.is-code i:nth-child(2) { background: var(--code-block-function); }
+.theme-palette-preview.is-code i:nth-child(3) { background: var(--code-block-string); }
+
+/* Chrome families define the neutral surfaces. The common mapping below feeds
+   Alto's existing surface tokens so feature plugins inherit the selection. */
+html[data-alto-chrome-theme='alto'][data-alto-theme='light'] {
+  --alto-chrome-bg: #eef0f3;
+  --alto-chrome-canvas: #f2f3f6;
+  --alto-chrome-panel: #f8f9fb;
+  --alto-chrome-raised: #f6f7f9;
+  --alto-chrome-soft: #e9ebef;
+  --alto-chrome-text: #4d5368;
+  --alto-chrome-strong: #353a4e;
+  --alto-chrome-muted: #898fa1;
+  --alto-chrome-dim: #a2a7b4;
+}
+
+html[data-alto-chrome-theme='alto'][data-alto-theme='dark'] {
+  --alto-chrome-bg: #181a20;
+  --alto-chrome-canvas: #1d2027;
+  --alto-chrome-panel: #262931;
+  --alto-chrome-raised: #23262e;
+  --alto-chrome-soft: #2d3039;
+  --alto-chrome-text: #c8ccd8;
+  --alto-chrome-strong: #eceef4;
+  --alto-chrome-muted: #989eae;
+  --alto-chrome-dim: #747b8d;
+}
+
+html[data-alto-chrome-theme='paper'][data-alto-theme='light'] {
+  --alto-chrome-bg: #f5f5f5;
+  --alto-chrome-canvas: #f5f5f5;
+  --alto-chrome-panel: #ffffff;
+  --alto-chrome-raised: #ffffff;
+  --alto-chrome-soft: #f0f0f0;
+  --alto-chrome-text: #242424;
+  --alto-chrome-strong: #1a1a1a;
+  --alto-chrome-muted: #666666;
+  --alto-chrome-dim: #999999;
+  --alto-chrome-border: #e8e8e8;
+  --alto-chrome-border-soft: #f0f0f0;
+  --alto-chrome-border-strong: #cccccc;
+}
+
+html[data-alto-chrome-theme='paper'][data-alto-theme='dark'] {
+  --alto-chrome-bg: #1a1a1a;
+  --alto-chrome-canvas: #1a1a1a;
+  --alto-chrome-panel: #232323;
+  --alto-chrome-raised: #232323;
+  --alto-chrome-soft: #333333;
+  --alto-chrome-text: #ffffff;
+  --alto-chrome-strong: #ffffff;
+  --alto-chrome-muted: #999999;
+  --alto-chrome-dim: #666666;
+  --alto-chrome-border: #333333;
+  --alto-chrome-border-soft: color-mix(in srgb, #333333 72%, transparent);
+  --alto-chrome-border-strong: #666666;
+}
+
+html[data-alto-chrome-theme='graphite'][data-alto-theme='light'] {
+  --alto-chrome-bg: #eeeeef;
+  --alto-chrome-canvas: #f3f3f4;
+  --alto-chrome-panel: #fafafa;
+  --alto-chrome-raised: #f7f7f8;
+  --alto-chrome-soft: #e7e7e9;
+  --alto-chrome-text: #505056;
+  --alto-chrome-strong: #303035;
+  --alto-chrome-muted: #7e7e87;
+  --alto-chrome-dim: #9b9ba3;
+}
+
+html[data-alto-chrome-theme='graphite'][data-alto-theme='dark'] {
+  --alto-chrome-bg: #151617;
+  --alto-chrome-canvas: #1a1b1d;
+  --alto-chrome-panel: #232427;
+  --alto-chrome-raised: #202124;
+  --alto-chrome-soft: #2a2b2f;
+  --alto-chrome-text: #c9c9ce;
+  --alto-chrome-strong: #eeeeef;
+  --alto-chrome-muted: #95959d;
+  --alto-chrome-dim: #717179;
+}
+
+html[data-alto-chrome-theme='ink'][data-alto-theme='light'] {
+  --alto-chrome-bg: #efeeec;
+  --alto-chrome-canvas: #f5f3f0;
+  --alto-chrome-panel: #faf9f7;
+  --alto-chrome-raised: #f6f4f1;
+  --alto-chrome-soft: #e9e6e2;
+  --alto-chrome-text: #514d4a;
+  --alto-chrome-strong: #302d2b;
+  --alto-chrome-muted: #817b77;
+  --alto-chrome-dim: #a09a96;
+}
+
+html[data-alto-chrome-theme='ink'][data-alto-theme='dark'] {
+  --alto-chrome-bg: #101113;
+  --alto-chrome-canvas: #151619;
+  --alto-chrome-panel: #1e2024;
+  --alto-chrome-raised: #1b1d21;
+  --alto-chrome-soft: #27292e;
+  --alto-chrome-text: #c9ccd2;
+  --alto-chrome-strong: #f0f1f3;
+  --alto-chrome-muted: #9297a1;
+  --alto-chrome-dim: #6d737e;
+}
+
+html[data-alto-theme-plugin='active'][data-alto-chrome-theme] {
+  color: var(--alto-chrome-text);
+  background: var(--alto-chrome-bg);
+  --bg: var(--alto-chrome-bg);
+  --canvas: var(--alto-chrome-canvas);
+  --sidebar: color-mix(in srgb, var(--alto-chrome-panel) 90%, transparent);
+  --sidebar-material: color-mix(in srgb, var(--alto-chrome-panel) 66%, transparent);
+  --panel: color-mix(in srgb, var(--alto-chrome-panel) 84%, transparent);
+  --panel-solid: var(--alto-chrome-panel);
+  --panel-raised: var(--alto-chrome-raised);
+  --panel-soft: var(--alto-chrome-soft);
+  --border: var(--alto-chrome-border, color-mix(in srgb, var(--alto-chrome-text) 15%, transparent));
+  --border-soft: var(--alto-chrome-border-soft, color-mix(in srgb, var(--alto-chrome-text) 9%, transparent));
+  --border-strong: var(--alto-chrome-border-strong, color-mix(in srgb, var(--alto-chrome-text) 24%, transparent));
+  --pane-divider: color-mix(in srgb, var(--alto-chrome-text) 10%, transparent);
+  --muted: var(--alto-chrome-muted);
+  --dim: var(--alto-chrome-dim);
+  --text: var(--alto-chrome-text);
+  --text-strong: var(--alto-chrome-strong);
+  --header-cluster: color-mix(in srgb, var(--alto-chrome-panel) 80%, transparent);
+  --header-cluster-border: color-mix(in srgb, var(--alto-chrome-strong) 8%, transparent);
+  --floating-panel: color-mix(in srgb, var(--alto-chrome-panel) 96%, transparent);
+  --floating-panel-border: color-mix(in srgb, var(--alto-chrome-strong) 9%, transparent);
+  --floating-row-hover: color-mix(in srgb, var(--alto-chrome-text) 6%, transparent);
+  --button-background: color-mix(in srgb, var(--alto-chrome-panel) 72%, transparent);
+  --button-background-hover: color-mix(in srgb, var(--alto-chrome-panel) 92%, transparent);
+}
+
+html[data-alto-theme-plugin='active'][data-alto-chrome-theme] .shell-kernel {
+  --bg: var(--alto-chrome-bg) !important;
+  --canvas: var(--alto-chrome-canvas) !important;
+  --sidebar: color-mix(in srgb, var(--alto-chrome-panel) 90%, transparent) !important;
+  --panel: color-mix(in srgb, var(--alto-chrome-panel) 84%, transparent) !important;
+  --panel-solid: var(--alto-chrome-panel) !important;
+  --panel-raised: var(--alto-chrome-raised) !important;
+  --panel-soft: var(--alto-chrome-soft) !important;
+  --text: var(--alto-chrome-text) !important;
+  --text-strong: var(--alto-chrome-strong) !important;
+  --muted: var(--alto-chrome-muted) !important;
+  --dim: var(--alto-chrome-dim) !important;
+  --border: var(--alto-chrome-border, color-mix(in srgb, var(--alto-chrome-text) 15%, transparent)) !important;
+  --border-soft: var(--alto-chrome-border-soft, color-mix(in srgb, var(--alto-chrome-text) 9%, transparent)) !important;
+  --border-strong: var(--alto-chrome-border-strong, color-mix(in srgb, var(--alto-chrome-text) 24%, transparent)) !important;
+  --pane-divider: color-mix(in srgb, var(--alto-chrome-text) 10%, transparent) !important;
+}
+
+/* These variables are consumed directly by Prism and by Alto's custom Pierre
+   theme, keeping chat code, source files, code tours, and diffs synchronized. */
+html[data-alto-code-theme='alto'][data-alto-theme='light'] {
+  --code-block-background: #e5e6ec;
+  --code-block-text: #4d536b;
+  --code-block-muted: #7d8294;
+  --code-block-comment: #a4a5ae;
+  --code-block-punctuation: #51576e;
+  --code-block-keyword: #c023b6;
+  --code-block-function: #326df0;
+  --code-block-class: #7352bd;
+  --code-block-string: #18876e;
+  --code-block-number: #b56418;
+  --code-block-operator: #555d78;
+  --code-block-variable: #4d536b;
+  --code-block-property: #b83486;
+  --code-block-regex: #a46300;
+}
+
+html[data-alto-code-theme='alto'][data-alto-theme='dark'] {
+  --code-block-background: #262931;
+  --code-block-text: #d2d6e2;
+  --code-block-muted: #9299ab;
+  --code-block-comment: #858c9d;
+  --code-block-punctuation: #aeb5c7;
+  --code-block-keyword: #e879dc;
+  --code-block-function: #76a7ff;
+  --code-block-class: #b79afa;
+  --code-block-string: #72c8a7;
+  --code-block-number: #e4ad6d;
+  --code-block-operator: #b6bdd0;
+  --code-block-variable: #d2d6e2;
+  --code-block-property: #e688be;
+  --code-block-regex: #e3b76e;
+}
+
+/* Prism and Pierre share the GitHub light and dark syntax palettes. */
+html[data-alto-code-theme='github'][data-alto-theme='light'] {
+  --code-block-background: #ffffff;
+  --code-block-text: #24292e;
+  --code-block-muted: #6a737d;
+  --code-block-comment: #6a737d;
+  --code-block-punctuation: #586069;
+  --code-block-keyword: #d73a49;
+  --code-block-function: #6f42c1;
+  --code-block-class: #6f42c1;
+  --code-block-string: #032f62;
+  --code-block-number: #005cc5;
+  --code-block-operator: #d73a49;
+  --code-block-variable: #e36209;
+  --code-block-property: #005cc5;
+  --code-block-regex: #032f62;
+}
+
+html[data-alto-code-theme='github'][data-alto-theme='dark'] {
+  --code-block-background: #24292e;
+  --code-block-text: #e1e4e8;
+  --code-block-muted: #6a737d;
+  --code-block-comment: #6a737d;
+  --code-block-punctuation: #d1d5da;
+  --code-block-keyword: #f97583;
+  --code-block-function: #b392f0;
+  --code-block-class: #b392f0;
+  --code-block-string: #9ecbff;
+  --code-block-number: #79b8ff;
+  --code-block-operator: #f97583;
+  --code-block-variable: #ffab70;
+  --code-block-property: #79b8ff;
+  --code-block-regex: #dbedff;
+}
+
+html[data-alto-code-theme='nord'][data-alto-theme='light'] {
+  --code-block-background: #eceff4;
+  --code-block-text: #2e3440;
+  --code-block-muted: #737d91;
+  --code-block-comment: #7b8497;
+  --code-block-punctuation: #4c566a;
+  --code-block-keyword: #5e81ac;
+  --code-block-function: #397f92;
+  --code-block-class: #7d5b92;
+  --code-block-string: #4f7d63;
+  --code-block-number: #a75f42;
+  --code-block-operator: #5e81ac;
+  --code-block-variable: #2e3440;
+  --code-block-property: #8b5f71;
+  --code-block-regex: #9a683f;
+}
+
+html[data-alto-code-theme='nord'][data-alto-theme='dark'] {
+  --code-block-background: #242933;
+  --code-block-text: #d8dee9;
+  --code-block-muted: #8993a5;
+  --code-block-comment: #7f899b;
+  --code-block-punctuation: #aeb7c7;
+  --code-block-keyword: #81a1c1;
+  --code-block-function: #88c0d0;
+  --code-block-class: #b48ead;
+  --code-block-string: #a3be8c;
+  --code-block-number: #d08770;
+  --code-block-operator: #81a1c1;
+  --code-block-variable: #d8dee9;
+  --code-block-property: #ebcb8b;
+  --code-block-regex: #d08770;
+}
+
+html[data-alto-code-theme='muted'][data-alto-theme='light'] {
+  --code-block-background: #eceef1;
+  --code-block-text: #4d5368;
+  --code-block-muted: #858a99;
+  --code-block-comment: #9b9fab;
+  --code-block-punctuation: #777d8d;
+  --code-block-keyword: #656b7d;
+  --code-block-function: #3f465b;
+  --code-block-class: #596176;
+  --code-block-string: #6d7384;
+  --code-block-number: #555c70;
+  --code-block-operator: #777d8d;
+  --code-block-variable: #4d5368;
+  --code-block-property: #60677a;
+  --code-block-regex: #666d80;
+}
+
+html[data-alto-code-theme='muted'][data-alto-theme='dark'] {
+  --code-block-background: #20232a;
+  --code-block-text: #d0d3dc;
+  --code-block-muted: #858c9c;
+  --code-block-comment: #777e8f;
+  --code-block-punctuation: #a0a6b5;
+  --code-block-keyword: #9aa1b1;
+  --code-block-function: #e0e3ea;
+  --code-block-class: #bec3ce;
+  --code-block-string: #adb3c0;
+  --code-block-number: #c6cad4;
+  --code-block-operator: #9aa1af;
+  --code-block-variable: #d0d3dc;
+  --code-block-property: #babfca;
+  --code-block-regex: #abb1bd;
+}
+
+html[data-alto-code-theme][data-alto-theme] {
+  /* Syntax presets own token colors. Viewer surfaces stay integrated with the
+     selected chrome palette instead of importing an upstream theme's canvas. */
+  --code-block-background: var(--panel-soft);
+  --code-block-border: var(--border-soft);
+  --code-block-text: var(--text);
+  --code-block-muted: var(--muted);
+  --code-block-hover: var(--floating-row-hover);
+  --code-block-diff-meta: var(--code-block-muted);
+  --code-block-diff-deleted: var(--red);
+  --code-block-diff-deleted-bg: color-mix(in srgb, var(--red) 11%, transparent);
+  --code-block-diff-inserted: var(--green);
+  --code-block-diff-inserted-bg: color-mix(in srgb, var(--green) 11%, transparent);
+
+  /* Pierre must read semantic colors directly. Shiki represents CSS-variable
+     theme colors with internal sentinels that are not usable as diff colors. */
+  --diffs-addition-color-override: var(--code-block-diff-inserted);
+  --diffs-deletion-color-override: var(--code-block-diff-deleted);
+  --diffs-modified-color-override: var(--code-block-function);
+
+  /* Pierre's CSS-variable theme inherits these through its shadow root. */
+  --diffs-foreground: var(--code-block-text);
+  --diffs-background: var(--code-block-background);
+  --diffs-token-comment: var(--code-block-comment);
+  --diffs-token-string: var(--code-block-string);
+  --diffs-token-constant: var(--code-block-number);
+  --diffs-token-keyword: var(--code-block-keyword);
+  --diffs-token-parameter: var(--code-block-variable);
+  --diffs-token-function: var(--code-block-function);
+  --diffs-token-string-expression: var(--code-block-string);
+  --diffs-token-punctuation: var(--code-block-punctuation);
+  --diffs-token-link: var(--code-block-property);
+  --diffs-token-inserted: var(--code-block-diff-inserted);
+  --diffs-token-deleted: var(--code-block-diff-deleted);
+  --diffs-token-changed: var(--code-block-property);
+}

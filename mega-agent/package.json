@@ -1,0 +1,13 @@
+{
+  "name": "mega-agent",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Full-stack skeleton consolidated from AgentOnWeb, alto, CommaAgents, deepseek-harness, jaz, moejs, oar, openhuman. See ../MEGA_AGENT_THESIS.md",
+  "scripts": {
+    "demo": "node src/cli.ts",
+    "test": "node --test test/mega.test.ts",
+    "check": "node --check src/cli.ts 2>/dev/null || node src/cli.ts --help"
+  },
+  "engines": { "node": ">=24" }
+}

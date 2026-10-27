@@ -1,0 +1,160 @@
+.source-viewer-pane {
+  position: relative;
+  flex: 1 1 auto;
+  outline: none;
+}
+
+.source-viewer-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.source-viewer-code-shell {
+  position: relative;
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.source-viewer-code {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+  --diffs-light-bg: var(--canvas);
+  --diffs-dark-bg: var(--canvas);
+  --diffs-light: var(--text);
+  --diffs-dark: var(--text);
+  --diffs-modified-color: var(--accent);
+  --diffs-bg-buffer-override: var(--canvas);
+  --diffs-bg-context-override: color-mix(in srgb, var(--panel-soft) 62%, var(--canvas));
+  --diffs-bg-context-gutter-override: color-mix(in srgb, var(--panel-soft) 78%, var(--canvas));
+  --diffs-fg-number-override: var(--muted);
+  --diffs-bg-selection-override: color-mix(in srgb, var(--accent) 20%, var(--canvas));
+  --diffs-bg-selection-number-override: color-mix(in srgb, var(--accent) 28%, var(--canvas));
+  --diffs-bg-hover-override: color-mix(in srgb, var(--accent) 8%, var(--canvas));
+  --diffs-font-family: var(--mono);
+  --diffs-header-font-family: var(--sans);
+  --diffs-font-size: 12.5px;
+  --diffs-line-height: 20px;
+  --diffs-gap-inline: 8px;
+  --diffs-gap-block: 5px;
+}
+
+.source-viewer-state {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 28px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+.source-viewer-state.is-error,
+.source-viewer-send-error { color: var(--danger); }
+.source-viewer-state .is-spinning { animation: source-viewer-spin 1.8s linear infinite; }
+
+.source-viewer-command,
+.source-review-draft {
+  position: absolute;
+  z-index: 7;
+  right: 16px;
+  left: 16px;
+  max-width: 660px;
+  margin: 0 auto;
+  border: 1px solid var(--border);
+  background: var(--panel-solid);
+  box-shadow: var(--shadow-panel);
+}
+
+.source-viewer-command {
+  top: 50px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  color: var(--text-muted);
+}
+.source-viewer-command input {
+  flex: 1 1 auto;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  color: var(--text);
+  background: transparent;
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.source-review-draft {
+  bottom: 54px;
+  padding: 11px;
+  border-radius: 13px;
+}
+.source-review-draft-heading,
+.source-review-draft-actions,
+.source-viewer-footer,
+.source-viewer-footer > div,
+.source-viewer-footer button {
+  display: flex;
+  align-items: center;
+}
+.source-review-draft-heading { justify-content: space-between; margin: 0 1px 8px; color: var(--text-muted); font-size: 10.5px; }
+.source-review-draft-heading button { display: grid; place-items: center; border: 0; color: inherit; background: transparent; }
+.source-review-draft textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 68px;
+  resize: vertical;
+  padding: 8px 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: 9px;
+  outline: none;
+  color: var(--text);
+  background: var(--canvas);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.source-review-draft textarea:focus { border-color: color-mix(in srgb, var(--accent) 42%, var(--border)); }
+.source-review-draft-actions { justify-content: flex-end; gap: 6px; margin-top: 8px; }
+.source-review-draft-actions button,
+.source-viewer-footer button {
+  justify-content: center;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel-soft);
+  font-size: 11.5px;
+}
+.source-review-draft-actions button.primary,
+.source-viewer-footer button { border-color: transparent; color: white; background: var(--accent); }
+.source-review-draft-actions button:disabled,
+.source-viewer-footer button:disabled { opacity: .45; }
+
+.source-viewer-footer {
+  flex: 0 0 42px;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 10px 0 14px;
+  border-top: 1px solid var(--border-soft);
+  background: var(--panel-soft);
+}
+.source-viewer-footer > div { min-width: 0; gap: 7px; color: var(--text-muted); font-size: 11.5px; }
+.source-viewer-send-error { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@keyframes source-viewer-spin { to { transform: rotate(360deg); } }
+
+@container conversation-column (max-width: 560px) {
+  .source-viewer-toolbar { gap: 6px; padding-left: 8px; }
+}

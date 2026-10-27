@@ -1,0 +1,15 @@
+{
+  "title": "File Management & IO",
+  "pages": [
+    "read_file",
+    "list_directory",
+    "search_files",
+    "glob",
+    "create_file",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "move_file",
+    "apply_patch"
+  ]
+}

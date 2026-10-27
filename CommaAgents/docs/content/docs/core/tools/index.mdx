@@ -1,0 +1,131 @@
+---
+title: Tools
+description: Define custom tools and give agents the ability to interact with the outside world.
+---
+
+Tools give agents the ability to interact with the outside world. Each tool has a Zod schema for its parameters and an execute function that runs when the agent invokes it.
+
+Comma Agents ships with built-in tools organized into logical groups — [file management & IO](/docs/core/tools/built-in/file-io), a [TODO list system](/docs/core/tools/built-in/todo-system), [skill tools](/docs/core/tools/built-in/skill-tools), and individual tools for shell execution and web fetching. You can also define custom tools and register them in the [tool registry](/docs/core/tools/tool-registry).
+
+## Quick Start
+
+Agents reference tools by **string name**. Built-in tools are available automatically:
+
+```ts
+import { createAgent } from "@comma-agents/core";
+
+const agent = createAgent({
+  name: "coder",
+  model: "openai/gpt-4o",
+  tools: [
+    "read_file",
+    "list_directory",
+    "search_files",
+    "glob",
+    "create_file",
+    "write_file",
+    "edit_file",
+    "delete_file",
+    "move_file",
+    "apply_patch",
+    "run_command",
+  ],
+});
+```
+
+## Built-in tools at a glance
+
+### File Management & IO
+
+| Tool | Purpose |
+|---|---|
+| [`read_file`](/docs/core/tools/built-in/file-io/read_file) | Read a text file with line slicing and a sha256 for stale-file checks. |
+| [`list_directory`](/docs/core/tools/built-in/file-io/list_directory) | Enumerate a directory, optionally recursive. |
+| [`search_files`](/docs/core/tools/built-in/file-io/search_files) | Glob, text, or regex search across many files. |
+| [`glob`](/docs/core/tools/built-in/file-io/glob) | Match files and folders against a glob pattern. |
+| [`create_file`](/docs/core/tools/built-in/file-io/create_file) | Create a new file; fails if it exists. |
+| [`write_file`](/docs/core/tools/built-in/file-io/write_file) | Overwrite an existing file, gated by sha256. |
+| [`edit_file`](/docs/core/tools/built-in/file-io/edit_file) | Apply exact-string edits, gated by sha256. |
+| [`delete_file`](/docs/core/tools/built-in/file-io/delete_file) | Delete a file, recoverable via workspace trash. |
+| [`move_file`](/docs/core/tools/built-in/file-io/move_file) | Move or rename with no-overwrite semantics. |
+| [`apply_patch`](/docs/core/tools/built-in/file-io/apply_patch) | Apply a multi-file unified-diff envelope atomically. |
+
+### TODO List System
+
+| Tool | Purpose |
+|---|---|
+| [`todo_add`](/docs/core/tools/built-in/todo-system/todo_add) | Add a new pending item. |
+| [`todo_complete`](/docs/core/tools/built-in/todo-system/todo_complete) | Mark an item done, get the next pending one. |
+| [`todo_get`](/docs/core/tools/built-in/todo-system/todo_get) | List all items with their statuses. |
+| [`todo_get_next`](/docs/core/tools/built-in/todo-system/todo_get_next) | Peek at the next pending item. |
+| [`todo_clear`](/docs/core/tools/built-in/todo-system/todo_clear) | Remove all items, resetting the list. |
+
+### Skill Tools
+
+| Tool | Purpose |
+|---|---|
+| [`load_skill`](/docs/core/tools/built-in/skill-tools/load_skill) | Load the full instructions of a named [skill](/docs/core/skills) advertised in the system prompt. |
+
+### Other built-ins
+
+| Tool | Purpose |
+|---|---|
+| [`run_command`](/docs/core/tools/built-in/run_command) | Execute a shell command with timeout, output caps, and approval gates. |
+| [`webfetch`](/docs/core/tools/built-in/webfetch) | Fetch a URL and return its content. |
+
+Cross-cutting reference: [audit log](/docs/core/tools/audit-log), [trash](/docs/core/tools/trash), [patch envelope](/docs/core/tools/patch-envelope), [error kinds](/docs/core/tools/error-kinds).
+
+To add a custom tool, define it with `defineTool`, register it in the [tool registry](/docs/core/tools/tool-registry), and reference it by name:
+
+```ts
+import { defineTool, registerTool, createAgent } from "@comma-agents/core";
+import { z } from "zod";
+
+const weatherTool = defineTool({
+  description: "Get the current weather for a location.",
+  parameters: z.object({
+    location: z.string().describe("City name"),
+    unit: z.enum(["celsius", "fahrenheit"]).optional(),
+  }),
+  execute: async ({ location }) => ({
+    output: `Weather in ${location}: 72°F, sunny`,
+  }),
+});
+
+registerTool("weather", weatherTool);
+
+const agent = createAgent({
+  name: "assistant",
+  model: "openai/gpt-4o",
+  tools: ["bash", "read", "weather"],
+});
+```
+
+## defineTool
+
+`defineTool` creates a `ToolDefinition` with full TypeScript inference from the Zod schema to the execute function's parameters:
+
+```ts
+import { defineTool } from "@comma-agents/core";
+import { z } from "zod";
+
+const fetchTool = defineTool({
+  description: "Fetch a URL and return its text content.",
+  parameters: z.object({ url: z.string().url() }),
+  execute: async ({ url }) => ({
+    output: await fetch(url).then(response => response.text()),
+  }),
+});
+```
+
+## ToolDefinition
+
+The interface for defining a tool.
+
+<AutoTypeTable path="../packages/core/src/tools/tool.types.ts" name="ToolDefinition" />
+
+## ToolResult
+
+The result returned from a tool execution.
+
+<AutoTypeTable path="../packages/core/src/tools/tool.types.ts" name="ToolResult" />

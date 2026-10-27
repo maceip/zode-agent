@@ -1,0 +1,369 @@
+import { isNativeSurface, type NativeSurface, type RuntimeDescriptor, type AgentSession } from "@agentonweb/connector-contract";
+import {
+  ConnectorClient,
+  discoverRuntimes,
+  type AvailableRuntime,
+  type ConnectorCallbacks,
+} from "./connector-client.js";
+import type { SurfaceConnection } from "./shared.js";
+
+export interface ConnectionView {
+  readonly agentSessions?: readonly AgentSession[];
+  readonly connection: SurfaceConnection;
+  readonly runtimeId?: string;
+  readonly runtime?: RuntimeDescriptor;
+  readonly runtimes?: readonly {
+    readonly id: string;
+    readonly displayName: string;
+  }[];
+  readonly approvalUrl?: string;
+  readonly nativeUrl?: string;
+  readonly nativeOrigins?: readonly string[];
+  readonly error?: string;
+}
+
+export interface ConnectionSnapshot {
+  readonly view: ConnectionView;
+  readonly surface?: NativeSurface;
+}
+
+interface ConnectorTransport {
+  connect(endpoint: string, credential?: string): void;
+  request(command: { readonly type: "surface.get" }): Promise<unknown>;
+  close(): void;
+}
+
+interface ConnectionEffects {
+  changed(snapshot: ConnectionSnapshot): void;
+  saveCredentials(credentials: Readonly<Record<string, string>>): Promise<void>;
+  openApproval(url: string): Promise<void>;
+  revokeDelegation(runtimeId: string): Promise<void>;
+}
+
+export interface ConnectionCoordinatorOptions {
+  readonly effects: ConnectionEffects;
+  readonly discover?: () => Promise<AvailableRuntime[]>;
+  readonly createTransport?: (callbacks: ConnectorCallbacks) => ConnectorTransport;
+}
+
+interface Entry {
+  sessions?: readonly AgentSession[];
+  view: ConnectionView;
+  surface?: NativeSurface;
+  transport: ConnectorTransport;
+  generation: number;
+  refreshAt?: number;
+  refreshPromise?: Promise<void>;
+  renewSurface?: () => Promise<void>;
+}
+
+/** Independent connections; selection never closes another runtime. */
+export class ConnectionCoordinator {
+  #entries = new Map<string, Entry>();
+  #credentials: Record<string, string> = {};
+  #activeRuntimeId: string | undefined;
+  #available: AvailableRuntime[] = [];
+  #fallback: ConnectionView = { connection: "disconnected" };
+  #generation = 0;
+  #operations: Promise<unknown> = Promise.resolve();
+  #runtimeOperations = new Map<string, Promise<unknown>>();
+  #credentialWrites: Promise<unknown> = Promise.resolve();
+  #retryTimer: ReturnType<typeof setTimeout> | undefined;
+  #surfaceTimer: ReturnType<typeof setTimeout> | undefined;
+  #retryDelay = 3000;
+  constructor(readonly options: ConnectionCoordinatorOptions) {}
+
+  get snapshots(): ReadonlyMap<string, ConnectionSnapshot> {
+    return new Map(
+      [...this.#entries].map(([id, entry]) => [
+        id,
+        {
+          view: entry.view,
+          ...(entry.surface ? { surface: entry.surface } : {}),
+        },
+      ]),
+    );
+  }
+  get snapshot(): ConnectionSnapshot {
+    const entry = this.#activeRuntimeId ? this.#entries.get(this.#activeRuntimeId) : undefined;
+    const runtimes = new Map(
+      this.#available.map((item) => [item.runtime.id, { id: item.runtime.id, displayName: item.runtime.displayName }]),
+    );
+    const nativeOrigins = new Set(this.#available.map((item) => new URL(item.approvalUrl).origin));
+    for (const [id, item] of this.#entries) {
+      runtimes.set(id, {
+        id,
+        displayName: item.view.runtime?.displayName ?? id,
+      });
+      if (item.surface) {
+        nativeOrigins.add(new URL(item.surface.url).origin);
+        if (item.view.nativeUrl) nativeOrigins.add(new URL(item.view.nativeUrl).origin);
+      }
+      if (item.view.connection === "awaiting-approval" && item.view.approvalUrl)
+        nativeOrigins.add(new URL(item.view.approvalUrl).origin);
+    }
+    return {
+      view: {
+        ...(entry?.view ?? this.#fallback),
+        runtimes: [...runtimes.values()],
+        nativeOrigins: [...nativeOrigins],
+        agentSessions: [...this.#entries.values()].flatMap(item => item.view.connection === "connected" ? item.sessions ?? [] : []),
+      },
+      ...(entry?.surface ? { surface: entry.surface } : {}),
+    };
+  }
+  restore(runtimeId: string | undefined, credentials: Readonly<Record<string, string>>): Promise<void> {
+    return this.#enqueue(async () => {
+      this.#credentials = { ...credentials };
+      this.#activeRuntimeId = runtimeId;
+      for (const id of Object.keys(credentials)) await this.#connect(false, id);
+      // A persisted choice may belong to a runtime that was revoked/removed.
+      // Select only from the connections restored with existing credentials.
+      if (!this.#activeRuntimeId || !this.#entries.has(this.#activeRuntimeId))
+        this.#activeRuntimeId = this.#entries.keys().next().value;
+      this.#emit();
+    });
+  }
+  connect(runtimeId?: string): Promise<void> {
+    return this.#enqueue(() => this.#connect(true, runtimeId));
+  }
+  activate(runtimeId: string): Promise<void> {
+    return this.#enqueue(async () => {
+      this.#activeRuntimeId = runtimeId;
+      const entry = this.#entries.get(runtimeId);
+      if (entry?.view.connection === "connected") this.#emit();
+      else await this.#connect(true, runtimeId);
+    });
+  }
+  reconnectIfNeeded(): Promise<void> {
+    return this.#enqueue(async () => {
+      for (const id of Object.keys(this.#credentials)) {
+        const state = this.#entries.get(id)?.view.connection;
+        if (!state || state === "reconnecting" || state === "disconnected") await this.#connect(false, id);
+      }
+    });
+  }
+  async refreshSurfacesIfNeeded(runtimeId?: string): Promise<void> {
+    const renewals: Promise<void>[] = [];
+    for (const [id, entry] of this.#entries) {
+      if (runtimeId && runtimeId !== id) continue;
+      if (entry.refreshPromise) {
+        renewals.push(entry.refreshPromise);
+        continue;
+      }
+      if (entry.view.connection === "connected" && entry.refreshAt !== undefined && entry.refreshAt <= Date.now()) {
+        delete entry.refreshAt;
+        if (entry.renewSurface) {
+          const pending = entry.renewSurface().finally(() => {
+            if (entry.refreshPromise === pending) delete entry.refreshPromise;
+          });
+          entry.refreshPromise = pending;
+          renewals.push(pending);
+        }
+      }
+    }
+    this.#scheduleSurfaceRefresh();
+    await Promise.all(renewals);
+  }
+  showApproval(runtimeId = this.#activeRuntimeId): Promise<void> {
+    return this.#enqueue(async () => {
+      const url = runtimeId ? this.#entries.get(runtimeId)?.view.approvalUrl : undefined;
+      if (url) await this.options.effects.openApproval(url);
+    });
+  }
+  async idle(): Promise<void> {
+    // Connection commands may enqueue callbacks, which may in turn save credentials.
+    let commands: Promise<unknown>;
+    do {
+      commands = this.#operations;
+      await commands;
+      await Promise.all([...this.#runtimeOperations.values()]);
+      await this.#credentialWrites;
+    } while (commands !== this.#operations || this.#runtimeOperations.size);
+  }
+  #saveCredentials(): Promise<void> {
+    const credentials = { ...this.#credentials };
+    const saved = this.#credentialWrites.catch(() => {}).then(() => this.options.effects.saveCredentials(credentials));
+    this.#credentialWrites = saved;
+    return saved;
+  }
+  #enqueue<T>(operation: () => Promise<T> | T): Promise<T> {
+    const next = this.#operations.catch(() => {}).then(operation);
+    this.#operations = next;
+    return next;
+  }
+  async #connect(requestApproval: boolean, selectedId?: string): Promise<void> {
+    this.#available = await (this.options.discover ?? discoverRuntimes)();
+    const discoveredIds = new Set(this.#available.map((item) => item.runtime.id));
+    let removedActive = false;
+    for (const [id, entry] of this.#entries) {
+      if (discoveredIds.has(id) || entry.view.connection !== "disconnected" || this.#credentials[id]) continue;
+      this.#entries.delete(id);
+      entry.transport.close();
+      if (this.#activeRuntimeId === id) {
+        this.#activeRuntimeId = undefined;
+        removedActive = true;
+      }
+    }
+    if (removedActive)
+      this.#activeRuntimeId = [...this.#entries].find(([, entry]) => entry.view.connection === "connected")?.[0];
+    const id = selectedId ?? this.#activeRuntimeId;
+    const target =
+      this.#available.find((item) => item.runtime.id === id) ??
+      (!id && !removedActive && this.#available.length === 1 ? this.#available[0] : undefined);
+    if (!target) {
+      this.#fallback = {
+        connection: "disconnected",
+        error: this.#available.length
+          ? "Choose a local workspace to connect."
+          : "Start the local terminal service with aow service install, or start dsh web, then connect.",
+      };
+      this.#emit();
+      return;
+    }
+    if (requestApproval || !this.#activeRuntimeId) this.#activeRuntimeId = target.runtime.id;
+    const previous = this.#entries.get(target.runtime.id);
+    if (previous?.view.connection === "connected" || previous?.view.connection === "awaiting-approval") {
+      this.#emit();
+      return;
+    }
+    // Do not reuse a generation if a pruned runtime later reappears with its ID.
+    const generation = ++this.#generation;
+    // Invalidate old callbacks before closing a transport.
+    if (previous) previous.generation = generation;
+    previous?.transport.close();
+    const runtimeId = target.runtime.id;
+    const run = (operation: (entry: Entry) => Promise<void> | void) => {
+      const previous = this.#runtimeOperations.get(runtimeId) ?? Promise.resolve();
+      const pending = previous.catch(() => {}).then(async () => {
+        const entry = this.#entries.get(runtimeId);
+        if (entry?.generation === generation) await operation(entry);
+      });
+      this.#runtimeOperations.set(runtimeId, pending);
+      void pending.finally(() => {
+        if (this.#runtimeOperations.get(runtimeId) === pending) this.#runtimeOperations.delete(runtimeId);
+      }).catch(() => {});
+      return pending;
+    };
+    const current = (entry: Entry) => this.#entries.get(runtimeId) === entry && entry.generation === generation;
+    const acquireSurface = async (entry: Entry) => {
+      try {
+        const result = await entry.transport.request({ type: "surface.get" });
+        if (!current(entry)) return;
+        if (!isNativeSurface(result) || result.runtimeId !== runtimeId) throw new Error("Invalid native runtime surface.");
+        entry.surface = result;
+        // Obtain a newly signed native credential, not just a later browser expiry.
+        entry.refreshAt = Date.now() + Math.max(1000, result.cookie.maxAgeSeconds * 800);
+        entry.view = { connection: "connected", runtimeId, runtime: target.runtime, nativeUrl: target.approvalUrl };
+      } catch (error) {
+        if (!current(entry)) return;
+        delete entry.surface;
+        delete entry.refreshAt;
+        entry.view = { ...entry.view, connection: "reconnecting", error: String(error) };
+      }
+      this.#emit();
+    };
+    const transport = (this.options.createTransport ?? ((callbacks) => new ConnectorClient(callbacks)))({
+      sessions: sessions => run(entry => {
+        entry.sessions = sessions.filter(item => item.runtimeId === runtimeId);
+        this.#emit();
+      }),
+      pending: (url) =>
+        run(async (entry) => {
+          entry.view = {
+            ...entry.view,
+            connection: "awaiting-approval",
+            approvalUrl: url,
+          };
+          this.#emit();
+          await this.options.effects.openApproval(url);
+        }),
+      ready: (credential) =>
+        run(async (entry) => {
+          if (credential) {
+            this.#credentials[runtimeId] = credential;
+            await this.#saveCredentials();
+          }
+          if (!current(entry)) return;
+          await acquireSurface(entry);
+        }),
+      rejected: (code, message) =>
+        run(async (entry) => {
+          if (code === "REVOKED" || code === "AUTHENTICATION_FAILED") {
+            delete this.#credentials[runtimeId];
+            await this.#saveCredentials();
+            if (!current(entry)) return;
+            await this.options.effects.revokeDelegation(runtimeId);
+          }
+          if (!current(entry)) return;
+          delete entry.surface;
+          delete entry.refreshAt;
+          entry.view = {
+            ...entry.view,
+            connection: "disconnected",
+            error: message,
+          };
+          this.#emit();
+        }),
+      closed: () =>
+        run((entry) => {
+          delete entry.surface;
+          delete entry.refreshAt;
+          entry.view = {
+            ...entry.view,
+            connection: this.#credentials[runtimeId] ? "reconnecting" : "disconnected",
+          };
+          this.#emit();
+        }),
+    });
+    const entry: Entry = {
+      generation,
+      transport,
+      renewSurface: () => run(acquireSurface),
+      view: {
+        connection: requestApproval ? "connecting" : "reconnecting",
+        runtimeId,
+        runtime: target.runtime,
+        nativeUrl: target.approvalUrl,
+      },
+    };
+    this.#entries.set(runtimeId, entry);
+    this.#emit();
+    transport.connect(target.endpoint, this.#credentials[runtimeId]);
+  }
+  #emit(): void {
+    this.#scheduleReconnect();
+    this.#scheduleSurfaceRefresh();
+    this.options.effects.changed(this.snapshot);
+  }
+
+  #scheduleSurfaceRefresh(): void {
+    clearTimeout(this.#surfaceTimer);
+    const deadlines = [...this.#entries.values()].flatMap(entry => entry.view.connection === "connected" && entry.refreshAt !== undefined ? [entry.refreshAt] : []);
+    if (!deadlines.length) return;
+    this.#surfaceTimer = setTimeout(() => { void this.refreshSurfacesIfNeeded().catch(() => {}); }, Math.min(2_147_483_647, Math.max(0, Math.min(...deadlines) - Date.now())));
+    this.#surfaceTimer.unref?.();
+  }
+
+  #scheduleReconnect(): void {
+    const needed = Object.keys(this.#credentials).some(id => {
+      const connection = this.#entries.get(id)?.view.connection;
+      return !connection || connection === "reconnecting" || connection === "disconnected";
+    });
+    if (!needed) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = undefined;
+      this.#retryDelay = 3000;
+      return;
+    }
+    if (this.#retryTimer !== undefined) return;
+    // Fast recovery while the worker lives; the persistent alarm still wakes
+    // a suspended worker. Back off when the local runtime remains offline.
+    this.#retryTimer = setTimeout(() => {
+      this.#retryTimer = undefined;
+      this.#retryDelay = Math.min(this.#retryDelay * 2, 30_000);
+      void this.reconnectIfNeeded().catch(() => {}).finally(() => this.#scheduleReconnect());
+    }, this.#retryDelay);
+    this.#retryTimer.unref?.();
+  }
+}

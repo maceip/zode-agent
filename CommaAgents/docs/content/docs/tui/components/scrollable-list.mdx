@@ -1,0 +1,39 @@
+---
+title: ScrollableList
+description: Generic single-selection list with arrow-key navigation and row-aware scrollbar.
+---
+
+# ScrollableList
+
+A generic single-selection list with Up/Down arrow navigation, Enter to select, and a row-aware vertical scrollbar. Built as a selection layer over `ScrollableView`.
+
+```tsx
+import { ScrollableList } from "@comma-agents/tui";
+
+<ScrollableList
+  items={files}
+  getKey={(file) => file.id}
+  renderItem={(file, isSelected) => (
+    <Text color={isSelected ? "blue" : undefined}>{file.name}</Text>
+  )}
+  selectedIndex={selectedIndex}
+  onSelectedIndexChange={setSelectedIndex}
+  onSelected={(file) => openFile(file)}
+/>
+```
+
+## ScrollableListProps
+
+Props accepted by the controlled selection list.
+
+<AutoTypeTable path="../packages/tui/src/components/ScrollableList/ScrollableList.tsx" name="ScrollableListProps" />
+
+## Keyboard
+
+| Key | Action |
+|---|---|
+| Up | Move selection up |
+| Down | Move selection down |
+| Enter | Invoke `onSelected` with the selected item |
+
+The selected row is always kept visible via `scrollToRow`. When `isFocused` is provided, the list defers focus control entirely to the parent component.

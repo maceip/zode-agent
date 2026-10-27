@@ -1,0 +1,90 @@
+name: Build macOS app
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Git ref to build; defaults to the calling workflow's commit
+        type: string
+        default: ''
+      release-tag:
+        description: Require this tag to match the package version
+        type: string
+        default: ''
+    outputs:
+      tag:
+        value: ${{ jobs.macos.outputs.tag }}
+      artifact-name:
+        value: ${{ jobs.macos.outputs.artifact-name }}
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    runs-on: macos-26
+    timeout-minutes: 60
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      artifact-name: ${{ steps.package.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Check release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          nix develop --command node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs'
+          const { version } = JSON.parse(readFileSync('package.json', 'utf8'))
+          const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'))
+          const tag = process.env.RELEASE_TAG || `v${version}`
+          if (!/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag) || tag !== `v${version}`) {
+            throw new Error(`Release tag ${tag} must match package.json version v${version}`)
+          }
+          if (lock.version !== version || lock.packages[''].version !== version) {
+            throw new Error('Run npm version to update package.json and package-lock.json together')
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `tag=${tag}\n`)
+          NODE
+      - run: nix develop --command npm ci
+      - run: nix develop --command npm run build:mac-release
+      - name: Check the packaged app
+        env:
+          ELECTRON_RUN_AS_NODE: '1'
+        run: |
+          test "$(uname -m)" = arm64
+          test -f dist/mac/Alto.app/Contents/Resources/app/.alto-portable
+          /usr/bin/codesign --verify --deep --strict dist/mac/Alto.app
+          dist/mac/Alto.app/Contents/MacOS/Electron -e \
+            'require("./dist/mac/Alto.app/Contents/Resources/app/native/ghostty/build/ghostty-terminal.node")'
+      - name: Package app
+        id: package
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          name="Alto-${RELEASE_TAG}-macOS-arm64"
+          mkdir -p dist/release
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent \
+            dist/mac/Alto.app "dist/release/$name.zip"
+          (
+            cd dist/release
+            shasum -a 256 "$name.zip" > "$name.zip.sha256"
+            shasum -a 256 --check "$name.zip.sha256"
+          )
+          echo "artifact-name=$name" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact-name }}
+          path: |
+            dist/release/*.zip
+            dist/release/*.sha256
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error

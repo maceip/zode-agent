@@ -1,0 +1,696 @@
+use super::*;
+use crate::core::runtime::{ContextOverlay, CoreContext, DispatchCtx, DomainSet};
+use std::sync::Arc;
+use tinymemory_api::conformance::ReferenceEngine;
+use tinymemory_api::{MemoryEngine, MemoryMeta, Role, SourceKind, StoreItem, Turn};
+
+async fn use_linked_channel_module(config: &mut Config) {
+    config.modules.source = crate::config::schema::ModuleSourceMode::Linked;
+    config.modules.allow_download = false;
+    let _client = crate::channels::module_fixture::client().await;
+}
+
+fn channel_memory_item(thread_id: &str, channel: &str) -> StoreItem {
+    StoreItem::Conversation {
+        turns: vec![Turn::new(Role::User, format!("hello from {channel}"))],
+        meta: MemoryMeta {
+            thread_id: Some(thread_id.into()),
+            channel: Some(channel.into()),
+            source: tinymemory_api::SourceRef {
+                kind: SourceKind::Conversation,
+                id: Some(thread_id.into()),
+            },
+            ..MemoryMeta::default()
+        },
+    }
+}
+
+fn account_context(config: &Config, profile: &str) -> DispatchCtx {
+    DispatchCtx::new(
+        CoreContext::for_test(DomainSet::none(), Some(config.workspace_dir.clone())).derive_with(
+            ContextOverlay::new(config.clone(), DomainSet::full(), Default::default())
+                .profile(profile),
+        ),
+    )
+}
+
+async fn store_channel_thread(
+    ctx: DispatchCtx,
+    config: &Config,
+    channel: &str,
+    id: &str,
+) -> String {
+    use crate::threads::store::{ConversationMessage, CreateConversationThread};
+    use serde_json::json;
+
+    let params = crate::channels::providers::relay::RelayInboundParams::new(
+        channel,
+        format!("chat-{id}"),
+        format!("sender-{id}"),
+        id,
+        "hello",
+    );
+    let identity = crate::modules::channel_controller::prepare_identity(
+        &crate::channels::module_fixture::client().await,
+        tinychannels_bus::module_inbound::PrepareChannelIdentityRequest {
+            channel: channel.to_string(),
+            sender: Some(format!("sender-{id}")),
+            reply_target: Some(format!("chat-{id}")),
+            thread_ts: None,
+        },
+    )
+    .await
+    .expect("TinyChannels module should prepare the canonical thread id");
+    let thread_id = identity.thread_id;
+    let now = chrono::Utc::now().to_rfc3339();
+    crate::threads::store::blocking::ensure_thread(
+        ctx.clone(),
+        config.workspace_dir.clone(),
+        CreateConversationThread {
+            id: thread_id.clone(),
+            title: params.thread_title(),
+            created_at: now.clone(),
+            parent_thread_id: None,
+            labels: None,
+            personality_id: None,
+            working_dir: None,
+        },
+    )
+    .await
+    .unwrap();
+    crate::threads::store::blocking::append_message(
+        ctx,
+        config.workspace_dir.clone(),
+        thread_id.clone(),
+        ConversationMessage {
+            id: format!("user:{id}"),
+            content: "hello".into(),
+            message_type: "text".into(),
+            extra_metadata: json!({"scope": "channel", "channel": channel}),
+            sender: "user".into(),
+            created_at: now,
+        },
+    )
+    .await
+    .unwrap();
+    thread_id
+}
+
+#[tokio::test]
+async fn persist_prepared_discord_configuration_and_encrypted_token() {
+    let (_tmp, config) = isolated_test_config();
+    let result = persist_module_fixture(
+        &config,
+        "discord",
+        ChannelAuthMode::BotToken,
+        serde_json::json!({
+            "bot_token": "discord-token-123",
+            "guild_id": "guild-1",
+            "channel_id": "channel-2"
+        }),
+        tinychannels_bus::module_controller::ChannelConfigUpdate::Discord(DiscordConfig {
+            bot_token: "discord-token-123".into(),
+            guild_id: Some("guild-1".into()),
+            channel_id: Some("channel-2".into()),
+            allowed_users: vec![],
+            listen_to_bots: false,
+            mention_only: false,
+        }),
+    )
+    .await
+    .expect("discord connect should succeed");
+
+    assert_eq!(result.value.status, "connected");
+    assert!(result.value.restart_required);
+
+    let raw = tokio::fs::read_to_string(&config.config_path)
+        .await
+        .expect("saved config should exist");
+    let parsed: toml::Value = toml::from_str(&raw).expect("saved config should parse");
+    let discord = parsed
+        .get("channels_config")
+        .and_then(|v| v.get("discord"))
+        .and_then(toml::Value::as_table)
+        .expect("channels_config.discord should be persisted");
+
+    // bot_token is encrypted on disk (issue #1900)
+    let token = discord.get("bot_token").and_then(toml::Value::as_str);
+    assert!(
+        token.is_some_and(|t| t.starts_with("enc:") || t.starts_with("enc2:")),
+        "bot_token should be encrypted on disk, got: {token:?}"
+    );
+    assert_eq!(
+        discord.get("guild_id").and_then(toml::Value::as_str),
+        Some("guild-1")
+    );
+    assert_eq!(
+        discord.get("channel_id").and_then(toml::Value::as_str),
+        Some("channel-2")
+    );
+}
+
+#[tokio::test]
+async fn persist_prepared_telegram_chat_target() {
+    let (_tmp, config) = isolated_test_config();
+    let result = persist_module_fixture(
+        &config,
+        "telegram",
+        ChannelAuthMode::BotToken,
+        serde_json::json!({
+            "bot_token": "telegram-token-123",
+            "chat_id": "  987654  "
+        }),
+        tinychannels_bus::module_controller::ChannelConfigUpdate::Telegram(
+            tinychannels_bus::config::TelegramConfig {
+                bot_token: "telegram-token-123".into(),
+                chat_id: Some("987654".into()),
+                allowed_users: vec![],
+                stream_mode: tinychannels_bus::config::StreamMode::Off,
+                draft_update_interval_ms: 1000,
+                silent_streaming: true,
+                mention_only: false,
+            },
+        ),
+    )
+    .await
+    .expect("telegram connect should succeed");
+
+    assert_eq!(result.value.status, "connected");
+    assert!(result.value.restart_required);
+
+    let raw = tokio::fs::read_to_string(&config.config_path)
+        .await
+        .expect("saved config should exist");
+    let parsed: toml::Value = toml::from_str(&raw).expect("saved config should parse");
+    let telegram = parsed
+        .get("channels_config")
+        .and_then(|v| v.get("telegram"))
+        .and_then(toml::Value::as_table)
+        .expect("channels_config.telegram should be persisted");
+
+    // chat_id is trimmed before persistence (mirrors Discord channel_id).
+    assert_eq!(
+        telegram.get("chat_id").and_then(toml::Value::as_str),
+        Some("987654")
+    );
+}
+
+#[tokio::test]
+async fn persist_prepared_discord_retained_allowlist() {
+    // Reconnecting without resending `allowed_users` keeps the saved list — the
+    // reconnect-convenience path (#3794 review — Codex P2).
+    let (_tmp, mut config) = isolated_test_config();
+    seed_discord_with_allowlist(&mut config);
+    config.save().await.expect("seed should persist");
+
+    persist_module_fixture(
+        &config,
+        "discord",
+        ChannelAuthMode::BotToken,
+        serde_json::json!({ "bot_token": "discord-token-abc" }),
+        tinychannels_bus::module_controller::ChannelConfigUpdate::Discord(DiscordConfig {
+            bot_token: "discord-token-abc".into(),
+            guild_id: None,
+            channel_id: None,
+            allowed_users: vec!["111".into(), "222".into()],
+            listen_to_bots: false,
+            mention_only: false,
+        }),
+    )
+    .await
+    .expect("reconnect should succeed");
+
+    assert_eq!(
+        reload_discord_allowed_users(&config).await,
+        vec!["111".to_string(), "222".to_string()],
+        "omitted allowed_users must reuse the previously-saved list"
+    );
+}
+
+#[tokio::test]
+async fn persist_prepared_discord_empty_allowlist() {
+    // Clearing the allowlist in the UI submits an explicit empty value; the
+    // backend must honor it (empty ⇒ allow-all) instead of reusing the old list
+    // (#3794 review — Codex P2).
+    let (_tmp, mut config) = isolated_test_config();
+    seed_discord_with_allowlist(&mut config);
+    config.save().await.expect("seed should persist");
+
+    persist_module_fixture(
+        &config,
+        "discord",
+        ChannelAuthMode::BotToken,
+        serde_json::json!({ "bot_token": "discord-token-abc", "allowed_users": "" }),
+        tinychannels_bus::module_controller::ChannelConfigUpdate::Discord(DiscordConfig {
+            bot_token: "discord-token-abc".into(),
+            guild_id: None,
+            channel_id: None,
+            allowed_users: vec![],
+            listen_to_bots: false,
+            mention_only: false,
+        }),
+    )
+    .await
+    .expect("reconnect should succeed");
+
+    assert!(
+        reload_discord_allowed_users(&config).await.is_empty(),
+        "an explicit empty allowed_users must clear the list (allow-all), not reuse it"
+    );
+}
+
+#[tokio::test]
+async fn disconnect_discord_bot_token_clears_runtime_config() {
+    let (_tmp, mut config) = isolated_test_config();
+    config.channels_config.discord = Some(DiscordConfig {
+        bot_token: "discord-token-abc".to_string(),
+        guild_id: Some("guild-1".to_string()),
+        channel_id: Some("channel-2".to_string()),
+        allowed_users: vec![],
+        listen_to_bots: false,
+        mention_only: false,
+    });
+    config
+        .save()
+        .await
+        .expect("preloaded config should be persisted");
+
+    disconnect_channel(&config, "discord", ChannelAuthMode::BotToken, false)
+        .await
+        .expect("discord disconnect should succeed");
+
+    let raw = tokio::fs::read_to_string(&config.config_path)
+        .await
+        .expect("saved config should exist");
+    let parsed: toml::Value = toml::from_str(&raw).expect("saved config should parse");
+    let discord = parsed.get("channels_config").and_then(|v| v.get("discord"));
+
+    assert!(
+        discord.is_none(),
+        "channels_config.discord should be removed after disconnect"
+    );
+}
+
+// ── iMessage channel ───────────────────────────────────────────
+#[tokio::test]
+async fn persist_prepared_imessage_allowed_contacts() {
+    let (_tmp, config) = isolated_test_config();
+    let result = persist_module_fixture(
+        &config,
+        "imessage",
+        ChannelAuthMode::ManagedDm,
+        serde_json::json!({
+            "allowed_contacts": "+15551234567, user@icloud.com"
+        }),
+        tinychannels_bus::module_controller::ChannelConfigUpdate::IMessage(IMessageConfig {
+            allowed_contacts: vec!["+15551234567".into(), "user@icloud.com".into()],
+        }),
+    )
+    .await
+    .expect("imessage connect should succeed");
+    assert_eq!(result.value.status, "connected");
+    assert!(result.value.restart_required);
+
+    let raw = tokio::fs::read_to_string(&config.config_path)
+        .await
+        .expect("saved config should exist");
+    let parsed: toml::Value = toml::from_str(&raw).expect("saved config should parse");
+    let im = parsed
+        .get("channels_config")
+        .and_then(|v| v.get("imessage"))
+        .and_then(toml::Value::as_table)
+        .expect("channels_config.imessage should be persisted");
+    let contacts: Vec<&str> = im
+        .get("allowed_contacts")
+        .and_then(toml::Value::as_array)
+        .expect("allowed_contacts array")
+        .iter()
+        .filter_map(toml::Value::as_str)
+        .collect();
+    assert!(contacts.contains(&"+15551234567"));
+    assert!(contacts.contains(&"user@icloud.com"));
+}
+
+#[tokio::test]
+async fn persist_prepared_imessage_empty_contacts() {
+    let (_tmp, config) = isolated_test_config();
+    let result = persist_module_fixture(
+        &config,
+        "imessage",
+        ChannelAuthMode::ManagedDm,
+        serde_json::json!({}),
+        tinychannels_bus::module_controller::ChannelConfigUpdate::IMessage(IMessageConfig {
+            allowed_contacts: vec![],
+        }),
+    )
+    .await
+    .expect("imessage connect with no contacts should succeed");
+    assert_eq!(result.value.status, "connected");
+}
+
+#[tokio::test]
+async fn disconnect_imessage_clears_runtime_config() {
+    let (_tmp, mut config) = isolated_test_config();
+    config.channels_config.imessage = Some(IMessageConfig {
+        allowed_contacts: vec!["+15551234567".to_string()],
+    });
+    config
+        .save()
+        .await
+        .expect("preloaded config should be persisted");
+
+    disconnect_channel(&config, "imessage", ChannelAuthMode::ManagedDm, false)
+        .await
+        .expect("imessage disconnect should succeed");
+
+    let raw = tokio::fs::read_to_string(&config.config_path)
+        .await
+        .expect("saved config should exist");
+    let parsed: toml::Value = toml::from_str(&raw).expect("saved config should parse");
+    let im_entry = parsed
+        .get("channels_config")
+        .and_then(|v| v.get("imessage"));
+    assert!(im_entry.is_none(), "imessage config should be cleared");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1149: managed-DM / OAuth channels are stored only in the credential
+// layer (`channel:<slug>:<mode>`), not in `channels_config.<slug>`. Both
+// `channel_status` and `connected_channel_slugs` must surface them so the
+// chat agent stops reporting "Telegram not connected" right after a
+// managed-DM link succeeds.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn channel_status_reports_managed_dm_credential_as_connected() {
+    let (_tmp, config) = isolated_test_config();
+
+    // Simulate the post-link state: `telegram_login_check` stored a
+    // credential marker under `channel:telegram:managed_dm` with no
+    // corresponding `channels_config.telegram` block.
+    crate::security::credentials::ops::store_provider_credentials(
+        &config,
+        "channel:telegram:managed_dm",
+        None,
+        Some("managed".to_string()),
+        Some(serde_json::json!({ "linked": true })),
+        Some(true),
+    )
+    .await
+    .expect("seed managed-DM credential");
+
+    let result = channel_status(&config, Some("telegram"))
+        .await
+        .expect("channel_status should succeed");
+
+    let managed_dm = result
+        .value
+        .iter()
+        .find(|e| e.auth_mode == ChannelAuthMode::ManagedDm)
+        .expect("managed_dm entry");
+    assert!(
+        managed_dm.connected,
+        "managed-DM credential should report connected: {:?}",
+        result.value
+    );
+    assert!(managed_dm.has_credentials);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #3712: `channel_status` must reflect the *live* supervised-listener
+// health, not just credential/config presence, so the Messaging tab never
+// shows a false "Connected" while the listener is actually failing.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn merge_listener_health_ignores_modes_without_a_listener() {
+    // managed-DM and other listener-less modes have no `channel:<id>` health
+    // component — presence must pass through untouched and never set an error.
+    assert_eq!(
+        merge_listener_health(true, false, Some("error"), Some("boom")),
+        (true, None)
+    );
+    assert_eq!(
+        merge_listener_health(false, false, None, None),
+        (false, None)
+    );
+}
+
+#[test]
+fn merge_listener_health_error_overrides_presence_and_surfaces_reason() {
+    // Configured (presence == connected) but the live listener is failing →
+    // report disconnected and carry the reason to the UI.
+    assert_eq!(
+        merge_listener_health(true, true, Some("error"), Some("gateway 4004")),
+        (false, Some("gateway 4004".to_string()))
+    );
+}
+
+#[test]
+fn merge_listener_health_ok_confirms_connected() {
+    assert_eq!(
+        merge_listener_health(true, true, Some("ok"), None),
+        (true, None)
+    );
+}
+
+#[test]
+fn merge_listener_health_starting_keeps_presence() {
+    // Before the first connect attempt the component is "starting" (or absent):
+    // keep the presence-based value so a freshly-configured channel isn't shown
+    // as broken prematurely.
+    assert_eq!(
+        merge_listener_health(true, true, Some("starting"), None),
+        (true, None)
+    );
+    assert_eq!(merge_listener_health(true, true, None, None), (true, None));
+}
+
+#[tokio::test]
+async fn channel_status_surfaces_live_listener_error() {
+    let (_tmp, mut config) = isolated_test_config();
+
+    // Configure a bot_token Discord channel (materialises a runtime listener).
+    config.channels_config.discord = Some(DiscordConfig {
+        bot_token: "tok".to_string(),
+        guild_id: None,
+        channel_id: None,
+        allowed_users: vec![],
+        listen_to_bots: false,
+        mention_only: false,
+    });
+
+    // Simulate the supervisor reporting the listener as failed.
+    crate::platform::health::mark_component_error("channel:discord", "gateway closed (4004)");
+
+    let result = channel_status(&config, Some("discord"))
+        .await
+        .expect("channel_status should succeed");
+
+    let bot_token = result
+        .value
+        .iter()
+        .find(|e| e.auth_mode == ChannelAuthMode::BotToken)
+        .expect("bot_token entry");
+    assert!(
+        !bot_token.connected,
+        "a failing listener must report not-connected: {:?}",
+        result.value
+    );
+    assert_eq!(
+        bot_token.error.as_deref(),
+        Some("gateway closed (4004)"),
+        "the disconnect reason must be surfaced: {:?}",
+        result.value
+    );
+
+    // Recovery: once the supervisor marks the listener healthy, status flips
+    // back to connected with the error cleared.
+    crate::platform::health::mark_component_ok("channel:discord");
+    let recovered = channel_status(&config, Some("discord"))
+        .await
+        .expect("channel_status should succeed");
+    let bot_token = recovered
+        .value
+        .iter()
+        .find(|e| e.auth_mode == ChannelAuthMode::BotToken)
+        .expect("bot_token entry");
+    assert!(
+        bot_token.connected,
+        "healthy listener should report connected"
+    );
+    assert!(bot_token.error.is_none(), "error should clear on recovery");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #3712: default messaging channel switch (Telegram↔Discord). Setting the
+// default must persist to `channels_config.active_channel`; an unknown channel
+// must be rejected without clobbering the current value.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn set_default_channel_persists_known_channels() {
+    let (_tmp, mut config) = isolated_test_config();
+    assert!(config.channels_config.active_channel.is_none());
+
+    set_default_channel(&mut config, "Discord")
+        .await
+        .expect("set discord");
+    assert_eq!(
+        config.channels_config.active_channel.as_deref(),
+        Some("discord"),
+        "channel must be canonicalised to lowercase and persisted"
+    );
+
+    set_default_channel(&mut config, "telegram")
+        .await
+        .expect("set telegram");
+    assert_eq!(
+        config.channels_config.active_channel.as_deref(),
+        Some("telegram")
+    );
+}
+
+#[tokio::test]
+async fn set_default_channel_rejects_unknown_and_empty() {
+    let (_tmp, mut config) = isolated_test_config();
+    set_default_channel(&mut config, "discord")
+        .await
+        .expect("seed discord");
+
+    assert!(set_default_channel(&mut config, "myspace")
+        .await
+        .unwrap_err()
+        .contains("unknown channel"),);
+    assert!(set_default_channel(&mut config, "   ").await.is_err());
+
+    // A rejected set must not clobber the previously persisted value.
+    assert_eq!(
+        config.channels_config.active_channel.as_deref(),
+        Some("discord")
+    );
+}
+
+#[test]
+fn get_default_channel_defaults_to_web_when_unset() {
+    let (_tmp, config) = isolated_test_config();
+    let out = get_default_channel(&config).expect("get default");
+    assert_eq!(out.value["active_channel"], "web");
+}
+
+#[tokio::test]
+async fn connected_channel_slugs_merges_credentials_and_config() {
+    let (_tmp, mut config) = isolated_test_config();
+
+    // Layer 1: TOML-resident channel (e.g. discord bot_token).
+    config.channels_config.discord = Some(DiscordConfig {
+        bot_token: "tok".to_string(),
+        guild_id: None,
+        channel_id: None,
+        allowed_users: vec![],
+        listen_to_bots: false,
+        mention_only: false,
+    });
+
+    // Layer 2: credential-only channel (telegram managed_dm).
+    crate::security::credentials::ops::store_provider_credentials(
+        &config,
+        "channel:telegram:managed_dm",
+        None,
+        Some("managed".to_string()),
+        Some(serde_json::json!({ "linked": true })),
+        Some(true),
+    )
+    .await
+    .expect("seed managed-DM credential");
+
+    let slugs = connected_channel_slugs(&config)
+        .await
+        .expect("connected_channel_slugs should succeed");
+
+    assert!(slugs.contains(&"discord".to_string()), "got {slugs:?}");
+    assert!(slugs.contains(&"telegram".to_string()), "got {slugs:?}");
+}
+
+#[tokio::test]
+async fn connected_channel_slugs_dedupes_when_both_layers_present() {
+    let (_tmp, mut config) = isolated_test_config();
+
+    config.channels_config.discord = Some(DiscordConfig {
+        bot_token: "tok".to_string(),
+        guild_id: None,
+        channel_id: None,
+        allowed_users: vec![],
+        listen_to_bots: false,
+        mention_only: false,
+    });
+
+    // Same slug appears in both layers — should collapse to one entry.
+    crate::security::credentials::ops::store_provider_credentials(
+        &config,
+        "channel:discord:managed_dm",
+        None,
+        Some("managed".to_string()),
+        Some(serde_json::json!({ "linked": true })),
+        Some(true),
+    )
+    .await
+    .expect("seed managed-DM credential");
+
+    let slugs = connected_channel_slugs(&config)
+        .await
+        .expect("connected_channel_slugs should succeed");
+
+    let discord_count = slugs.iter().filter(|s| *s == "discord").count();
+    assert_eq!(discord_count, 1, "discord should appear once: {slugs:?}");
+}
+
+#[tokio::test]
+async fn connected_channel_slugs_empty_when_nothing_configured() {
+    let (_tmp, config) = isolated_test_config();
+    let slugs = connected_channel_slugs(&config).await.unwrap();
+    assert!(
+        slugs.is_empty(),
+        "fresh config should yield no channels: {slugs:?}"
+    );
+}
+
+#[tokio::test]
+async fn unavailable_module_cannot_persist_yuanbao_credentials() {
+    let (_tmp, mut config) = isolated_test_config();
+    config.modules.enabled = false;
+    let err = connect_channel(
+        &config,
+        "yuanbao",
+        ChannelAuthMode::ApiKey,
+        serde_json::json!({ "app_key": "12", "app_secret": "12" }),
+    )
+    .await
+    .expect_err("invalid yuanbao credentials should fail");
+
+    assert!(
+        err.contains("module unavailable"),
+        "expected explicit unavailable module error, got: {err}"
+    );
+
+    // Nothing should be persisted on failure: no TOML write, no credential row.
+    let raw = tokio::fs::read_to_string(&config.config_path).await.ok();
+    if let Some(text) = raw {
+        let parsed: toml::Value = toml::from_str(&text).expect("config parses");
+        // No new credentials may be written when the module is unavailable.
+        if let Some(yb) = parsed
+            .get("channels_config")
+            .and_then(|v| v.get("yuanbao"))
+            .and_then(toml::Value::as_table)
+        {
+            assert_ne!(
+                yb.get("app_key").and_then(toml::Value::as_str),
+                Some("12"),
+                "app_key must not be persisted when verification fails"
+            );
+        }
+    }
+}
+
+#[path = "ops_connect_memory_tests.rs"]
+mod memory_tests;

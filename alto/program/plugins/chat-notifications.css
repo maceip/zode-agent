@@ -1,0 +1,7 @@
+.chat-notifications-card {
+  overflow: hidden;
+}
+
+.chat-notifications-row .settings-row-copy small {
+  white-space: normal;
+}

@@ -1,0 +1,15 @@
+# The plugins' bytecode, as moejs.Compile compiles bench/testdata/plugins:
+# per plugin, its functions, its code words and the SHA-256 of everything
+# the compiler made of it. A change here takes the full gate of
+# docs/DESIGN.md §14.2. Record with
+#   go test ./pluginbytecode -run TestPluginBytecode -update
+alibaba functions=72 code=8506 sha256=44d4278f8d9bb6251157097fbfdb6a5f5a827895e36644a268f3af570927a7d9
+doubao functions=71 code=5885 sha256=0f51a47ea82d88ebd0735682736ab0f28760dde06e1d127b1655dffbbfc3cf7e
+google functions=28 code=2317 sha256=8fc4533f186af6bad60d16282878455de64226037a53b62b111497992cd33f7b
+hailuo functions=50 code=4177 sha256=022a4726f884fd806e261b19dc0d4aa0dfcc1b5622c15920cbc6ea1e9bd4ba4b
+jimeng functions=48 code=3196 sha256=c94e9b069c9a5d4440c642ae85976c630b463d04e8b43afa87606ce05005b93f
+kling functions=40 code=2806 sha256=c42871ef655cb514869af7db290a339481b96e95c00de3eb8423a8ba68a37c14
+sora functions=21 code=1947 sha256=1c92ab4057b74c6e4d5bee03f4cff95a2c535d07fb1eccac602d333714d06b05
+sunoapi functions=37 code=1987 sha256=257dcfda8465b3842edec7a1f5534de2464451b6f53e9156671960db680e9f85
+vertex-ai functions=31 code=2386 sha256=8f639a34e135463b0a9d6fd922a9ca17f0eca229f28a7cab1537955255a6b380
+vidu functions=33 code=2495 sha256=e46e7845e27220e7995908221272ab50b164b1e13b20f4565a4783a05a419a9c

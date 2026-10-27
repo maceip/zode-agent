@@ -1,0 +1,198 @@
+import createDebug from 'debug';
+
+import { Sources, SourcesContent, SourcesTrigger } from '../../../components/ai-elements';
+import Button from '../../../components/ui/Button';
+import { SheetContent, SheetRoot, SheetTitle } from '../../../components/ui/Sheet';
+import { useT } from '../../../lib/i18n/I18nContext';
+import type { ProcessingTranscriptItem, ToolTimelineEntry } from '../../../store/chatRuntimeSlice';
+import { extractAgentSources, formatTimelineEntry } from '../../../utils/toolTimelineFormatting';
+import { SubagentActivityCard } from '../aui/SubagentActivityCard';
+import { ToolTimelineAdapter } from '../aui/ToolTimelineAdapter';
+import { AgentSparkIcon } from '../aui/toolTimelineRowHelpers';
+import { AgentSourceRow } from './AgentSourceRow';
+
+const log = createDebug('app:conversations:agent-process-source');
+
+function normalizeScopedBody(value: string | undefined | null): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+/**
+ * The consolidated "Agent Process Source" side panel from the Figma Chat
+ * design — slid in from the right (~600px) when the user clicks
+ * "View full agent process Source →" beneath a settled answer.
+ *
+ * This panel shows the *whole* run: the full agent-insights timeline plus
+ * the distinct web sources the agents visited. It reuses
+ * {@link ToolTimelineAdapter} as a single source of truth; a sub-agent
+ * delegation's nested activity always renders inline through its own
+ * `TaskCard` disclosure (`SubagentActivityCard`) — there is no separate
+ * "view full processing" drawer to link out to.
+ */
+export function AgentProcessSourcePanel({
+  open,
+  entries,
+  transcript = [],
+  scopedEntry,
+  onClose,
+}: {
+  open: boolean;
+  entries: ToolTimelineEntry[];
+  /** Ordered narration/thinking/tool transcript. When present, the panel
+   *  renders the interleaved Hermes view; otherwise it falls back to the
+   *  tool-only timeline. */
+  transcript?: ProcessingTranscriptItem[];
+  /** When set, the panel is scoped to a single step — its title becomes the
+   *  step label and the body shows only that step's details (its sub-agent
+   *  activity, or its tool detail). `undefined` → the whole-run overview. */
+  scopedEntry?: ToolTimelineEntry;
+  onClose: () => void;
+}) {
+  const { t } = useT();
+
+  if (!open) return null;
+
+  // Sources/sub-agents are scoped to the single step when one is selected,
+  // else they cover the whole run.
+  const sources = extractAgentSources(scopedEntry ? [scopedEntry] : entries);
+  const subagentEntries = entries.filter(entry => entry.subagent);
+  // For a scoped *non*-sub-agent step, the detail (args / output) to show.
+  const scopedDetail = scopedEntry
+    ? (normalizeScopedBody(scopedEntry.result) ??
+      normalizeScopedBody(formatTimelineEntry(scopedEntry, t).detail) ??
+      normalizeScopedBody(scopedEntry.argsBuffer))
+    : undefined;
+
+  log(
+    'render panel scoped=%s entries=%d sources=%d',
+    Boolean(scopedEntry),
+    entries.length,
+    sources.length
+  );
+
+  // The overlay is the shared Radix-backed `Sheet`: the hand-rolled portal +
+  // backdrop `<button>` + `keydown` listener it replaced had no focus trap, no
+  // scroll lock and no focus restore on close. `open` is hard-coded because the
+  // early return above already renders nothing when closed — `onOpenChange` is
+  // what routes Escape / outside-click back to the caller's `onClose`.
+  return (
+    <SheetRoot
+      open
+      onOpenChange={next => {
+        if (!next) onClose();
+      }}>
+      <SheetContent
+        side="right"
+        aria-describedby={undefined}
+        data-testid="agent-process-source-panel"
+        className="max-w-[600px]">
+        {/* Header */}
+        <header className="flex shrink-0 items-center gap-2.5 border-b border-line px-4 py-3">
+          <span
+            aria-hidden
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary-50 text-primary-500 dark:bg-primary-500/15">
+            <AgentSparkIcon />
+          </span>
+          {/* `asChild` keeps the historical inline span so the header layout is
+              unchanged while Radix gets its required accessible title. */}
+          <SheetTitle asChild>
+            <span className="min-w-0 flex-1 truncate font-semibold text-content">
+              {scopedEntry
+                ? formatTimelineEntry(scopedEntry, t).title
+                : t('conversations.agentTaskInsights.processSourceTitle')}
+            </span>
+          </SheetTitle>
+          <Button
+            iconOnly
+            variant="tertiary"
+            size="sm"
+            onClick={onClose}
+            aria-label={t('conversations.subagent.close')}
+            className="shrink-0 rounded-full">
+            ✕
+          </Button>
+        </header>
+
+        {/* Body — the full agent timeline, then the visited sources. */}
+        <div className="flex-1 space-y-5 overflow-y-auto px-4 py-4">
+          <section>
+            <h3 className="mb-2 text-[10px] font-semibold tracking-wide text-content-faint uppercase">
+              {t('conversations.agentTaskInsights.stepsHeading')}
+            </h3>
+            {scopedEntry ? (
+              // Scoped to one step: show only that step's details.
+              scopedEntry.subagent ? (
+                <SubagentActivityCard activity={scopedEntry.subagent} />
+              ) : scopedDetail ? (
+                <pre className="max-h-[60vh] overflow-y-auto rounded-lg bg-surface-muted px-3 py-2 text-[12px] whitespace-pre-wrap wrap-break-word text-content-secondary">
+                  {scopedDetail}
+                </pre>
+              ) : (
+                <p className="text-xs text-content-faint italic">
+                  {t('conversations.agentTaskInsights.noSteps')}
+                </p>
+              )
+            ) : entries.length > 0 || transcript.length > 0 ? (
+              // Whole-run view — `ToolTimelineAdapter` already switches between
+              // the interleaved narration/tool-group view (when `transcript` is
+              // present) and the plain tool-row list (legacy snapshot),
+              // nesting each sub-agent's full activity inline either way.
+              <ToolTimelineAdapter entries={entries} transcript={transcript} expandAllRows />
+            ) : (
+              <p className="text-xs text-content-faint italic">
+                {t('conversations.agentTaskInsights.noSteps')}
+              </p>
+            )}
+          </section>
+
+          {/* Sub-agents — each delegated agent's full processing (thoughts +
+              tool rows + detail). Only rendered alongside the transcript view,
+              which doesn't nest sub-agent activity itself; the no-transcript
+              fallback above already expands it. */}
+          {!scopedEntry && transcript.length > 0 && subagentEntries.length > 0 ? (
+            <section>
+              <h3 className="mb-2 text-[10px] font-semibold tracking-wide text-content-faint uppercase">
+                {t('conversations.agentTaskInsights.subagentsHeading')}
+              </h3>
+              <div className="space-y-3">
+                {subagentEntries.map(entry => (
+                  <div key={entry.id} data-testid="agent-source-subagent">
+                    <p className="text-[12px] font-medium text-content-secondary">
+                      {formatTimelineEntry(entry, t).title}
+                    </p>
+                    <SubagentActivityCard activity={entry.subagent!} />
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+
+          {/* Sources — `ai-elements`' Sources disclosure rather than a static
+              heading: a long run can visit dozens of pages, and Radix's
+              Collapsible gives the header real `aria-expanded`/`aria-controls`
+              wiring that an <h3> never had. `defaultOpen` keeps the previous
+              always-visible behaviour, so nothing is hidden by the change. */}
+          {sources.length > 0 ? (
+            <Sources asChild defaultOpen className="mb-0 text-content">
+              <section>
+                <SourcesTrigger
+                  count={sources.length}
+                  className="mb-2 text-[10px] font-semibold tracking-wide text-content-faint uppercase">
+                  {t('conversations.agentTaskInsights.sourcesHeading')} ({sources.length})
+                </SourcesTrigger>
+                <SourcesContent className="mt-0 w-full gap-0">
+                  <ul className="space-y-0.5">
+                    {sources.map(source => (
+                      <AgentSourceRow key={source.id} source={source} />
+                    ))}
+                  </ul>
+                </SourcesContent>
+              </section>
+            </Sources>
+          ) : null}
+        </div>
+      </SheetContent>
+    </SheetRoot>
+  );
+}

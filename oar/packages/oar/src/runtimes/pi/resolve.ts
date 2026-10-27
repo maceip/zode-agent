@@ -1,0 +1,125 @@
+import { join, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { SessionNotFoundError } from "../../contracts/session-not-found-error.js";
+import { RuntimeFailureError } from "../../contracts/runtime-failure-error.js";
+
+/*
+ * pi resume + model resolution (SDK 0.84.2, pi-mono v0.84.2 914cf1472):
+ * pi persists sessions as FILES under
+ * <agentDir>/sessions/--<cwd slug>--/*.jsonl and opens them by path
+ * (SessionManager.open), not by id. The id OAR reports (AgentSession.sessionId)
+ * is the file's header id, and SessionManager.list(cwd, dir) reads it back per
+ * file, so resume is "list the cwd's session dir, match the id, open the path".
+ * Models are only unique per provider, so options.model is the same
+ * `provider/model` spelling `oar models pi` lists and pi's `--model` accepts.
+ */
+
+/** Structural slice of pi's SessionInfo the lookup reads. */
+export interface PiSessionInfo {
+  readonly id: string;
+  readonly path: string;
+}
+
+/** Structural slice of `SessionManager.list`; kept narrow for tests. */
+export interface PiSessionLister {
+  list(cwd: string, sessionDir?: string): Promise<readonly PiSessionInfo[]>;
+}
+
+/** Structural slice of `ModelRuntime.getModel`; kept generic for tests. */
+export interface PiModelLookup<TModel> {
+  getModel(provider: string, modelId: string): TModel | undefined;
+}
+
+/**
+ * pi's global config home (auth.json, models.json, settings, sessions) for
+ * every pi entry point: `OAR_PI_AGENT_DIR`, else pi's own (`fallback`, pi's
+ * `getAgentDir`: `PI_CODING_AGENT_DIR` or `~/.pi/agent`). Empty counts as
+ * unset, as pi treats an empty `PI_CODING_AGENT_DIR`; kept, it would join
+ * into relative paths and put auth.json in the working directory. Here, free
+ * of pi imports, so the entry points that load pi lazily can share it.
+ */
+export function piAgentDir(fallback: () => string): string {
+  const pinned = process.env.OAR_PI_AGENT_DIR;
+  return pinned === undefined || pinned === "" ? fallback() : pinned;
+}
+
+/**
+ * Mirrors pi's unexported `getDefaultSessionDirPath` (session-manager.js
+ * 0.84.2): the cwd is resolved, its leading separator dropped, every `/ \ :`
+ * turned into `-`, and wrapped in `--…--` under `<agentDir>/sessions`. Kept
+ * in lock-step so the agent-dir pin (OAR_PI_AGENT_DIR) and pi's own CLI land
+ * sessions in the same directory.
+ */
+export function piSessionDir(cwd: string, agentDir: string): string {
+  const slug = resolve(cwd).replace(/^[/\\]/u, "").replaceAll(/[/\\:]/gu, "-");
+  return join(resolve(agentDir), "sessions", `--${slug}--`);
+}
+
+/**
+ * Session id → session file. Listing is per cwd because pi's directory is
+ * per cwd: a session started elsewhere is not found here, and the error says
+ * where it looked so the caller can tell "wrong cwd" from "never persisted"
+ * (pi writes the file on the first message, so an unused session has none).
+ */
+export async function piFindSessionFile(
+  lister: PiSessionLister,
+  id: string,
+  cwd: string,
+  sessionDir: string,
+): Promise<string> {
+  let sessions = await lister.list(cwd, sessionDir);
+  let found = sessions.find((session) => session.id === id);
+  if (found === undefined) {
+    // A native child stores process.cwd(), which resolves directory symlinks
+    // (including macOS /var -> /private/var). Keep the existing storage
+    // directory and check only that same physical cwd, never other projects.
+    const physical = await realpath(cwd).catch((error: unknown) => {
+      if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")) { return cwd; }
+      throw error;
+    });
+    if (physical !== resolve(cwd)) {
+      const native = await lister.list(physical, sessionDir);
+      sessions = [...new Map([...sessions, ...native].map((entry) => [entry.path, entry])).values()];
+      found = sessions.find((session) => session.id === id);
+    }
+  }
+  if (found === undefined) {
+    throw new SessionNotFoundError(id,
+      `pi session ${id} not found: no session file with that id under ${sessionDir} `
+      + `(${sessions.length} session(s) there for cwd ${cwd}; pi persists a session on its first message)`,
+      { method: "SessionManager.list", native: { cwd, sessionDir, sessionCount: sessions.length } },
+    );
+  }
+  return found.path;
+}
+
+/** Splits `provider/model` at the first slash; model ids may themselves contain slashes. */
+export function splitPiModelId(model: string): { provider: string; modelId: string } {
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1) {
+    throw new Error(
+      `pi model must be spelled provider/model as listed by \`oar models pi\`; got ${JSON.stringify(model)}`,
+    );
+  }
+  return { provider: model.slice(0, slash), modelId: model.slice(slash + 1) };
+}
+
+/**
+ * `provider/model` → pi Model through the session's ModelRuntime (extension
+ * registrations included, since the runtime comes from
+ * createAgentSessionServices). Unknown is an error rather than a fallback:
+ * pi would otherwise pick its own default and the caller's choice would
+ * silently not apply.
+ */
+export function piResolveModel<TModel>(lookup: PiModelLookup<TModel>, model: string): TModel {
+  const { provider, modelId } = splitPiModelId(model);
+  const found = lookup.getModel(provider, modelId);
+  if (found === undefined) {
+    throw new RuntimeFailureError(
+      "model_unavailable",
+      `pi model ${model} is not registered: provider ${provider} has no model ${modelId} `
+      + "(see `oar models pi` for the usable list)",
+    );
+  }
+  return found;
+}

@@ -1,0 +1,283 @@
+import type { RuntimeBrand } from "../contracts/brand.js";
+import { defineRuntime, type Runtime } from "../contracts/runtime.js";
+import type { InputImage, InputOptions, RuntimeEventBody, Session, SessionCapabilities, SessionOptions, StartSession, TokenTotals, TurnOutcome } from "../contracts/session.js";
+// Built only on the public runtime-author SPI (@botiverse/oar/kernel), like any host's runtime.
+import { createSessionKernel, inputImagesRefusal, sealSession, withdrawHeld } from "../kernel.js";
+import { toolContent } from "../shared/tool-output.js";
+import { scriptedTasks, type ScriptedTask, type ScriptedTaskSpec } from "./scripted-tasks.js";
+
+/**
+ * What a script sees and does during one turn. Everything it emits enters the
+ * record stream as frames of type `scripted/*`, read into the ordinary events
+ * (`text_delta`, `reasoning`, `tool_call_*`), so a host exercises exactly the
+ * paths a vendor runtime would drive. An abort or dispose ends the turn at
+ * once, without waiting for the script; nothing the script emits after that
+ * is recorded.
+ */
+export interface ScriptedTurn {
+  /** The input that began the turn: a prompt, or a queued input when its turn starts. */
+  readonly input: string;
+  /** The images that came with `input` (`InputOptions.images`), as the host passed them. */
+  readonly images: readonly InputImage[];
+  /** The options the host opened the session with (cwd, env, system prompts). */
+  readonly options: SessionOptions;
+  /** Aborts when the host aborts the turn or disposes the session. */
+  readonly signal: AbortSignal;
+  /** Steer inputs delivered into this turn so far, oldest first. */
+  readonly steered: readonly string[];
+  /** Emit assistant text. */
+  readonly say: (text: string) => void;
+  /** Emit readable reasoning. */
+  readonly think: (text: string) => void;
+  /**
+   * Run a tool: `tool_call_started`, then `run` (awaited), then
+   * `tool_call_ended` carrying its result as content (`ok`), or the thrown
+   * error's message (`failed`, and the error is rethrown to the script).
+   * A tool that settles after the turn ended (an abort or dispose ended it
+   * while `run` was in flight) records nothing: the call gets no
+   * `tool_call_ended`, and a thrown error is still rethrown.
+   */
+  readonly tool: (name: string, input: string, run?: () => unknown) => Promise<void>;
+  /**
+   * Start a task the runtime tracks beside this turn (a background command,
+   * a subagent): `task_started` now, then `update` and `end` whenever the
+   * script reports them, also after the turn ended. Started outside a live
+   * turn, or reported after the session was disposed, nothing is recorded.
+   */
+  readonly task: (spec: ScriptedTaskSpec) => ScriptedTask;
+}
+
+export interface ScriptedRuntimeOptions {
+  /** Registry id; default `scripted`. */
+  readonly id?: string;
+  readonly brand?: RuntimeBrand;
+  /** Reported as the session's model; default `scripted-1`. */
+  readonly model?: string;
+  /**
+   * One turn of behavior. Resolving ends the turn `completed`; throwing ends
+   * it `failed` with the error message; an aborted signal ends it `aborted`
+   * (the script should stop working when it sees the signal).
+   */
+  readonly turn: (turn: ScriptedTurn) => void | Promise<void>;
+}
+
+const tokensOf = (text: string): number => Math.ceil(text.length / 4);
+
+/**
+ * A runtime whose model is a script: for hosts' tests and demos that need a
+ * real `Session` (the same records, folds and control semantics as a vendor
+ * runtime) without a binary, a login or a provider. Capabilities: steer,
+ * a non-durable queue whose entries can be withdrawn before their turn
+ * starts, no sub-agents. Installation is always `bundled`.
+ */
+export function scriptedRuntime(options: ScriptedRuntimeOptions): Runtime {
+  const id = options.id ?? "scripted";
+  const model = options.model ?? "scripted-1";
+  const start: StartSession = async (_installation, sessionOptions): Promise<Session> => {
+    await Promise.resolve();
+    // SessionOptions.effort's contract: a runtime that lists no effort levels refuses one, never ignores it.
+    if (sessionOptions.effort !== undefined) {
+      throw new Error(`${id} lists no reasoning-effort levels; it cannot run at effort "${sessionOptions.effort}"`);
+    }
+    const kernel = createSessionKernel(sessionOptions.resume);
+    const queued: { readonly input: string; readonly inputId: string | undefined; readonly images: readonly InputImage[] }[] = [];
+    const totals: { input: number; output: number } = { input: 0, output: 0 };
+    let active: { controller: AbortController; steered: string[] } | null = null;
+    let disposed = false;
+    const startTask = scriptedTasks((type, native, events) => {
+      kernel.frame({ type, native, events });
+    }, () => !disposed);
+
+    const frame = (type: string, native: unknown, events: readonly RuntimeEventBody[]): void => {
+      kernel.frame({ type, native, events });
+    };
+    const usage = (): TokenTotals => ({ input: totals.input, output: totals.output });
+
+    function run(input: string, images: readonly InputImage[] = []): void {
+      const controller = new AbortController();
+      const steered: string[] = [];
+      const turnState = { controller, steered };
+      active = turnState;
+      totals.input += tokensOf(input);
+      let callSeq = 0;
+      const live = (): boolean => active === turnState && !controller.signal.aborted;
+      const turn: ScriptedTurn = {
+        input,
+        images,
+        options: sessionOptions,
+        signal: controller.signal,
+        steered: turnState.steered,
+        say: (text) => {
+          if (!live()) {
+            return;
+          }
+          totals.output += tokensOf(text);
+          frame("scripted/text", { text }, [{ kind: "text_delta", text }]);
+        },
+        think: (text) => {
+          if (!live()) {
+            return;
+          }
+          frame("scripted/reasoning", { text }, [{ kind: "reasoning", content: { kind: "text", text } }]);
+        },
+        task: (spec) => startTask(spec, live()),
+        tool: async (name, toolInput, work) => {
+          if (!live()) {
+            return;
+          }
+          callSeq += 1;
+          const callId = `call-${String(callSeq)}`;
+          frame("scripted/tool_start", { callId, name, input: toolInput }, [{ kind: "tool_call_started", callId, tool: name, input: toolInput }]);
+          // Work can settle after an abort or dispose ended the turn. Its end is then not recorded:
+          // the status fold adopts a mid-turn event seen while idle, so a late tool_call_ended would
+          // reopen a turn nothing ends (or end the next turn's call of the same id). A failure still
+          // reaches the script, so it stops.
+          try {
+            const result: unknown = await work?.();
+            if (!live()) {
+              return;
+            }
+            const content = toolContent(result);
+            frame("scripted/tool_end", { callId, output: result, result: "ok" }, [{ kind: "tool_call_ended", callId, result: "ok", ...(content === undefined ? {} : { content }) }]);
+          } catch (error) {
+            if (live()) {
+              const output = error instanceof Error ? error.message : String(error);
+              frame("scripted/tool_end", { callId, output, result: "failed" }, [{ kind: "tool_call_ended", callId, result: "failed", content: [{ type: "text", text: output }] }]);
+            }
+            throw error;
+          }
+        },
+      };
+      // The turn starts once the control that began it is answered, as with a vendor runtime:
+      // the accepted response precedes the turn's first event.
+      setImmediate(() => {
+        void (async (): Promise<void> => {
+          end(turnState, await settle(turn, controller.signal));
+        })();
+      });
+    }
+
+    async function settle(turn: ScriptedTurn, signal: AbortSignal): Promise<TurnOutcome> {
+      try {
+        await options.turn(turn);
+        return signal.aborted ? { kind: "aborted" } : { kind: "completed" };
+      } catch (error) {
+        return signal.aborted
+          ? { kind: "aborted" }
+          : { kind: "failed", reason: error instanceof Error ? error.message : String(error), failure: "unknown" };
+      }
+    }
+
+    function end(turnState: NonNullable<typeof active>, outcome: TurnOutcome): void {
+      if (active !== turnState) {
+        return; // already ended (an abort or dispose ended it first)
+      }
+      active = null;
+      frame("scripted/end", { outcome }, [
+        { kind: "turn_ended", outcome },
+        { kind: "usage", usage: { tokens: usage(), context: { tokens: totals.input + totals.output, contextWindow: 200_000, percent: ((totals.input + totals.output) / 200_000) * 100 } } },
+      ]);
+      const next = queued.shift();
+      if (next !== undefined && !disposed) {
+        run(next.input, next.images);
+      }
+    }
+
+    function abortActive(): void {
+      const turnState = active;
+      if (turnState === null) {
+        return;
+      }
+      turnState.controller.abort();
+      end(turnState, { kind: "aborted" });
+    }
+
+    frame("scripted/model", { model }, [{ kind: "model", model }]);
+    const capabilities: SessionCapabilities = { queue: { durable: false }, attribution: "none", images: true };
+    return sealSession({
+      id: kernel.sessionId,
+      capabilities,
+      prompt: async (input, inputOptions?: InputOptions) => {
+        const result = await kernel.control({ kind: "prompt", input, ...inputOptions }, () => {
+          if (active !== null) {
+            return { kind: "rejected", code: "busy", reason: "busy" };
+          }
+          const refused = inputImagesRefusal(capabilities, inputOptions?.images);
+          if (refused !== null) {
+            return refused;
+          }
+          run(input, inputOptions?.images);
+          return { kind: "accepted" };
+        });
+        return result;
+      },
+      steer: async (input, inputOptions) => {
+        const result = await kernel.control({ kind: "steer", input, ...inputOptions }, () => {
+          if (active === null) {
+            return { kind: "rejected", code: "no_active_turn", reason: "no active turn" };
+          }
+          const refused = inputImagesRefusal(capabilities, inputOptions?.images);
+          if (refused !== null) {
+            return refused;
+          }
+          active.steered.push(input);
+          return { kind: "accepted" };
+        });
+        return result;
+      },
+      queue: async (input, inputOptions) => {
+        const result = await kernel.control({ kind: "queue", input, ...inputOptions }, () => {
+          const refused = inputImagesRefusal(capabilities, inputOptions?.images);
+          if (refused !== null) {
+            return refused;
+          }
+          if (active === null) {
+            run(input, inputOptions?.images);
+          } else {
+            queued.push({ input, inputId: inputOptions?.inputId, images: inputOptions?.images ?? [] });
+          }
+          return { kind: "accepted" };
+        });
+        return result;
+      },
+      withdraw: async (inputId) => {
+        // The turn-end drain shifts its entry before running it, so an entry still here was never sent.
+        const result = await kernel.control({ kind: "withdraw", inputId }, () => withdrawHeld(queued, inputId));
+        return result;
+      },
+      abort: async () => {
+        const result = await kernel.control({ kind: "abort" }, () => {
+          if (active === null) {
+            return { kind: "rejected", code: "no_active_turn", reason: "no active turn" };
+          }
+          abortActive();
+          return { kind: "accepted" };
+        });
+        return result;
+      },
+      rawEvents: (observer, cursor) => kernel.rawEvents(observer, cursor),
+      records: () => kernel.records(),
+      graph: () => kernel.graph(),
+      dispose: async () => {
+        if (disposed) {
+          return;
+        }
+        disposed = true;
+        const request = kernel.request("toRuntime", { kind: "dispose" });
+        queued.length = 0;
+        abortActive();
+        kernel.respond(request.id, { kind: "exited", code: 0 });
+        await Promise.resolve();
+      },
+    });
+  };
+  return defineRuntime({
+    id,
+    ...(options.brand === undefined ? {} : { brand: options.brand }),
+    session: start,
+    installation: async () => {
+      await Promise.resolve();
+      return { kind: "available" as const, via: "bundled" as const };
+    },
+  });
+}

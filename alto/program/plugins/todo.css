@@ -1,0 +1,105 @@
+.todo-header-button { flex: 0 0 auto; display: inline-flex; align-items: center; gap: var(--space-2); height: var(--control-button); padding: 0 var(--space-2); -webkit-app-region: no-drag; }
+.todo-header-button[aria-pressed=true] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); }
+.todo-pane { flex: 1; min-width: 0; min-height: 0; background: var(--canvas); }
+.todo-scroll { flex: 1; min-width: 0; min-height: 0; overflow: auto; }
+.todo-content { width: min(100%, calc(var(--composer-content-width) + var(--space-5) * 2)); margin: 0 auto; padding: calc(var(--space-5) * 1.5) clamp(var(--space-4), 4vw, calc(var(--space-5) * 1.5)) calc(var(--space-5) * 2); }
+.todo-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); margin-bottom: var(--space-5); padding-bottom: var(--space-4); border-bottom: 1px solid var(--border-soft); }
+.todo-title { display: flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.todo-title > svg { color: var(--accent); flex-shrink: 0; }
+.todo-heading h1 { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-3); margin: 0; color: var(--text-strong); font-size: var(--type-page-headline); font-weight: var(--weight-semibold); line-height: var(--line-control); }
+.todo-heading h1:focus { outline: none; }
+.todo-heading h1 span { color: var(--muted); font-size: var(--type-label); font-weight: var(--weight-regular); white-space: nowrap; }
+.todo-project { margin-bottom: var(--space-4); min-width: 0; }
+.todo-project-heading { display: flex; align-items: center; gap: var(--space-2); min-height: var(--control-button); margin-bottom: var(--space-1); }
+.todo-project-heading h2 { flex: 1; min-width: 0; margin: 0; font-size: var(--type-label); font-weight: var(--weight-semibold); }
+.todo-project-toggle { display: flex; align-items: center; gap: var(--space-2); max-width: 100%; min-height: var(--control-default); padding: 0 var(--space-1); color: var(--text-strong); border: 0; border-radius: var(--radius-dense); background: transparent; text-align: left; font: inherit; cursor: pointer; }
+.todo-project-toggle > svg { flex-shrink: 0; color: var(--muted); }
+.todo-project-toggle:hover { background: var(--surface-hover); }
+.todo-project-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-count { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; min-width: calc(var(--control-icon) - var(--space-1)); padding: calc(var(--space-1) / 2) calc(var(--space-3) / 2); border-radius: var(--radius-dense); background: var(--panel-soft); color: var(--muted); font-size: var(--type-supporting); font-weight: var(--weight-medium); line-height: var(--line-control); font-variant-numeric: tabular-nums; }
+.todo-project-add { --alto-icon-button-size: var(--control-compact); }
+.todo-project-body { min-width: 0; }
+.todo-items, .todo-chats { list-style: none; margin: 0; padding: 0; }
+.todo-items { overflow: hidden; border: 1px solid var(--border-soft); border-radius: var(--radius-row); background: var(--panel-solid); }
+.todo-items:empty { display: none; }
+.todo-item { padding: var(--space-2) var(--space-3); transition: background .12s; }
+.todo-item + .todo-item { border-top: 1px solid var(--border-soft); }
+.todo-item:hover { background: var(--surface-hover); }
+.todo-item-line { display: flex; min-width: 0; min-height: var(--control-default); align-items: center; gap: var(--space-2); }
+.todo-checkbox { display: grid; place-items: center; width: var(--control-icon); height: var(--control-icon); flex-shrink: 0; cursor: pointer; }
+.todo-checkbox input { appearance: none; grid-area: 1 / 1; margin: 0; width: calc(var(--space-2) * 2); height: calc(var(--space-2) * 2); border: 1px solid var(--border-strong); border-radius: calc(var(--radius-dense) - var(--space-1) / 2); background: var(--panel-solid); cursor: pointer; transition: border-color .12s, background .12s; }
+.todo-checkbox:hover input { border-color: var(--accent); }
+.todo-checkbox input:checked { background: var(--accent); border-color: var(--accent); }
+.todo-checkbox > svg { grid-area: 1 / 1; opacity: 0; pointer-events: none; color: var(--accent-text); stroke-width: 2.5; }
+.todo-checkbox input:checked + svg { opacity: 1; }
+.todo-checkbox input:disabled { opacity: .5; cursor: default; }
+.todo-edit-name { display: block; min-width: 0; padding: var(--space-1) 0; color: inherit; background: transparent; border: 0; border-radius: var(--radius-dense); text-align: left; font: inherit; overflow-wrap: anywhere; cursor: text; }
+.todo-edit-name:hover { color: var(--accent); }
+.todo-item-text { flex: 1; color: var(--text-strong); font-size: var(--type-body); font-weight: var(--weight-medium); line-height: var(--line-body); }
+.todo-item.is-done .todo-item-text { text-decoration: line-through; color: var(--muted); font-weight: var(--weight-regular); }
+.todo-inline-input { min-width: 0; width: 100%; border: 1px solid var(--accent-border); border-radius: var(--radius-dense); padding: var(--space-1); color: var(--text-strong); background: var(--panel-solid); font: inherit; }
+.todo-row-action { --alto-icon-button-size: var(--control-compact); flex-shrink: 0; opacity: 0; transition: opacity .12s; }
+.todo-item:hover > .todo-item-line > .todo-row-action, .todo-item:focus-within > .todo-item-line > .todo-row-action, .todo-chat:hover > .todo-row-action, .todo-chat:focus-within > .todo-row-action, .todo-row-action[aria-expanded=true], .todo-row-action:focus-visible { opacity: 1; }
+.todo-chats { margin: 0 0 var(--space-1) calc(var(--control-icon) / 2); padding-left: calc(var(--control-icon) / 2 + var(--space-2)); border-left: 1px solid var(--border); }
+.todo-project-body > .todo-chats { margin-left: var(--space-3); }
+.todo-chat { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-1); min-width: 0; min-height: var(--control-compact); }
+.todo-chat-link { min-width: 0; flex: 1; display: flex; gap: var(--space-2); align-items: center; color: var(--muted); background: transparent; border: 0; border-radius: var(--radius-dense); padding: var(--space-1) 0; text-align: left; font-size: var(--type-label); cursor: pointer; }
+.todo-chat-link svg { flex-shrink: 0; }
+.todo-chat-link span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-chat-link svg:last-child { opacity: 0; }
+.todo-chat-link:hover, .todo-chat-link:focus-visible { color: var(--accent); }
+.todo-chat-link:hover svg:last-child, .todo-chat-link:focus-visible svg:last-child { opacity: 1; }
+.todo-chat-rename { display: flex; align-items: center; flex: 1; min-width: 0; gap: var(--space-2); color: var(--muted); }
+.todo-chat-rename > svg, .todo-chat-rename > button { flex-shrink: 0; }
+.todo-chat-rename input { flex: 1; font-size: var(--type-label); }
+.todo-chat > .todo-error { flex-basis: 100%; margin: var(--space-1) 0; }
+.todo-add-item { display: flex; align-items: center; gap: var(--space-2); min-height: var(--control-button); margin-top: var(--space-1); padding: 0 calc(var(--space-3) + var(--space-1)); border: 1px solid transparent; border-radius: var(--radius-dense); color: var(--muted); }
+.todo-add-item > svg { flex-shrink: 0; }
+.todo-add-item input { flex: 1; min-width: 0; padding: var(--space-2) 0; color: var(--text); background: transparent; border: 0; outline: none; font-size: var(--type-label); }
+.todo-add-item input::placeholder { color: var(--muted); }
+.todo-add-item:focus-within { border-color: var(--accent-border); background: var(--panel-solid); color: var(--accent); }
+.todo-add-item:hover:not(:focus-within) { background: var(--surface-hover); }
+.todo-other-projects { padding-top: var(--space-3); margin-top: var(--space-2); border-top: 1px solid var(--border-soft); }
+.todo-other-toggle { display: flex; align-items: center; gap: var(--space-2); min-height: var(--control-button); padding: 0 var(--space-1); margin-bottom: var(--space-1); color: var(--muted); border: 0; border-radius: var(--radius-dense); background: transparent; font-size: var(--type-label); cursor: pointer; }
+.todo-other-toggle:hover { color: var(--text-strong); }
+.todo-other-projects .todo-project { margin-bottom: var(--space-1); }
+.todo-other-projects .todo-project-heading { margin-bottom: 0; }
+.todo-other-projects .todo-project-name { color: var(--text); font-weight: var(--weight-regular); }
+.todo-search { min-width: 0; flex: 1; padding: var(--space-2) var(--space-3); color: var(--text); background: var(--panel-soft); border: 1px solid var(--border-soft); border-radius: var(--radius-dense); font-size: var(--type-body); }
+.todo-row-options { display: flex; flex-wrap: wrap; align-items: center; flex-basis: 100%; gap: var(--space-2); padding: var(--space-1) 0; color: var(--muted); font-size: var(--type-label); }
+.todo-row-options button { display: inline-flex; align-items: center; gap: var(--space-1); border: 0; padding: var(--space-1) var(--space-2); border-radius: var(--radius-dense); background: var(--panel-soft); color: var(--text); font-size: var(--type-label); cursor: pointer; }
+.todo-row-options button:hover { background: var(--accent-soft); color: var(--accent); }
+.todo-error { color: var(--danger); font-size: var(--type-label); overflow-wrap: anywhere; }
+.todo-pane button:focus-visible, .todo-checkbox input:focus-visible, .todo-inline-input:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: 2px; }
+.todo-modal-layer { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center; padding: var(--space-4); background: color-mix(in srgb, var(--text-strong) 30%, transparent); }
+.todo-move-dialog { width: min(calc(var(--overview-group-width) + var(--overview-stat-width)), 100%); min-width: 0; max-height: calc(100dvh - calc(var(--space-4) * 2)); display: flex; flex-direction: column; padding: var(--space-4); box-sizing: border-box; }
+.todo-move-heading { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); }
+.todo-move-heading h2 { margin: 0; font-size: var(--type-topbar-title); color: var(--text-strong); }
+.todo-move-description { color: var(--muted); font-size: var(--type-label); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin: calc(var(--space-3) / 2) 0 var(--space-4); }
+.todo-search { width: 100%; box-sizing: border-box; flex: 0 0 auto; }
+.todo-destinations { min-height: 0; max-height: 40vh; overflow-y: auto; margin: var(--space-3) calc(var(--space-1) * -1); padding: 0 var(--space-1); }
+.todo-destination-project { margin: 0 0 var(--space-2); }
+.todo-destination-project button { display: flex; align-items: center; gap: var(--space-2); width: 100%; min-width: 0; padding: var(--space-2) var(--space-2); background: transparent; color: var(--text); border: 0; border-radius: var(--radius-xs); text-align: left; font-size: var(--type-body); }
+.todo-destination-project button span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-destination-project > button:first-child { font-weight: var(--weight-semibold); }
+.todo-destination-project .todo-destination-item { padding-left: var(--space-5); color: var(--muted); }
+.todo-destination-project button:hover { background: var(--surface-hover); }
+.todo-destination-project button[aria-pressed=true] { background: var(--accent-soft); color: var(--accent); }
+.todo-move-dialog footer { display: flex; justify-content: flex-end; gap: var(--space-2); }
+.todo-primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+@media (max-width: 480px) {
+  .todo-content { padding: var(--space-5) var(--space-3); }
+  .todo-heading { margin-bottom: var(--space-4); }
+  .todo-title { gap: var(--space-2); }
+  .todo-heading h1 { font-size: var(--type-topbar-title); gap: var(--space-2); }
+  .todo-item { padding: var(--space-2); }
+  .todo-item-line { gap: var(--space-1); }
+  .todo-chats { padding-left: calc(var(--control-icon) / 2 + var(--space-1)); }
+  .todo-move-dialog { padding: var(--space-3); }
+}
+@media (hover: none) {
+  .todo-row-action { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .todo-item, .todo-row-action, .todo-checkbox input { transition: none; }
+}

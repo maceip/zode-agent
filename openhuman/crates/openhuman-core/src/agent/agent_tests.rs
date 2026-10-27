@@ -1,0 +1,308 @@
+//! Comprehensive agent-loop test suite.
+//!
+//! Tests exercise the full `OpenHumanSessionHost.turn()` cycle with mock providers and tools,
+//! covering every edge case an agentic tool loop must handle:
+//!
+//!   1. Simple text response (no tools)
+//!   2. Single tool call → final response
+//!   3. Multi-step tool chain (tool A → tool B → response)
+//!   4. Max-iteration bailout
+//!   5. Unknown tool name recovery
+//!   6. Tool execution failure recovery
+//!   7. Parallel tool dispatch
+//!   8. History trimming during long conversations
+//!   9. Memory auto-save round-trip
+//!  10. Native vs XML dispatcher integration
+//!  11. Empty / whitespace-only LLM responses
+//!  12. Mixed text + tool call responses
+//!  13. Multi-tool batch in a single response
+//!  14. System prompt generation & tool instructions
+//!  15. Context enrichment from memory loader
+//!  16. TranscriptEntry serialization round-trip
+//!  17. Tool call with stringified JSON arguments
+//!  18. Conversation history fidelity (tool call → tool result → assistant)
+//!  19. Builder validation (missing required fields)
+//!  20. Idempotent system prompt insertion
+
+use crate::agent::session_host::OpenHumanSessionHost;
+use crate::config::AgentConfig;
+use anyhow::Result;
+use async_trait::async_trait;
+use std::sync::{Arc, Mutex};
+use tinyinference_llm::model::{ChatModel, ModelProfile, ModelRequest, ModelResponse};
+use tinyinference_llm::usage::BilledUsage;
+use tinytools::{Tool, ToolResult};
+use tinytools_agent::dialect::NativeToolCall;
+use tinytools_agent::dialect::TranscriptEntry;
+use tinytools_agent::dialect::{NativeDialect, ToolDialect, XmlDialect};
+
+type ChatResponse = tinyinference_llm::model::ChatResponse<BilledUsage, NativeToolCall>;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Test Helpers — Mock Provider, Mock Tool, Mock Memory
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A mock LLM provider that returns pre-scripted responses in order.
+/// When the queue is exhausted it returns a simple "done" text response.
+struct ScriptedProvider {
+    responses: Mutex<Vec<ChatResponse>>,
+    /// Model calls made, including any answered by the exhausted-queue default.
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedProvider {
+    fn new(responses: Vec<ChatResponse>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl ChatModel<()> for ScriptedProvider {
+    fn profile(&self) -> Option<&ModelProfile> {
+        static PROFILE: std::sync::LazyLock<ModelProfile> =
+            std::sync::LazyLock::new(|| ModelProfile {
+                provider: Some("agent-test".to_string()),
+                tool_calling: true,
+                parallel_tool_calls: true,
+                ..ModelProfile::default()
+            });
+        Some(&PROFILE)
+    }
+
+    async fn invoke(
+        &self,
+        _state: &(),
+        request: ModelRequest,
+    ) -> tinyinference_llm::Result<ModelResponse> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = self.responses.lock().unwrap();
+        let response = if guard.is_empty() {
+            ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+                finish_reason: None,
+            }
+        } else {
+            guard.remove(0)
+        };
+        Ok(tinyinference_llm::model::response_to_model_response(
+            &response, &request,
+        ))
+    }
+}
+
+/// A mock provider that always returns an error.
+struct FailingProvider;
+
+#[async_trait]
+impl ChatModel<()> for FailingProvider {
+    async fn invoke(
+        &self,
+        _state: &(),
+        _request: ModelRequest,
+    ) -> tinyinference_llm::Result<ModelResponse> {
+        Err(tinyinference_llm::Error::Model(
+            "provider error".to_string(),
+        ))
+    }
+}
+
+/// A simple echo tool that returns its arguments as output.
+struct EchoTool;
+
+#[async_trait]
+impl Tool for EchoTool {
+    fn name(&self) -> &str {
+        "echo"
+    }
+
+    fn description(&self) -> &str {
+        "Echoes the input"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"}
+            }
+        })
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
+        let msg = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(empty)")
+            .to_string();
+        Ok(ToolResult::success(msg))
+    }
+}
+
+/// A tool that always fails execution.
+struct FailingTool;
+
+#[async_trait]
+impl Tool for FailingTool {
+    fn name(&self) -> &str {
+        "fail"
+    }
+
+    fn description(&self) -> &str {
+        "Always fails"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+        Ok(ToolResult::error("intentional failure"))
+    }
+}
+
+/// A tool that panics (tests error propagation).
+struct PanickingTool;
+
+#[async_trait]
+impl Tool for PanickingTool {
+    fn name(&self) -> &str {
+        "panicker"
+    }
+
+    fn description(&self) -> &str {
+        "Panics on execution"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+        anyhow::bail!("catastrophic tool failure")
+    }
+}
+
+/// A tool that tracks how many times it was called.
+struct CountingTool {
+    count: Arc<Mutex<usize>>,
+}
+
+impl CountingTool {
+    fn new() -> (Self, Arc<Mutex<usize>>) {
+        let count = Arc::new(Mutex::new(0));
+        (
+            Self {
+                count: count.clone(),
+            },
+            count,
+        )
+    }
+}
+
+#[async_trait]
+impl Tool for CountingTool {
+    fn name(&self) -> &str {
+        "counter"
+    }
+
+    fn description(&self) -> &str {
+        "Counts calls"
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+        let mut c = self.count.lock().unwrap();
+        *c += 1;
+        Ok(ToolResult::success(format!("call #{}", *c)))
+    }
+}
+
+/// Build an agent with an isolated temp workspace.
+/// Returns `(OpenHumanSessionHost, TempDir)` — hold `_tmp` in the test to keep the dir alive.
+fn build_agent_with(
+    provider: Arc<dyn ChatModel<()>>,
+    tools: Vec<Box<dyn Tool>>,
+    dispatcher: Box<dyn ToolDialect>,
+) -> (OpenHumanSessionHost, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let agent = OpenHumanSessionHost::builder()
+        .chat_model(provider)
+        .model_name("agent-test/mock".into())
+        .tools(tools)
+        .tool_dispatcher(dispatcher)
+        .workspace_dir(tmp.path().to_path_buf())
+        .build()
+        .unwrap();
+    (agent, tmp)
+}
+
+fn build_agent_with_config(
+    provider: Arc<dyn ChatModel<()>>,
+    tools: Vec<Box<dyn Tool>>,
+    config: AgentConfig,
+) -> (OpenHumanSessionHost, tempfile::TempDir) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let agent = OpenHumanSessionHost::builder()
+        .chat_model(provider)
+        .model_name("agent-test/mock".into())
+        .tools(tools)
+        .tool_dispatcher(Box::new(NativeDialect))
+        .workspace_dir(tmp.path().to_path_buf())
+        .config(config)
+        .build()
+        .unwrap();
+    (agent, tmp)
+}
+
+/// Helper: create a ChatResponse with tool calls (native format).
+fn tool_response(calls: Vec<NativeToolCall>) -> ChatResponse {
+    ChatResponse {
+        text: Some(String::new()),
+        tool_calls: calls,
+        usage: None,
+        reasoning_content: None,
+        finish_reason: None,
+    }
+}
+
+/// Helper: create a plain text ChatResponse.
+fn text_response(text: &str) -> ChatResponse {
+    ChatResponse {
+        text: Some(text.into()),
+        tool_calls: vec![],
+        usage: None,
+        reasoning_content: None,
+        finish_reason: None,
+    }
+}
+
+/// Helper: create an XML-style tool call response.
+fn xml_tool_response(name: &str, args: &str) -> ChatResponse {
+    ChatResponse {
+        text: Some(format!(
+            "<tool_call>\n{{\"name\": \"{name}\", \"arguments\": {args}}}\n</tool_call>"
+        )),
+        tool_calls: vec![],
+        usage: None,
+        reasoning_content: None,
+        finish_reason: None,
+    }
+}
+
+#[path = "agent_turn_loop_nudge_tests.rs"]
+mod agent_turn_loop_nudge_tests;
+#[path = "agent_turn_loop_packed_tool_tests.rs"]
+mod agent_turn_loop_packed_tool_tests;
+#[path = "agent_turn_loop_tests.rs"]
+mod agent_turn_loop_tests;
+#[path = "agent_turn_progress_release_tests.rs"]
+mod agent_turn_progress_release_tests;

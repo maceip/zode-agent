@@ -1,0 +1,938 @@
+import { resolve } from "node:path";
+import { build } from "esbuild";
+import { JSDOM } from "jsdom";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import type { ContentRequest, StateUpdate, SurfaceCommand, SurfaceViewState } from "./shared.js";
+import type { ModeShortcutBinding } from "./mode-shortcuts.js";
+
+let source: string;
+const pages: JSDOM[] = [];
+const idle: SurfaceViewState = {
+  mode: "chill",
+  connection: "disconnected",
+  opacity: 0.6,
+};
+const connected: SurfaceViewState = {
+  ...idle,
+  connection: "connected",
+  surface: {
+    runtimeId: "native-test",
+    displayName: "Native test",
+    url: "http://localhost:3080/",
+    frameName: "agentonweb:test-nonce",
+  },
+};
+
+beforeAll(async () => {
+  // Exercise the production bundle, including its closed Shadow DOM and dock.
+  const result = await build({
+    entryPoints: [resolve("apps/extension/src/content.tsx")],
+    bundle: true,
+    write: false,
+    format: "iife",
+    platform: "browser",
+    target: "chrome132",
+    loader: { ".css": "text", ".svg": "text", ".png": "dataurl" },
+  });
+  source = result.outputFiles[0]!.text;
+});
+afterEach(() => {
+  for (const dom of pages.splice(0)) dom.window.close();
+});
+
+async function page(
+  initial = idle,
+  url = "https://example.org/",
+  initialReply?: Promise<{ ok: boolean; result: SurfaceViewState; modeShortcuts?: ModeShortcutBinding[] }>,
+  onRequest?: (request: ContentRequest) => void,
+  options: { platform?: string; modeShortcuts?: ModeShortcutBinding[] } = {},
+) {
+  // No external resources are loaded. Only our bundled content script executes.
+  const dom = new JSDOM('<button id="website-control">Website control</button>', { url, runScripts: "outside-only" });
+  pages.push(dom);
+  const { window } = dom;
+  const { document } = window;
+  Object.defineProperty(window.navigator, "platform", { value: options.platform ?? "Win32" });
+  const modeShortcuts = options.modeShortcuts ?? ["chill", "focus", "watch"].map((mode, index) => ({
+    name: `mode-${mode}`, shortcut: `${options.platform === "MacIntel" ? "Ctrl" : "Alt"}+${index + 1}`,
+  }));
+  const createdFrames: HTMLIFrameElement[] = [];
+  const createElement = document.createElement.bind(document);
+  vi.spyOn(document, "createElement").mockImplementation(((name: string, options?: ElementCreationOptions) => {
+    const element = createElement(name, options);
+    if (name === "iframe") createdFrames.push(element as HTMLIFrameElement);
+    return element;
+  }) as typeof document.createElement);
+  const websiteControl = document.querySelector<HTMLButtonElement>("button")!;
+  websiteControl.focus();
+  let shadow!: ShadowRoot;
+  const attachShadow = window.HTMLElement.prototype.attachShadow;
+  vi.spyOn(window.HTMLElement.prototype, "attachShadow").mockImplementation(function (this: HTMLElement, options) {
+    shadow = attachShadow.call(this, options);
+    return shadow;
+  });
+  let receive!: (message: StateUpdate | SurfaceCommand) => void;
+  const sendMessage = vi.fn(async (request: ContentRequest) => {
+    onRequest?.(request);
+    if (request.type === "mode.shortcuts.get") return { ok: true, result: modeShortcuts };
+    return initialReply ?? { ok: true, result: initial, modeShortcuts };
+  });
+  Object.assign(window, {
+    chrome: {
+      runtime: {
+        getURL: (path: string) => `chrome-extension://test-extension${path}`,
+        sendMessage,
+        onMessage: {
+          addListener(listener: typeof receive) {
+            receive = listener;
+          },
+        },
+      },
+    },
+  });
+  window.eval(source);
+  await Promise.resolve();
+  const host = document.getElementById("agentonweb-extension-root")!;
+  const frame = shadow.querySelector<HTMLIFrameElement>("iframe") ?? createdFrames[0]!;
+  const ready = (target = frame, origin = "chrome-extension://test-extension", nonce = "test-nonce", sender: unknown = target.contentWindow) =>
+    window.dispatchEvent(new window.MessageEvent("message", {
+      data: { source: "agentonweb-surface", type: "surface.wrapper-ready", nonce }, origin, source: sender as Window,
+    }));
+  const emit = (type: StateUpdate["type"] | SurfaceCommand["type"], state = initial) =>
+    receive({ source: "agentonweb-background", type, state });
+  const escape = (target: { dispatchEvent(event: any): boolean }) => {
+    const event = new window.KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+    });
+    target.dispatchEvent(event);
+    return event;
+  };
+  return {
+    window,
+    shadow,
+    host,
+    frame,
+    websiteControl,
+    sendMessage,
+    emit,
+    escape,
+    ready,
+  };
+}
+
+describe("page-local AgentOnWeb visibility", () => {
+  it("applies an acknowledged mode click after a page update even without a background broadcast", async () => {
+    const p = await page(connected);
+    // SPA/HMR page replacement must not make mode buttons depend on receiving
+    // an unsolicited broadcast: the mode.set reply already confirms the mode.
+    p.window.document.body.replaceChildren(p.window.document.createElement("main"));
+    p.sendMessage.mockImplementation(async request => ({ ok: true,
+      result: request.type === "mode.set" ? { ...connected, mode: request.mode } : connected,
+    }));
+    p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!.click();
+    for (const mode of ["focus", "watch", "chill"] as const) {
+      p.shadow.querySelector<HTMLButtonElement>(`[aria-label^="${mode[0]!.toUpperCase() + mode.slice(1)} mode"]`)!.click();
+      await vi.waitFor(() => expect(p.host.dataset.mode).toBe(mode));
+      expect(p.frame.hidden).toBe(mode === "watch");
+    }
+  });
+
+  it("ignores an older mode click reply and preserves newer presentation state", async () => {
+    const p = await page(connected);
+    const replies = new Map<string, (value: { ok: boolean; result: SurfaceViewState }) => void>();
+    p.sendMessage.mockImplementation(request => request.type === "mode.set"
+      ? new Promise(resolve => replies.set(request.mode, resolve))
+      : Promise.resolve({ ok: true, result: connected }));
+    p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!.click();
+    p.shadow.querySelector<HTMLButtonElement>('[aria-label^="Focus mode"]')!.click();
+    p.shadow.querySelector<HTMLButtonElement>('[aria-label^="Watch mode"]')!.click();
+    p.emit("state.update", { ...connected, opacity: 0.8, agentSessions: [{
+      id: "pi:new", terminalId: "terminal", runtimeId: "native-test", agent: "Pi", title: "New live task",
+      detail: "", status: "running", updatedAt: Date.now(), attentionId: "",
+    }] });
+    replies.get("watch")!({ ok: true, result: { ...connected, mode: "watch" } });
+    await vi.waitFor(() => expect(p.host.dataset.mode).toBe("watch"));
+    replies.get("focus")!({ ok: true, result: { ...connected, mode: "focus" } });
+    await Promise.resolve();
+    expect(p.host.dataset.mode).toBe("watch");
+    expect(p.host.style.getPropertyValue("--agentonweb-surface-opacity")).toBe("0.8");
+    expect(p.shadow.querySelector(".agent-session")!.textContent).toContain("New live task");
+  });
+
+  it("lets a later keyboard command supersede a pending mode click and ignores failed replies", async () => {
+    const p = await page(connected);
+    let reply!: (value: { ok: boolean; result: SurfaceViewState }) => void;
+    p.sendMessage.mockImplementation(request => request.type === "mode.set"
+      ? new Promise(resolve => { reply = resolve; })
+      : Promise.resolve({ ok: true, result: connected }));
+    p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!.click();
+    const focus = p.shadow.querySelector<HTMLButtonElement>('[aria-label^="Focus mode"]')!;
+    focus.click();
+    p.emit("surface.show", { ...connected, mode: "watch" });
+    reply({ ok: true, result: { ...connected, mode: "focus" } });
+    await Promise.resolve();
+    expect(p.host.dataset.mode).toBe("watch");
+    focus.click();
+    reply({ ok: false, result: { ...connected, mode: "focus" } });
+    await Promise.resolve();
+    expect(p.host.dataset.mode).toBe("watch");
+  });
+
+  it("keeps the active iframe visible and focused across status and presentation updates", async () => {
+    const p = await page(connected);
+    p.frame.focus();
+    const context = p.frame.contentWindow;
+    // JSDOM does not blur hidden iframes. Catch the transient hidden=true that
+    // clears the native terminal textarea's focus in a real browser.
+    const hidden = vi.spyOn(p.frame, "hidden", "set");
+    for (const state of [connected, { ...connected, agentSessions: [] },
+      { ...connected, opacity: 0.7 }, { ...connected, mode: "focus" as const }]) {
+      p.emit("state.update", state);
+      expect(hidden).not.toHaveBeenCalledWith(true);
+      expect(p.shadow.activeElement).toBe(p.frame);
+      expect(p.frame.contentWindow).toBe(context);
+    }
+    p.emit("surface.show", { ...connected, mode: "focus" });
+    expect(hidden).not.toHaveBeenCalledWith(true);
+    p.emit("state.update", { ...connected, mode: "watch" });
+    expect(p.frame.hidden).toBe(true);
+  });
+
+  it("refreshes a wrapper's lost authorization after worker restart and rejects forged retry messages", async () => {
+    const ui = await page(connected);
+    const recovered = { ...connected, surface: { ...connected.surface!, frameName: 'agentonweb:fresh-nonce' } };
+    ui.sendMessage.mockResolvedValue({ ok: true, result: recovered });
+    ui.sendMessage.mockClear();
+    const retry = (origin: string, nonce: string, sender: unknown = ui.frame.contentWindow) =>
+      ui.window.dispatchEvent(new ui.window.MessageEvent('message', { origin, source: sender as Window,
+        data: { source: 'agentonweb-surface', type: 'surface.wrapper-retry', nonce } }));
+    retry('https://attacker.example', 'test-nonce');
+    retry('chrome-extension://test-extension', 'wrong');
+    retry('chrome-extension://test-extension', 'test-nonce', ui.window);
+    expect(ui.sendMessage).not.toHaveBeenCalled();
+    retry('chrome-extension://test-extension', 'test-nonce');
+    await vi.waitFor(() => expect(ui.frame.name).toBe('agentonweb:fresh-nonce'));
+    expect(new URLSearchParams(new URL(ui.frame.src).hash.slice(1)).get('nonce')).toBe('fresh-nonce');
+    expect(ui.sendMessage).toHaveBeenCalledExactlyOnceWith({ source: 'agentonweb-content', type: 'state.get' });
+  });
+
+  it("remembers Close across reloads and cross-site navigation until explicitly reopened", async () => {
+    let saved = { ...idle, dismissed: false };
+    const openPage = (url: string) =>
+      page(saved, url, undefined, (request) => {
+        if (request.type === "visibility.set") saved = { ...saved, dismissed: !request.visible };
+      });
+    const first = await openPage("https://example.org/");
+    first.shadow.querySelector<HTMLButtonElement>('[aria-label="Close AgentOnWeb"]')!.click();
+    for (const url of ["https://example.org/", "https://example.org/next", "https://example.net/"]) {
+      const next = await openPage(url);
+      expect(next.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(true);
+      expect(next.shadow.querySelector<HTMLElement>(".surface-dock")!.hidden).toBe(false);
+      next.emit("state.update", connected);
+      expect(next.frame.hasAttribute("src")).toBe(false);
+    }
+    const reopened = await openPage("https://example.net/");
+    reopened.emit("surface.show", { ...connected, dismissed: true });
+    expect(reopened.frame.hidden).toBe(false);
+    expect(saved.dismissed).toBe(false);
+    expect(
+      (await openPage("https://example.net/next")).shadow.querySelector<HTMLElement>(".surface-setup")!.hidden,
+    ).toBe(false);
+  });
+
+  it("honors saved dismissal when a broadcast arrives before the initial reply", async () => {
+    const p = await page(idle, undefined, new Promise(() => {}));
+    p.emit("state.update", { ...connected, dismissed: true });
+    expect(p.frame.hasAttribute("src")).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(true);
+    p.emit("surface.toggle", { ...connected, dismissed: true });
+    expect(p.frame.hidden).toBe(false);
+  });
+
+  it("keeps the native workspace opaque when the website styles all divs", async () => {
+    const p = await page({ ...connected, mode: "focus" });
+    const style = p.window.document.createElement("style");
+    style.textContent = "div { opacity: 0.8; }";
+    p.window.document.head.append(style);
+    expect(p.window.getComputedStyle(p.host).opacity).toBe("1");
+  });
+
+  it("does not replace an explicitly opened workspace with a delayed initial snapshot", async () => {
+    let reply!: (response: { ok: boolean; result: SurfaceViewState }) => void;
+    const initialReply = new Promise<{ ok: boolean; result: SurfaceViewState }>((resolve) => {
+      reply = resolve;
+    });
+    const p = await page(idle, undefined, initialReply);
+    expect(p.host.hidden).toBe(true);
+    p.emit("surface.show", connected);
+    const source = p.frame.src;
+    reply({ ok: true, result: idle });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(p.host.hidden).toBe(false);
+    expect(p.frame.src).toBe(source);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(true);
+  });
+
+  it("opens by default with the setup and collapsed lower-right dock", async () => {
+    const p = await page();
+    expect(p.host.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-dock")!.hidden).toBe(false);
+    expect(p.shadow.querySelector('[aria-label="Hide AgentOnWeb"]')).toBeNull();
+    expect(p.frame.hasAttribute("src")).toBe(false);
+    const connectedPage = await page(connected);
+    expect(connectedPage.host.hidden).toBe(false);
+    expect(connectedPage.frame.hidden).toBe(false);
+    expect(new URL(connectedPage.frame.src).hostname).toBe("test-extension");
+    expect(new URLSearchParams(new URL(connectedPage.frame.src).hash.slice(1)).get("url")).toBe(
+      "http://localhost:3080/",
+    );
+  });
+
+  it("does not mount a CSP-inheriting blank document before a workspace is requested", async () => {
+    const p = await page();
+    expect(p.shadow.querySelector("iframe")).toBeNull();
+    p.emit("state.update", connected);
+    expect(p.shadow.querySelector("iframe")!.getAttribute("src")).toMatch(/^chrome-extension:/u);
+  });
+
+  it("waits for the authenticated wrapper before posting presentation state", async () => {
+    const p = await page();
+    const postMessage = vi.fn();
+    Object.defineProperty(p.frame, "contentWindow", {
+      configurable: true,
+      value: { postMessage },
+    });
+    p.emit("state.update", connected);
+    expect(postMessage).not.toHaveBeenCalled();
+    p.frame.dispatchEvent(new p.window.Event("load"));
+    expect(postMessage).not.toHaveBeenCalled();
+    p.ready(p.frame, "https://example.org");
+    p.ready(p.frame, undefined, "wrong");
+    p.ready(p.frame, undefined, undefined, p.window);
+    expect(postMessage).not.toHaveBeenCalled();
+    p.ready();
+    expect(postMessage).toHaveBeenCalledTimes(3);
+  });
+
+  it("does not trust an inherited about:blank load as extension readiness", async () => {
+    const p = await page();
+    const postMessage = vi.fn();
+    Object.defineProperty(p.frame, "contentWindow", { configurable: true, value: { postMessage } });
+    p.emit("state.update", connected);
+    // load can still belong to the initial website-origin document, or an
+    // error document. Neither is proof of the extension wrapper's origin.
+    p.frame.dispatchEvent(new p.window.Event("load"));
+    p.emit("state.update", { ...connected, opacity: 0.7 });
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it("restores presentation delivery after the only runtime disconnects and reconnects", async () => {
+    const state = { ...connected, surfaces: [connected.surface!] };
+    const p = await page(state);
+    p.emit("state.update", {
+      ...idle,
+      connection: "reconnecting",
+      surfaces: [],
+    });
+    expect(p.shadow.querySelector("iframe")).toBeNull();
+    p.emit("state.update", state);
+    const replacement = p.shadow.querySelector<HTMLIFrameElement>("iframe")!;
+    expect(replacement).not.toBe(p.frame);
+    const postMessage = vi.fn();
+    Object.defineProperty(replacement, "contentWindow", {
+      configurable: true,
+      value: { postMessage },
+    });
+    p.emit("state.update", { ...state, mode: "focus", opacity: 0.8 });
+    expect(postMessage).not.toHaveBeenCalled();
+    p.ready(replacement);
+    expect(postMessage.mock.calls.map(([message]) => message)).toEqual([
+      {
+        source: "agentonweb-extension",
+        nonce: "test-nonce",
+        type: "mode.set",
+        mode: "focus",
+      },
+      {
+        source: "agentonweb-extension",
+        nonce: "test-nonce",
+        type: "opacity.set",
+        opacity: 0.8,
+      },
+      { source: "agentonweb-extension", nonce: "test-nonce", type: "mode.shortcuts", modes: ["chill", "focus", "watch"] },
+    ]);
+    p.emit("state.update", { ...state, mode: "chill", opacity: 0.4 });
+    expect(postMessage).toHaveBeenCalledWith(
+      {
+        source: "agentonweb-extension",
+        nonce: "test-nonce",
+        type: "opacity.set",
+        opacity: 0.4,
+      },
+      "chrome-extension://test-extension",
+    );
+  });
+
+  it("hides the complete mounted frame in Watch while retaining its browsing context", async () => {
+    const p = await page(connected);
+    const src = p.frame.src;
+    p.emit("state.update", { ...connected, mode: "watch" });
+    expect(p.frame.hidden).toBe(true);
+    expect(p.frame.src).toBe(src);
+    p.emit("state.update", { ...connected, mode: "focus" });
+    expect(p.frame.hidden).toBe(false);
+    expect(p.frame.src).toBe(src);
+  });
+
+  it("closes only the setup while keeping the dock, and does not reopen during reconnect", async () => {
+    const p = await page();
+    p.shadow.querySelector<HTMLButtonElement>('[aria-label="Close AgentOnWeb"]')!.click();
+    expect(p.host.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(true);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-dock")!.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".agentonweb-root")!.dataset.active).toBe("false");
+    expect(p.window.document.activeElement).toBe(p.websiteControl);
+    p.emit("state.update", { ...idle, connection: "reconnecting" });
+    p.emit("state.update", connected);
+    expect(p.host.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".agentonweb-root")!.dataset.active).toBe("false");
+    expect(p.frame.hasAttribute("src")).toBe(false);
+    expect(p.window.document.activeElement).toBe(p.websiteControl);
+    expect(p.sendMessage.mock.calls.map(([request]) => request.type)).toEqual(["state.get", "visibility.set"]);
+    p.emit("surface.toggle", connected);
+    expect(p.shadow.querySelector<HTMLElement>(".agentonweb-root")!.dataset.active).toBe("true");
+    expect(p.frame.src).toContain("chrome-extension://test-extension/native-surface.html#");
+  });
+
+  it("toolbar hiding preserves a mounted workspace and keeps the dock", async () => {
+    const focused = { ...connected, mode: "focus" as const };
+    const p = await page(focused);
+    const setSource = vi.spyOn(p.frame, "src", "set");
+    const source = p.frame.src;
+    p.emit("surface.toggle");
+    expect(p.host.hidden).toBe(false);
+    expect(p.frame.hidden).toBe(true);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-dock")!.hidden).toBe(false);
+    const styles = p.shadow.querySelector("style")!.textContent!;
+    expect(styles).toMatch(
+      /\.agentonweb-root\[data-active="false"\]\s+\.surface-shell\s*\{[^}]*background:\s*transparent/du,
+    );
+    p.emit("state.update");
+    p.emit("surface.toggle");
+    expect(p.frame.hidden).toBe(false);
+    expect(p.frame.src).toBe(source);
+    expect(p.shadow.querySelector("iframe")).toBe(p.frame);
+    expect(setSource).not.toHaveBeenCalled();
+    expect(p.host.dataset.mode).toBe("focus");
+    expect(p.sendMessage.mock.calls.map(([request]) => request.type)).toEqual([
+      "state.get",
+      "visibility.set",
+      "visibility.set",
+    ]);
+  });
+
+  it("dismisses the setup with Escape without removing the dock or handling website Escape", async () => {
+    const p = await page();
+    p.websiteControl.focus();
+    expect(p.escape(p.websiteControl).defaultPrevented).toBe(false);
+    expect(p.host.hidden).toBe(false);
+    const close = p.shadow.querySelector<HTMLButtonElement>('[aria-label="Close AgentOnWeb"]')!;
+    close.focus();
+    expect(p.escape(close).defaultPrevented).toBe(true);
+    expect(p.host.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(true);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-dock")!.hidden).toBe(false);
+    expect(p.window.document.activeElement).toBe(p.websiteControl);
+  });
+
+  it("shows the setup for every mode while disconnected", async () => {
+    const p = await page();
+    for (const mode of ["Chill", "Focus", "Watch"]) {
+      p.shadow.querySelector<HTMLButtonElement>('[aria-label="Close AgentOnWeb"]')!.click();
+      expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(true);
+      p.shadow.querySelector<HTMLButtonElement>('[aria-label="Expand AgentOnWeb controls"]')!.click();
+      p.shadow.querySelector<HTMLButtonElement>(`[aria-label^="${mode} mode"]`)!.click();
+      expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(false);
+    }
+    expect(p.sendMessage.mock.calls.map(([request]) => request.type)).toEqual([
+      "state.get",
+      "visibility.set",
+      "visibility.set",
+      "mode.set",
+      "visibility.set",
+      "visibility.set",
+      "mode.set",
+      "visibility.set",
+      "visibility.set",
+      "mode.set",
+    ]);
+  });
+
+  it("shows a dismissible setup in Watch and never overlays native authorization pages", async () => {
+    const p = await page({ ...idle, mode: "watch" });
+    expect(p.host.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-setup")!.hidden).toBe(false);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-dock")!.hidden).toBe(false);
+    const native = await page({ ...idle, approvalUrl: "http://localhost:3080/approve" }, "http://localhost:3080/");
+    expect(native.host.hidden).toBe(true);
+    expect(native.window.document.activeElement).toBe(native.websiteControl);
+  });
+
+  it("hides the selected runtime on a discovered unpaired runtime's management origin only", async () => {
+    const state = {
+      ...connected,
+      runtimeId: connected.surface!.runtimeId,
+      nativeOrigins: ["http://localhost:3080", "http://localhost:49827"],
+      runtimes: [
+        { id: connected.surface!.runtimeId, displayName: "Native test" },
+        { id: "terminal", displayName: "Local terminal" },
+      ],
+    };
+    const management = await page(state, "http://localhost:49827/launch?token=private-setup");
+    expect(management.host.hidden).toBe(true);
+    expect(management.frame.hasAttribute("src")).toBe(false);
+    management.emit("surface.show", state);
+    expect(management.host.hidden).toBe(true);
+    expect(management.window.document.activeElement).toBe(management.websiteControl);
+
+    const unrelated = await page(state, "http://localhost:49828/");
+    expect(unrelated.host.hidden).toBe(false);
+    expect(unrelated.frame.hidden).toBe(false);
+
+    const beforeDiscovery = await page(connected, "http://localhost:49827/");
+    expect(beforeDiscovery.host.hidden).toBe(false);
+    beforeDiscovery.emit("state.update", state);
+    expect(beforeDiscovery.host.hidden).toBe(true);
+  });
+
+  it("collapses all controls to an accessible launcher and restores focus on Escape", async () => {
+    const p = await page(connected);
+    const dock = p.shadow.querySelector<HTMLElement>(".surface-dock")!;
+    const toggle = p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!;
+    const palette = p.shadow.querySelector<HTMLElement>(".surface-palette")!;
+    const picker = p.shadow.querySelector<HTMLElement>(".runtime-switch")!;
+    expect(dock.dataset.expanded).toBe("false");
+    expect(palette.inert).toBe(true);
+    expect(picker.inert).toBe(true);
+    toggle.click();
+    expect(palette.inert).toBe(false);
+    const mode = p.shadow.querySelector<HTMLButtonElement>(".surface-mode")!;
+    mode.focus();
+    mode.dispatchEvent(new p.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(dock.dataset.expanded).toBe("false");
+    expect(palette.inert).toBe(true);
+    expect(picker.inert).toBe(true);
+    expect(p.shadow.activeElement).toBe(toggle);
+    toggle.click();
+    const opacity = p.shadow.querySelector<HTMLInputElement>(".surface-opacity input")!;
+    expect(opacity.disabled).toBe(false);
+    p.emit("state.update", { ...connected, mode: "watch" });
+    expect(opacity.disabled).toBe(true);
+    expect(dock.dataset.expanded).toBe("true");
+  });
+
+  it("handles physical platform shortcuts and authenticates iframe shortcuts and outside clicks", async () => {
+    const p = await page({ ...connected, runtimeId: "terminal", runtimes: [
+      { id: "deepseek-harness", displayName: "DSH" }, { id: "terminal", displayName: "Local terminal" },
+    ] });
+    const dock = p.shadow.querySelector<HTMLElement>(".surface-dock")!;
+    const toggle = p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!;
+    toggle.click();
+    p.shadow.querySelector(".surface-mode")!.dispatchEvent(new p.window.Event("pointerdown", { bubbles: true, composed: true }));
+    expect(dock.dataset.expanded).toBe("true");
+    p.websiteControl.dispatchEvent(new p.window.Event("pointerdown", { bubbles: true }));
+    expect(dock.dataset.expanded).toBe("false");
+    const key = new p.window.KeyboardEvent("keydown", { key: "`", code: "Backquote", altKey: true, bubbles: true, cancelable: true });
+    p.websiteControl.dispatchEvent(key);
+    expect(key.defaultPrevented).toBe(true);
+    expect(p.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "runtime.activate", runtimeId: "deepseek-harness" }));
+    p.emit("state.update", { ...connected, runtimeId: "deepseek-harness", runtimes: [
+      { id: "deepseek-harness", displayName: "DSH" }, { id: "terminal", displayName: "Local terminal" },
+    ] });
+    p.sendMessage.mockClear();
+    Object.defineProperty(p.frame, "contentWindow", { configurable: true, value: { postMessage: vi.fn() } });
+    const message = (nonce: string, type: string, action?: string) => p.window.dispatchEvent(new p.window.MessageEvent("message", {
+      source: p.frame.contentWindow, origin: "chrome-extension://test-extension",
+      data: { source: "agentonweb-surface", nonce, type, action },
+    }));
+    message("wrong", "surface.shortcut", "runtime.toggle");
+    expect(p.sendMessage).not.toHaveBeenCalled();
+    message("test-nonce", "surface.shortcut", "runtime.toggle");
+    expect(p.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "runtime.activate", runtimeId: "terminal" }));
+    toggle.click();
+    message("wrong", "surface.pointerdown");
+    expect(dock.dataset.expanded).toBe("true");
+    message("test-nonce", "surface.pointerdown");
+    expect(dock.dataset.expanded).toBe("false");
+  });
+
+  it("switches modes from macOS page keys when browser commands are not dispatched", async () => {
+    const p = await page({ ...connected, dismissed: true }, undefined, undefined, undefined, { platform: "MacIntel" });
+    p.sendMessage.mockClear();
+    for (const [code, mode] of [["Digit1", "chill"], ["Digit2", "focus"], ["Digit3", "watch"]] as const) {
+      const event = new p.window.KeyboardEvent("keydown", { code, ctrlKey: true, bubbles: true, cancelable: true });
+      p.websiteControl.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+      expect(p.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "mode.shortcut", mode }));
+    }
+    expect(p.sendMessage.mock.calls.filter(([request]) => request.type === "mode.shortcut")).toHaveLength(3);
+    p.emit("surface.show", { ...connected, mode: "watch" });
+    expect(p.host.dataset.mode).toBe("watch");
+    expect(p.shadow.querySelector<HTMLElement>(".agentonweb-root")!.dataset.active).toBe("true");
+  });
+
+  it("forwards authenticated terminal mode keys through the deduplicated shortcut path and refreshes its policy", async () => {
+    const bindings = [
+      { name: "mode-chill", shortcut: "Ctrl+1" },
+      { name: "mode-focus", shortcut: "Ctrl+Shift+2" },
+      { name: "mode-watch", shortcut: "Ctrl+3" },
+    ];
+    const p = await page(connected, undefined, undefined, undefined, { platform: "MacIntel", modeShortcuts: bindings });
+    const native = { postMessage: vi.fn() };
+    Object.defineProperty(p.frame, "contentWindow", { configurable: true, value: native });
+    p.ready();
+    expect(native.postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "mode.shortcuts", modes: ["chill", "watch"] }), "chrome-extension://test-extension");
+    const key = (action: string, nonce = "test-nonce", origin = "chrome-extension://test-extension", sender: unknown = native) =>
+      p.window.dispatchEvent(new p.window.MessageEvent("message", { source: sender as Window, origin,
+        data: { source: "agentonweb-surface", type: "surface.shortcut", nonce, action } }));
+    p.sendMessage.mockClear();
+    key("watch", "wrong");
+    key("watch", undefined, "https://attacker.example");
+    key("watch", undefined, undefined, p.window);
+    key("focus");
+    expect(p.sendMessage).not.toHaveBeenCalled();
+    key("chill");
+    key("watch");
+    expect(p.sendMessage.mock.calls.map(([request]) => request)).toEqual([
+      { source: "agentonweb-content", type: "mode.shortcut", mode: "chill" },
+      { source: "agentonweb-content", type: "mode.shortcut", mode: "watch" },
+    ]);
+    let refresh!: (value: { ok: boolean; result: typeof bindings }) => void;
+    p.sendMessage.mockImplementationOnce(() => new Promise(resolve => { refresh = resolve; }));
+    bindings[2]!.shortcut = "";
+    p.window.dispatchEvent(new p.window.MessageEvent("message", { source: native as any, origin: "chrome-extension://test-extension",
+      data: { source: "agentonweb-surface", type: "surface.focused", nonce: "test-nonce" } }));
+    p.sendMessage.mockClear();
+    key("chill");
+    expect(p.sendMessage).toHaveBeenCalledWith({ source: "agentonweb-content", type: "mode.shortcut", mode: "chill" });
+    refresh({ ok: true, result: bindings });
+    await Promise.resolve();
+    expect(native.postMessage).toHaveBeenLastCalledWith(expect.objectContaining({ type: "mode.shortcuts", modes: ["chill"] }), "chrome-extension://test-extension");
+    p.sendMessage.mockClear();
+    key("watch");
+    expect(p.sendMessage).not.toHaveBeenCalled();
+    p.emit("state.update", { ...connected, mode: "watch" });
+    key("chill");
+    expect(p.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("focuses the terminal only for explicit Focus, preserves Chill focus, and restores the last website control in Watch", async () => {
+    const p = await page(connected);
+    const postMessage = vi.fn();
+    Object.defineProperty(p.frame, "contentWindow", { configurable: true, value: { postMessage } });
+    p.ready();
+    const field = p.window.document.createElement("input");
+    p.window.document.body.append(field);
+    field.focus();
+    p.emit("state.update", { ...connected, mode: "focus" });
+    expect(p.window.document.activeElement).toBe(field);
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "surface.focus" }), expect.anything());
+    p.emit("surface.show", { ...connected, mode: "focus" });
+    expect(p.shadow.activeElement).toBe(p.frame);
+    expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "surface.focus" }), "chrome-extension://test-extension");
+    postMessage.mockClear();
+    p.emit("surface.show", connected);
+    expect(p.shadow.activeElement).toBe(p.frame);
+    p.emit("state.update", connected);
+    expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ type: "surface.focus" }), expect.anything());
+    p.emit("state.update", { ...connected, mode: "watch" });
+    p.emit("surface.show", { ...connected, mode: "watch" });
+    expect(p.window.document.activeElement).toBe(field);
+    // Chromium may focus the intermediate extension frame asynchronously when
+    // it finishes hiding the native out-of-process child.
+    p.frame.focus();
+    p.window.dispatchEvent(new p.window.MessageEvent("message", { source: p.frame.contentWindow,
+      origin: "chrome-extension://test-extension",
+      data: { source: "agentonweb-surface", type: "surface.focused", nonce: "test-nonce" } }));
+    expect(p.window.document.activeElement).toBe(field);
+    p.emit("surface.show", connected);
+    expect(p.window.document.activeElement).toBe(field);
+    p.emit("surface.show", { ...connected, mode: "focus" });
+    expect(p.shadow.activeElement).toBe(p.frame);
+    field.remove();
+    p.emit("surface.show", { ...connected, mode: "watch" });
+    expect(p.window.document.activeElement).toBe(p.window.document.body);
+  });
+
+  it("delivers a Focus request after wrapper readiness without replaying it on later state updates", async () => {
+    const p = await page(connected);
+    const postMessage = vi.fn();
+    Object.defineProperty(p.frame, "contentWindow", { configurable: true, value: { postMessage } });
+    p.emit("surface.show", { ...connected, mode: "focus" });
+    expect(postMessage).not.toHaveBeenCalled();
+    p.ready();
+    expect(postMessage.mock.calls.filter(([message]) => message.type === "surface.focus")).toHaveLength(1);
+    p.emit("state.update", { ...connected, mode: "focus" });
+    expect(postMessage.mock.calls.filter(([message]) => message.type === "surface.focus")).toHaveLength(1);
+  });
+
+  it("leaves editable website shortcuts and inactive runtime shortcuts alone", async () => {
+    const state = { ...connected, runtimeId: "terminal", runtimes: [
+      { id: "terminal", displayName: "Terminal" }, { id: "deepseek-harness", displayName: "DSH" },
+    ] };
+    const p = await page(state);
+    const key = (code: string, target: Element = p.websiteControl) => {
+      const event = new p.window.KeyboardEvent("keydown", { code, altKey: true, bubbles: true, composed: true, cancelable: true });
+      target.dispatchEvent(event);
+      return event;
+    };
+    p.sendMessage.mockClear();
+    const input = p.window.document.createElement("textarea");
+    p.window.document.body.append(input);
+    for (const code of ["Digit1", "Digit2", "Digit3"]) expect(key(code, input).defaultPrevented).toBe(false);
+    expect(key("Backquote", input).defaultPrevented).toBe(false);
+    p.emit("state.update", { ...state, mode: "watch" });
+    expect(key("Backquote").defaultPrevented).toBe(false);
+    Object.defineProperty(p.frame, "contentWindow", { configurable: true, value: { postMessage: vi.fn() } });
+    p.window.dispatchEvent(new p.window.MessageEvent("message", {
+      source: p.frame.contentWindow, origin: "chrome-extension://test-extension",
+      data: { source: "agentonweb-surface", nonce: "test-nonce", type: "surface.shortcut", action: "runtime.toggle" },
+    }));
+    expect(p.sendMessage).not.toHaveBeenCalled();
+    p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!.click();
+    expect(key("Backquote").defaultPrevented).toBe(true);
+    expect(p.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "runtime.activate", runtimeId: "deepseek-harness" }));
+  });
+
+  it("can reopen a dismissed, unconnected workspace with a mode key while runtime switching stays inactive", async () => {
+    const p = await page({ ...idle, dismissed: true });
+    p.sendMessage.mockClear();
+    for (const code of ["Digit1", "Digit2", "Digit3"]) {
+      const event = new p.window.KeyboardEvent("keydown", { code, altKey: true, bubbles: true, cancelable: true });
+      p.websiteControl.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(true);
+    }
+    expect(p.sendMessage.mock.calls.filter(([request]) => request.type === "mode.shortcut")).toHaveLength(3);
+    p.sendMessage.mockClear();
+    const event = new p.window.KeyboardEvent("keydown", { code: "Backquote", altKey: true, bubbles: true, cancelable: true });
+    p.websiteControl.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(p.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("honors remapped/cleared mode bindings and refreshes them after shortcut settings", async () => {
+    const bindings = [
+      { name: "mode-chill", shortcut: "" },
+      { name: "mode-focus", shortcut: "Ctrl+Shift+2" },
+      { name: "mode-watch", shortcut: "Ctrl+3" },
+    ];
+    const p = await page(connected, undefined, undefined, undefined, { platform: "MacIntel", modeShortcuts: bindings });
+    const press = (code: string, fields: KeyboardEventInit = {}) => {
+      const event = new p.window.KeyboardEvent("keydown", { code, ctrlKey: true, bubbles: true, cancelable: true, ...fields });
+      p.websiteControl.dispatchEvent(event);
+      return event;
+    };
+    p.sendMessage.mockClear();
+    expect(press("Digit1").defaultPrevented).toBe(false);
+    expect(press("Digit2").defaultPrevented).toBe(false);
+    expect(press("Digit3", { shiftKey: true }).defaultPrevented).toBe(false);
+    expect(press("Digit3", { isComposing: true }).defaultPrevented).toBe(false);
+    expect(p.sendMessage).not.toHaveBeenCalled();
+    expect(press("Digit3", { repeat: true }).defaultPrevented).toBe(true);
+    expect(p.sendMessage).not.toHaveBeenCalled();
+    expect(press("Digit3").defaultPrevented).toBe(true);
+    expect(p.sendMessage).toHaveBeenCalledExactlyOnceWith({ source: "agentonweb-content", type: "mode.shortcut", mode: "watch" });
+    p.sendMessage.mockClear();
+    bindings[2]!.shortcut = "";
+    p.window.dispatchEvent(new p.window.Event("focus"));
+    await Promise.resolve();
+    p.sendMessage.mockClear();
+    expect(press("Digit3").defaultPrevented).toBe(false);
+    expect(p.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not overwrite a refreshed shortcut binding with a delayed initial snapshot", async () => {
+    let reply!: (value: { ok: boolean; result: SurfaceViewState; modeShortcuts: ModeShortcutBinding[] }) => void;
+    const initialReply = new Promise<{ ok: boolean; result: SurfaceViewState; modeShortcuts: ModeShortcutBinding[] }>(resolve => { reply = resolve; });
+    const p = await page(connected, undefined, initialReply);
+    p.emit("state.update", connected);
+    p.window.dispatchEvent(new p.window.Event("focus"));
+    await Promise.resolve();
+    reply({ ok: true, result: connected, modeShortcuts: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+    p.sendMessage.mockClear();
+    const event = new p.window.KeyboardEvent("keydown", { code: "Digit2", altKey: true, bubbles: true, cancelable: true });
+    p.websiteControl.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(p.sendMessage).toHaveBeenCalledExactlyOnceWith({ source: "agentonweb-content", type: "mode.shortcut", mode: "focus" });
+  });
+
+  it("collapses runtime choices and keeps the current trigger stable across updates", async () => {
+    const state = {
+      ...connected,
+      runtimeId: "terminal",
+      runtimes: [
+        { id: "terminal", displayName: "Local terminal" },
+        { id: "deepseek-harness", displayName: "DeepSeek Harness" },
+      ],
+    };
+    const p = await page(state);
+    const trigger = p.shadow.querySelector<HTMLButtonElement>(".runtime-current")!;
+    const options = p.shadow.querySelector<HTMLElement>(".runtime-options")!;
+    expect(trigger.querySelector(".runtime-name")!.textContent).toBe("Local terminal");
+    expect(options.hidden).toBe(true);
+    p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!.click();
+    trigger.click();
+    expect(options.hidden).toBe(false);
+    options.querySelectorAll<HTMLButtonElement>("button")[1]!.click();
+    expect(options.hidden).toBe(true);
+    expect(p.shadow.querySelector<HTMLElement>(".surface-dock")!.dataset.view).toBe("controls");
+    expect(p.shadow.querySelector<HTMLElement>(".surface-dock")!.dataset.expanded).toBe("true");
+    expect(p.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "runtime.activate", runtimeId: "deepseek-harness" }));
+    // Don't claim activation until the background confirms it.
+    expect(trigger.querySelector(".runtime-name")!.textContent).toBe("Local terminal");
+    p.emit("state.update", { ...state, runtimeId: "deepseek-harness" });
+    expect(p.shadow.querySelector(".runtime-current")).toBe(trigger);
+    expect(trigger.querySelector(".runtime-name")!.textContent).toBe("DeepSeek Harness");
+    expect(options.hidden).toBe(true);
+    trigger.click();
+    p.emit("state.update", { ...state, runtimeId: "deepseek-harness" });
+    expect(options.hidden).toBe(false);
+    trigger.dispatchEvent(new p.window.KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    expect(options.hidden).toBe(true);
+  });
+
+  it("preserves the focused runtime option when unread output or names change", async () => {
+    const state = {
+      ...connected, mode: "watch" as const, runtimeId: connected.surface!.runtimeId,
+      runtimes: [
+        { id: connected.surface!.runtimeId, displayName: "Native test" },
+        { id: "deepseek-harness", displayName: "DeepSeek Harness" },
+      ],
+    };
+    const p = await page(state);
+    p.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!.click();
+    p.shadow.querySelector<HTMLButtonElement>(".runtime-current")!.click();
+    const options = p.shadow.querySelector<HTMLElement>(".runtime-options")!;
+    const option = options.querySelectorAll<HTMLButtonElement>("button")[1]!;
+    option.focus();
+    expect(p.shadow.activeElement).toBe(option);
+    p.window.dispatchEvent(new p.window.MessageEvent("message", {
+      data: { source: "agentonweb-surface", type: "surface.output", nonce: "test-nonce" },
+      origin: "chrome-extension://test-extension", source: p.frame.contentWindow,
+    }));
+    expect(options.querySelector("button")!.getAttribute("aria-label")).toBe("Native test, new output");
+    expect(options.querySelectorAll("button")[1]).toBe(option);
+    expect(p.shadow.activeElement).toBe(option);
+    expect(options.hidden).toBe(false);
+    p.emit("state.update", {
+      ...state, runtimes: [state.runtimes[0]!, { ...state.runtimes[1]!, displayName: "DSH renamed", newOutput: true }],
+    });
+    expect(options.querySelectorAll("button")[1]).toBe(option);
+    expect(p.shadow.activeElement).toBe(option);
+    expect(options.hidden).toBe(false);
+    expect(option.textContent).toContain("DSH renamed");
+    option.click();
+    expect(p.sendMessage).toHaveBeenCalledWith(expect.objectContaining({ type: "runtime.activate", runtimeId: "deepseek-harness" }));
+  });
+
+  it("retains each native iframe and its browsing context across runtime switches", async () => {
+    const one = connected.surface!;
+    const two = {
+      ...one,
+      runtimeId: "terminal",
+      displayName: "Local terminal",
+      url: "http://localhost:9000/",
+      frameName: "agentonweb:terminal-nonce",
+    };
+    const initial = {
+      ...connected,
+      runtimeId: one.runtimeId,
+      surfaces: [one, two],
+    };
+    const p = await page(initial);
+    const first = p.frame;
+    const source = first.src;
+    p.emit("state.update", {
+      ...initial,
+      runtimeId: two.runtimeId,
+      surface: two,
+    });
+    expect(first.hidden).toBe(true);
+    expect(first.src).toBe(source);
+    expect(p.shadow.querySelectorAll("iframe")).toHaveLength(2);
+    p.emit("state.update", initial);
+    expect(first.hidden).toBe(false);
+    expect(first.src).toBe(source);
+    expect(p.shadow.querySelectorAll("iframe")).toHaveLength(2);
+  });
+
+  it("shows only authenticated output notices in Watch and clears them when reopened", async () => {
+    const surface = connected.surface!;
+    const state = {
+      ...connected,
+      runtimeId: surface.runtimeId,
+      runtimes: [{ id: surface.runtimeId, displayName: surface.displayName }],
+    };
+    const p = await page(state);
+    p.emit("state.update", { ...state, mode: "watch" });
+    const sendNotice = (nonce: string, origin = "chrome-extension://test-extension") => {
+      p.window.dispatchEvent(
+        new p.window.MessageEvent("message", {
+          data: { source: "agentonweb-surface", type: "surface.output", nonce },
+          origin,
+          source: p.frame.contentWindow,
+        }),
+      );
+    };
+    sendNotice("wrong");
+    sendNotice("test-nonce", "https://attacker.example");
+    expect(p.shadow.querySelector('[aria-label="Native test, new output"]')).toBeNull();
+    sendNotice("test-nonce");
+    expect(p.shadow.querySelector('[aria-label="Native test, new output"]')).not.toBeNull();
+    p.emit("state.update", state);
+    expect(p.shadow.querySelector('[aria-label="Native test, new output"]')).toBeNull();
+  });
+});
+
+it("opens the session list from the page icon and buffers an exact terminal jump until wrapper readiness", async () => {
+  const session = { id: "a:codex", runtimeId: "native-test", terminalId: "a", agent: "Codex", status: "running" as const,
+    title: "Fix login", detail: "/project", attentionId: "", updatedAt: 1 };
+  const state = { ...connected, runtimeId: "native-test", agentSessions: [session] };
+  const ui = await page(state);
+  ui.shadow.querySelector<HTMLButtonElement>(".surface-toggle")!.click();
+  expect(ui.shadow.querySelector<HTMLElement>(".surface-dock")!.dataset.view).toBe("sessions");
+  ui.shadow.querySelector<HTMLButtonElement>(".agent-session")!.click();
+  expect(ui.sendMessage).toHaveBeenCalledWith({ source: "agentonweb-content", type: "runtime.activate", runtimeId: "native-test" });
+  const frame = ui.shadow.querySelector<HTMLIFrameElement>("iframe")!;
+  const post = vi.fn();
+  Object.defineProperty(frame, "contentWindow", { configurable: true, value: { postMessage: post } });
+  ui.ready(frame);
+  expect(post).toHaveBeenCalledWith(expect.objectContaining({ type: "terminal.activate", terminalId: "a", requestId: expect.any(String) }), "chrome-extension://test-extension");
+});
+
+it("notifies approval and completion once and does not render session text as markup", async () => {
+  const session = { id: "a:codex", runtimeId: "native-test", terminalId: "a", agent: "Codex", status: "running" as const,
+    title: "<img src=x onerror=alert(1)>", detail: "/project", attentionId: "", updatedAt: 1 };
+  const ui = await page({ ...connected, agentSessions: [session] });
+  const approval = { ...connected, agentSessions: [{ ...session, status: "approval" as const, attentionId: "approval-1" }] };
+  ui.emit("state.update", approval);
+  const toast = ui.shadow.querySelector<HTMLElement>(".agent-notification")!;
+  expect(toast.hidden).toBe(false);
+  expect(toast.textContent).toContain("Needs approval");
+  expect(toast.querySelector("img")).toBeNull();
+  toast.querySelector<HTMLButtonElement>('[aria-label="Dismiss notification"]')!.click();
+  ui.emit("state.update", approval);
+  expect(toast.hidden).toBe(true);
+  const complete = { ...connected, agentSessions: [{ ...session, status: "completed" as const, attentionId: "complete-1" }] };
+  ui.emit("state.update", complete);
+  expect(toast.hidden).toBe(false);
+  expect(toast.textContent).toContain("Completed");
+  ui.emit("state.update", { ...connected, agentSessions: [] });
+  expect(toast.hidden).toBe(true);
+});

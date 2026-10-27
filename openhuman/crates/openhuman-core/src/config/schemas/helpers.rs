@@ -1,0 +1,313 @@
+use serde::de::{DeserializeOwned, Deserializer};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+
+use crate::core::Outcome;
+use crate::core::{FieldSchema, TypeSchema};
+
+pub(super) const DEFAULT_ONBOARDING_FLAG_NAME: &str = ".skip_onboarding";
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelRouteUpdate {
+    pub(super) hint: String,
+    pub(super) model: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct CloudProviderUpdate {
+    /// Opaque stable id. Empty / missing → server generates a new id.
+    pub(super) id: Option<String>,
+    /// Routing slug, e.g. "openai", "my-deepseek". Must be unique per config.
+    pub(super) slug: String,
+    /// Human-readable label.
+    #[serde(default)]
+    pub(super) label: Option<String>,
+    pub(super) endpoint: String,
+    /// Auth style: "bearer" | "anthropic" | "openhuman_jwt" | "none".
+    #[serde(default)]
+    pub(super) auth_style: Option<String>,
+    /// Optional PEM CA bundle for this provider. Empty string removes it.
+    #[serde(default)]
+    pub(super) ca_cert_pem: Option<String>,
+    /// Legacy field — tolerated on read for back-compat but not required.
+    // keep until v0.66 (review after 2027-01-11): incoming RPC discriminator
+    // remains accepted until shipped-client parameter coverage exists.
+    #[serde(rename = "type", default)]
+    pub(super) legacy_type: Option<String>,
+    /// Legacy field — tolerated on read.
+    #[serde(default)]
+    pub(super) default_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ModelSettingsUpdate {
+    /// OpenHuman product backend URL. Used for auth, billing, voice, and
+    /// every non-inference HTTP call. Almost always left blank so it
+    /// defaults to the canonical hosted backend.
+    pub(super) api_url: Option<String>,
+    /// Custom OpenAI-compatible LLM endpoint. When set together with
+    /// `api_key`, inference talks directly to this URL instead of routing
+    /// through the OpenHuman backend. Send an empty string to clear.
+    pub(super) inference_url: Option<String>,
+    /// Optional API key for OpenAI-compatible backends. Stored verbatim in
+    /// `config.toml` on the user's machine — see #1342 (local-first / pluggable
+    /// backends). The key is never echoed back over RPC; `get_client_config`
+    /// only reports `api_key_set: bool`.
+    pub(super) api_key: Option<String>,
+    pub(super) default_model: Option<String>,
+    pub(super) default_temperature: Option<f64>,
+    /// When present, REPLACES `config.model_routes` wholesale with these
+    /// `(hint, model)` pairs. Send `Some([])` to clear all routes (used when
+    /// the user switches back to the OpenHuman backend whose built-in router
+    /// picks per-task models on its own). Omit to leave existing routes
+    /// untouched.
+    pub(super) model_routes: Option<Vec<ModelRouteUpdate>>,
+    /// When present, REPLACES `config.cloud_providers` wholesale. The keys
+    /// themselves live in `auth-profiles.json` via
+    /// `cloud_provider_set_key` — they are NOT carried here.
+    pub(super) cloud_providers: Option<Vec<CloudProviderUpdate>>,
+    pub(super) primary_cloud: Option<String>,
+    pub(super) chat_provider: Option<String>,
+    pub(super) reasoning_provider: Option<String>,
+    pub(super) agentic_provider: Option<String>,
+    pub(super) coding_provider: Option<String>,
+    pub(super) vision_provider: Option<String>,
+    pub(super) memory_provider: Option<String>,
+    pub(super) embeddings_provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct MemorySettingsUpdate {
+    pub(super) embedding_provider: Option<String>,
+    pub(super) embedding_model: Option<String>,
+    pub(super) embedding_dimensions: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RuntimeSettingsUpdate {
+    pub(super) kind: Option<String>,
+    pub(super) reasoning_enabled: Option<bool>,
+    pub(super) reasoning_effort: Option<String>,
+    pub(super) reasoning_effort_model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct BrowserSettingsUpdate {
+    pub(super) enabled: Option<bool>,
+    pub(super) backend: Option<String>,
+    pub(super) headless: Option<bool>,
+    pub(super) viewport_width: Option<u32>,
+    pub(super) viewport_height: Option<u32>,
+    pub(super) chrome_path: Option<String>,
+    pub(super) profile_mode: Option<String>,
+    pub(super) profile_path: Option<String>,
+    pub(super) download_dir: Option<String>,
+    pub(super) max_task_steps: Option<usize>,
+    pub(super) task_timeout_secs: Option<u64>,
+    pub(super) learn_from_tasks: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ComputerSettingsUpdate {
+    pub(super) decision_model: Option<String>,
+    pub(super) sage_fast: Option<bool>,
+    pub(super) planner_model: Option<String>,
+    pub(super) rescue_model: Option<String>,
+    pub(super) max_rescues: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AnalyticsSettingsUpdate {
+    pub(super) enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct UserTimezoneUpdate {
+    #[serde(default)]
+    pub(super) timezone: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct LocalAiSettingsUpdate {
+    pub(super) runtime_enabled: Option<bool>,
+    /// MVP opt-in marker. Tied to `runtime_enabled` from the unified AI
+    /// panel toggle (both flip on enable, both flip off on disable) so
+    /// the user gets local AI working with a single click instead of
+    /// having to also apply a tier preset.
+    pub(super) opt_in_confirmed: Option<bool>,
+    pub(super) provider: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_json")]
+    pub(super) base_url: Option<Value>,
+    pub(super) model_id: Option<String>,
+    pub(super) chat_model_id: Option<String>,
+    pub(super) usage_embeddings: Option<bool>,
+    pub(super) api_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct SetBrowserAllowAllParams {
+    pub(super) enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceOnboardingFlagParams {
+    pub(super) flag_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct WorkspaceOnboardingFlagSetParams {
+    pub(super) flag_name: Option<String>,
+    pub(super) value: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct OnboardingCompletedSetParams {
+    pub(super) value: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ComposioTriggerSettingsUpdate {
+    pub(super) triage_disabled: Option<bool>,
+    pub(super) triage_disabled_toolkits: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AutonomySettingsUpdate {
+    /// Master switch for the whole autonomy policy. Defaults to `false`
+    /// (`AutonomyConfig::enabled`): with it off, classification, the approval
+    /// gate, the allowlist, the action budget and containment are all inert,
+    /// and every other field in this patch has no effect until it is `true`.
+    /// `is_always_forbidden` applies either way.
+    pub(super) enabled: Option<bool>,
+    /// `"readonly" | "supervised" | "full"` (case-insensitive).
+    pub(super) level: Option<String>,
+    pub(super) workspace_only: Option<bool>,
+    /// Replaces the shell command allow-list wholesale.
+    pub(super) allowed_commands: Option<Vec<String>>,
+    /// Replaces the forbidden-paths denylist wholesale.
+    pub(super) forbidden_paths: Option<Vec<String>>,
+    /// Replaces the trusted-roots allow-list wholesale. Each entry is
+    /// `{ "path": "/abs/dir", "access": "read" | "readwrite" }`.
+    pub(super) trusted_roots: Option<Vec<crate::security::TrustedRoot>>,
+    pub(super) allow_tool_install: Option<bool>,
+    pub(super) max_actions_per_hour: Option<u32>,
+    /// Replaces the "Always allow" allowlist wholesale — tool names the agent
+    /// may run without an approval prompt. Empty list clears it.
+    pub(super) auto_approve: Option<Vec<String>>,
+    /// Blanket "auto-approve everything" bypass. `Unknown` origins are still
+    /// denied by the gate regardless of this setting.
+    pub(super) auto_approve_all: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct PrivacyModeUpdate {
+    /// `"local_only" | "standard" | "sensitive"` (case-insensitive).
+    pub(super) mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AgentSettingsUpdate {
+    /// Tool/action wall-clock timeout in seconds (1–3600). Validated server-side.
+    pub(super) agent_timeout_secs: Option<u64>,
+    /// Agent id the web-chat path routes turns to. Empty string clears the
+    /// override (back to the orchestrator); omitted leaves it unchanged.
+    #[serde(default)]
+    pub(super) chat_agent_id: Option<String>,
+    /// `auto | native | xml | pformat | python | typescript`. Validated
+    /// server-side; omitted leaves it unchanged.
+    #[serde(default)]
+    pub(super) tool_dispatcher: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AgentPathsUpdate {
+    /// New absolute action sandbox path. Empty string clears the override;
+    /// omitted leaves it unchanged. Validated server-side.
+    pub(super) action_dir: Option<String>,
+    /// New absolute folder for agent deliverables (#5505). Empty string
+    /// clears the override; omitted leaves it unchanged.
+    #[serde(default)]
+    pub(super) files_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct SandboxSettingsUpdate {
+    pub(super) backend: Option<String>,
+    pub(super) enabled: Option<bool>,
+    pub(super) docker_image: Option<String>,
+    pub(super) docker_memory_limit_mb: Option<u64>,
+    pub(super) docker_cpu_limit: Option<f64>,
+    pub(super) env_passthrough: Option<Vec<String>>,
+}
+
+pub(super) fn deserialize_params<T: DeserializeOwned>(
+    params: Map<String, Value>,
+) -> Result<T, String> {
+    serde_json::from_value(Value::Object(params)).map_err(|e| format!("invalid params: {e}"))
+}
+
+pub(super) fn deserialize_present_json<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
+pub fn optional_string(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Option(Box::new(TypeSchema::String)),
+        comment,
+        required: false,
+    }
+}
+
+pub fn optional_json(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Option(Box::new(TypeSchema::Json)),
+        comment,
+        required: false,
+    }
+}
+
+pub fn required_string(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::String,
+        comment,
+        required: true,
+    }
+}
+
+pub fn optional_bool(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Option(Box::new(TypeSchema::Bool)),
+        comment,
+        required: false,
+    }
+}
+
+pub fn optional_number(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Option(Box::new(TypeSchema::U64)),
+        comment,
+        required: false,
+    }
+}
+
+pub fn json_output(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Json,
+        comment,
+        required: true,
+    }
+}
+
+pub(super) fn to_json<T: serde::Serialize>(outcome: Outcome<T>) -> Result<Value, String> {
+    outcome.into_cli_compatible_json()
+}

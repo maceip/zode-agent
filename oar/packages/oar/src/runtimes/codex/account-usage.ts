@@ -1,0 +1,269 @@
+import type { SessionOptions } from "../../contracts/session-options.js";
+import type {
+  AccountUsageUnsupportedReason,
+  AccountUsageReauthReason,
+  AccountUsageReader,
+  AccountUsageSnapshot,
+  AccountUsageWindow,
+} from "../../contracts/account-usage.js";
+import { startAppServerClient, type AppServerClient } from "./app-server-client.js";
+import { asEpochInstant, asNumber, asRecord } from "../../shared/json.js";
+
+type ReadOutcome =
+  | { readonly kind: "ok"; readonly result: unknown; readonly email: string | undefined }
+  | { readonly kind: "reauth_required"; readonly reason: AccountUsageReauthReason }
+  | { readonly kind: "unsupported"; readonly reason: AccountUsageUnsupportedReason }
+  | { readonly kind: "error" };
+
+type StartAppServerClient = (command: string, env?: SessionOptions["env"]) => AppServerClient;
+
+function text(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 && trimmed.length <= 80 ? trimmed : undefined;
+}
+
+function windowLabel(value: unknown): string {
+  const minutes = asNumber(value);
+  if (minutes === null || minutes <= 0) {
+    return "Usage limit";
+  }
+  if (minutes % (7 * 24 * 60) === 0) {
+    const weeks = minutes / (7 * 24 * 60);
+    return `${weeks} ${weeks === 1 ? "week" : "weeks"}`;
+  }
+  if (minutes % (24 * 60) === 0) {
+    const days = minutes / (24 * 60);
+    return `${days} ${days === 1 ? "day" : "days"}`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return `${hours} ${hours === 1 ? "hour" : "hours"}`;
+  }
+  return `${minutes} minutes`;
+}
+
+function limitLabel(bucket: Record<string, unknown>): string | undefined {
+  const name = text(bucket.limitName);
+  if (name !== undefined) {
+    return name;
+  }
+  const id = text(bucket.limitId);
+  return id === "codex" ? "Codex" : id;
+}
+
+/**
+ * Mirrors Codex TUI's `app_server_rate_limit_snapshots` merge and deduplication.
+ * Source (2026-08-22):
+ * https://github.com/openai/codex/blob/4f39251a010a8bd7d692d25fb33832ff06f1635a/codex-rs/tui/src/app_server_session.rs#L2084-L2103
+ */
+function rateLimitBuckets(
+  historical: Record<string, unknown> | null,
+  indexed: Record<string, unknown> | null,
+): Record<string, unknown>[] {
+  const primaryLimitId = text(historical?.limitId);
+  const buckets = historical === null ? [] : [historical];
+  if (indexed === null) {
+    return buckets;
+  }
+  for (const [limitId, value] of Object.entries(indexed)) {
+    const bucket = asRecord(value);
+    if (bucket === null) {
+      continue;
+    }
+    if (primaryLimitId !== undefined
+      && (primaryLimitId === limitId || primaryLimitId === text(bucket.limitId))) {
+      continue;
+    }
+    buckets.push(bucket);
+  }
+  return buckets;
+}
+
+/**
+ * Native evidence comes from `codex app-server --listen stdio://`, followed by
+ * `initialize` and `account/rateLimits/read`. `rateLimits` is the
+ * backward-compatible single-bucket view; `rateLimitsByLimitId` is the
+ * optional multi-bucket view. A representative response is:
+ *
+ * ```json
+ * {
+ *   "rateLimits": {
+ *     "limitId": "codex",
+ *     "limitName": null,
+ *     "primary": { "usedPercent": 50, "windowDurationMins": 10080, "resetsAt": 1787820410 },
+ *     "secondary": null,
+ *     "planType": "pro",
+ *     "rateLimitReachedType": null
+ *   },
+ *   "rateLimitsByLimitId": {
+ *     "codex_bengalfox": {
+ *       "limitId": "codex_bengalfox",
+ *       "limitName": "GPT-5.3-Codex-Spark",
+ *       "primary": { "usedPercent": 0, "windowDurationMins": 300, "resetsAt": 1787322278 },
+ *       "secondary": { "usedPercent": 0, "windowDurationMins": 10080, "resetsAt": 1787909078 },
+ *       "planType": "pro"
+ *     },
+ *     "codex": {
+ *       "limitId": "codex",
+ *       "limitName": null,
+ *       "primary": { "usedPercent": 50, "windowDurationMins": 10080, "resetsAt": 1787820410 },
+ *       "secondary": null,
+ *       "planType": "pro",
+ *       "rateLimitReachedType": null
+ *     }
+ *   }
+ * }
+ * ```
+ */
+export function projectCodexUsage(result: unknown, email?: string): AccountUsageSnapshot {
+  const root = asRecord(result);
+  const historical = asRecord(root?.rateLimits);
+  const indexed = asRecord(root?.rateLimitsByLimitId);
+  const buckets = rateLimitBuckets(historical, indexed);
+  const windows: AccountUsageWindow[] = [];
+  let rateLimited = false;
+  let plan: string | undefined = undefined;
+
+  for (const bucket of buckets) {
+    const sourceLabel = limitLabel(bucket);
+    plan ??= text(bucket.planType);
+    rateLimited ||= bucket.rateLimitReachedType !== null
+      && bucket.rateLimitReachedType !== undefined;
+
+    for (const kind of ["primary", "secondary"] as const) {
+      const candidate = asRecord(bucket[kind]);
+      if (candidate === null) {
+        continue;
+      }
+      const usedPercent = asNumber(candidate.usedPercent);
+      if (usedPercent === null || usedPercent < 0 || usedPercent > 100) {
+        continue;
+      }
+      const resetsAt = asEpochInstant(candidate.resetsAt);
+      const durationLabel = windowLabel(candidate.windowDurationMins);
+      const minutes = asNumber(candidate.windowDurationMins);
+      const limitId = text(bucket.limitId);
+      windows.push({
+        label: sourceLabel === undefined ? durationLabel : `${sourceLabel} · ${durationLabel}`,
+        usedRatio: Number((usedPercent / 100).toFixed(6)),
+        ...(resetsAt === null ? {} : { resetsAt }),
+        ...(limitId === undefined ? {} : { id: `${limitId}:${kind}` }),
+        ...(minutes === null || minutes <= 0 ? {} : { durationMs: minutes * 60_000 }),
+      });
+      rateLimited ||= usedPercent >= 100;
+    }
+  }
+
+  if (windows.length === 0) {
+    throw new Error("Codex returned no usable account usage windows");
+  }
+  return {
+    kind: "available",
+    ...(plan === undefined ? {} : { plan }),
+    ...(email === undefined ? {} : { email }),
+    rateLimited,
+    windows,
+  };
+}
+
+/**
+ * Native evidence from `account/read` on the same app-server session:
+ *
+ * ```json
+ * { "account": { "type": "chatgpt", "email": "user@example.com", "planType": "pro" },
+ *   "requiresOpenaiAuth": true }
+ * ```
+ *
+ * Only a ChatGPT (subscription) login carries a meaningful account email; an
+ * API-key account is dropped per the owner's `type === "chatgpt"` requirement.
+ */
+export function accountEmail(result: unknown): string | undefined {
+  const account = asRecord(asRecord(result)?.account);
+  if (account?.type !== "chatgpt" || typeof account.email !== "string") {
+    return undefined;
+  }
+  return account.email;
+}
+
+/**
+ * Codex exposes ChatGPT rate-limit windows only for a ChatGPT account. API-key
+ * and provider-managed runtimes are valid, but have no subscription usage for
+ * this capability to report.
+ */
+export function isNonSubscriptionAccount(result: unknown): boolean {
+  const root = asRecord(result);
+  const account = asRecord(root?.account);
+  return account?.type === "apiKey"
+    || account?.type === "amazonBedrock"
+    || root?.requiresOpenaiAuth === false;
+}
+
+export async function readFromAppServer(
+  command: string,
+  timeoutMs: number,
+  startClient: StartAppServerClient = startAppServerClient,
+  env?: SessionOptions["env"],
+): Promise<ReadOutcome> {
+  const client = startClient(command, env);
+  const deadline = setTimeout(() => {
+    client.kill();
+  }, timeoutMs);
+  try {
+    await client.request("initialize", {
+      clientInfo: { name: "oar", version: "0.0.0" },
+      capabilities: { experimentalApi: true },
+    });
+    client.notify("initialized", {});
+
+    // Read auth mode before the ChatGPT-only rate-limit endpoint. In API-key
+    // mode that endpoint rejects with "ChatGPT authentication required" even
+    // though Codex itself is correctly authenticated; treating that as expired
+    // OAuth would tell the user to perform a login that cannot fix the state.
+    let account: unknown = undefined;
+    try {
+      account = await client.request("account/read", {});
+    } catch {
+      // Older app-servers may not expose account/read. Preserve the existing
+      // rate-limit read in that case instead of making identity mandatory.
+    }
+    if (isNonSubscriptionAccount(account)) {
+      return { kind: "unsupported", reason: "unsupported_auth_mode" };
+    }
+
+    const result = await client.request("account/rateLimits/read", {});
+    return { kind: "ok", result, email: accountEmail(account) };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "";
+    if (/authentication required/iu.test(message)) {
+      return { kind: "reauth_required", reason: "not_authenticated" };
+    }
+    if (/method not found|not supported/iu.test(message)) {
+      return { kind: "unsupported", reason: "endpoint_unavailable" };
+    }
+    return { kind: "error" };
+  } finally {
+    clearTimeout(deadline);
+    client.kill();
+  }
+}
+
+export const codexAccountUsage: AccountUsageReader = async (installation, options = {}) => {
+  if (installation.via !== "executable") {
+    return { kind: "unsupported", reason: "unsupported_installation" };
+  }
+  const outcome = await readFromAppServer(installation.command, options.timeoutMs ?? 8000, undefined, options.env);
+  switch (outcome.kind) {
+    case "ok":
+      return projectCodexUsage(outcome.result, outcome.email);
+    case "reauth_required":
+      return outcome;
+    case "unsupported":
+      return outcome;
+    case "error":
+      break;
+  }
+  throw new Error("Failed to read Codex account usage");
+};

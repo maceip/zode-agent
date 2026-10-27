@@ -1,0 +1,733 @@
+# One stream, three record kinds
+
+> Part of the [record-stream spec](README.md). Related design pages:
+> [hard problems 5-8](../design/hard-problems.md#the-session-and-event-model),
+> [foundations](../design/foundations.md).
+
+Control (prompt / steer / queue / withdraw / abort / dispose and their replies) and
+facts (what the runtime actually said) are records on one stream, and
+control never decides whether a fact exists. A model that pushes both
+through control objects lets the control plane trim, synthesize, and
+constrain facts, so whether a fact exists depends on whether an object is
+still alive. Attribution, the session graph, and the cursor cannot be built
+on a stream that loses facts. The five ways such a model loses facts are in
+the [decision](../design/decisions.md#control-objects-as-the-event-model-2026-09-03).
+
+## Evidence B: why the fix is not split into two channels
+
+Control and facts share one channel because two paths share no seq: "did
+the abort land before or after that tool_result" would become unanswerable.
+Every shipped runtime carries both on one channel as well; the vendor
+evidence is in the
+[decision](../design/decisions.md#separate-channels-for-control-and-facts-2026-09-03).
+
+## The rules
+
+**frame**: the runtime's own words. Expects no reply; append-only;
+monotonic seq. oar never synthesizes a frame. The turn's start *is* the
+prompt request itself, and its end is the runtime's own completion event
+(claude's `result`, codex's `turn/completed`); if a runtime doesn't report
+one, it is honestly absent. No oar-made facts exist in the stream, so there
+is no origin self-disclosure label.
+
+**request**: an action record that expects an outcome; bidirectional.
+app→runtime: prompt / steer / queue / withdraw / abort / dispose. runtime→app:
+approvals, questions, external tools. toApp request bodies are runtime
+verbatim with an open vocabulary, so `direction` is the only way a server
+can decide "does the app need to answer this" without understanding the
+body.
+
+**response**: must point at a request (`requestId`); the reverse is not
+guaranteed. A response exists *only* when oar observed an outcome the
+runtime will not say itself (e.g. the process exit code after a dispose).
+Outcomes the runtime does say (a prompt completing) are answered by its own
+frames, and oar adds no echoing response (it would be a synthesized
+`turn_ended` under a new name). A request without a response is an honest
+record: the action was initiated and the outcome was not observed (crash,
+oar itself killed). Backfilling a guessed response is forbidden.
+
+Further rules:
+
+- **Credential configuration values do not enter records.** This is the
+  exception to verbatim recording: adapters replace documented credential
+  fields with `[redacted]` before the kernel retains or publishes a frame,
+  preserving names and other fields. Live observers and replay see the same
+  redacted frame; the runtime's configuration is unchanged
+  ([Grok MCP evidence](../runtimes/grok.md#session-mcp-servers)). Records a
+  host stored before a rule existed are cleaned with `redactRecord` (root and
+  `@botiverse/oar/observe`): it applies the current rules to one stored
+  record, returns a changed copy only when it changed something, and is safe
+  to run over all storage on every start (grok MCP notifications recorded
+  before 0.32.1 carry the user's own MCP `env` values). `REDACTION_RULES`
+  (same exports) says when and where to run it: `version` goes up whenever a
+  rule is added or broadened, so a host rescans stored records only when it
+  changes; `frameTypePrefixes` lists the `body.type` prefixes a rule can
+  change, and a frame matching none is never changed, so storage can be
+  pre-filtered by them.
+- **Known session credentials are removed by value as well.** Before any
+  request, response or frame is retained or published, its string values and
+  keys are redacted, including native data and projected failure reasons.
+  Control results, live observers and replay share those redacted records;
+  inputs and configuration sent to the runtime keep their original values.
+  Opening errors and later adapter errors use the same rule, including
+  `message`, `stack` and structured `cause` data. Credential values are
+  replaced longest first. Records without a matching string keep their original
+  objects; no known credentials means no traversal or copy.
+
+  For `SessionOptions.env`, a name's last underscore-separated segment must
+  be `KEY`, `APIKEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
+  `CREDENTIAL`, `CREDENTIALS`, `COOKIE` or `PWD`, ignoring case. The exact
+  name `PGPASSWORD` is also recognized. Values shorter than eight characters,
+  null removals, and values starting with `/`, `~/` or a Windows drive plus
+  `:\` are excluded. Thus `ANTHROPIC_API_KEY` and `MYSQL_PWD` are protected,
+  while `SSH_AUTH_SOCK`, `GIT_AUTHOR_EMAIL`, `PASSWORD_STORE_DIR`,
+  `GNUPG_PASSPHRASE_FILE`, `KEYTIMEOUT`, `AWS_ACCESS_KEY_ID`, `HOME` and `PATH`
+  stay readable.
+
+  MCP `env` follows the same name and value rules. MCP `headers` recognizes
+  `Authorization` and `Proxy-Authorization`, or a final hyphen-separated
+  segment in that same credential word list, ignoring case. This includes
+  `Cookie`, `X-Api-Key` and `Api-Key`; ordinary `Content-Type` stays readable.
+  Authorization values also contribute the part after their scheme (such
+  as `Bearer`, `Basic` or `Token`), subject to the same value rules, so a
+  bare echoed token is protected too. Error text uses the same selection.
+
+  Independently of names, session and MCP environment values that parse as
+  URLs with a nonempty password are protected in full, including PostgreSQL,
+  MongoDB and Redis connection URLs. Their encoded and decoded passwords are
+  also protected when at least eight characters long. A shorter password is
+  not replaced outside its complete URL; a URL without a password is not
+  selected by this shape rule.
+
+  Pi additionally resolves the selected model's API key through its SDK at
+  open and on native model changes, keeping previous keys protected for the
+  rest of the session. SDK keys use the same eight-character minimum and
+  path exclusion as environment values, so short local-provider placeholders
+  such as `ollama`, `EMPTY`, `none` or `x` do not alter ordinary text.
+  OAR does not scan the host environment or credential
+  files. Keys a subprocess runtime independently reads from its login or
+  configuration are outside this value-based rule. Unlike the structural
+  `redactRecord` rules above, this needs the session's known values and does
+  not retrospectively clean old stored logs. Matching is within a string in
+  one record. When a model repeats a key from raw tool output (for example,
+  after `env` or `echo $KEY`), its short text deltas commonly split that key.
+  The complete tool-output frame is redacted, but the model's fragments are
+  not: `SessionView` body text and `events({ coalesceText: true })` can
+  reconstruct the original key. Split text, tool-input or tool-output deltas are outside
+  this guarantee. This rule neither buffers the live stream nor rewrites
+  previously delivered fragments.
+- **Native activity can precede this controller.** A runtime frame can report
+  `turn_active` without a prompt request. It adopts an idle root as running,
+  with no invented request id, and preserves the phase of an already running
+  turn. The session view opens at most one turn across a prompt request
+  (`turn_started`) and its native activity report. Only a native completion
+  report supplies `turn_ended`.
+- **Control never prunes facts.** There is no settled-gate anywhere:
+  whatever the runtime said must enter the stream, even if it lands after a
+  span has ended.
+- **Reachability is read off the stream.** Once the stream holds an
+  `exited` response (the runtime is gone) or a `dispose` request (the
+  session is being released), every later prompt / steer / queue / withdraw /
+  abort request is rejected (`runtime_exited` / `disposed`) by the shared kernel
+  before any adapter code runs: no adapter keeps a private "is it alive"
+  flag. `dispose` is the one control that still goes through after an
+  observed exit: it is recorded and answered `accepted` at once (nothing is
+  left to release), so a session whose runtime died on its own still ends
+  with an answered dispose rather than a dangling one.
+- **Control responses answer only "accepted or not".** Final states and
+  landing points are always events. A rejection carries one typed `code`
+  (`busy`, `no_active_turn`, `not_queued`, `unsupported`, `runtime_exited`,
+  `disposed`, `runtime_refused`, `error`) next to the prose `reason`, so an application
+  branches on a word, not on vendor text. `unsupported` means the runtime
+  cannot do this control with these inputs (images where it takes none,
+  images on a cursor steer, or no input at all); a control a runtime cannot do at all is a
+  member the session lacks, never a request that is always rejected: a
+  session that cannot steer has no `steer`, so its stream holds no steer
+  request.
+- **An interrupted process can still exit before replying.** Claude and
+  Codex answer pending aborts `rejected: runtime_exited` if the process dies
+  before OAR takes over. If the interrupted turn has not ended within ten
+  seconds, OAR accepts its still-pending abort requests, then terminates the
+  process. Acceptance records that OAR took over the stop; it does not say the
+  process has exited yet. A late native reply remains a frame, never a second
+  response. On POSIX this sends SIGTERM to its process group, then SIGKILL
+  after the normal kill grace period (another ten seconds by default,
+  `OAR_KILL_GRACE_MS`), which also reaches its descendants that left the group
+  (claude's Bash tool commands); on Windows it force-terminates the process
+  tree with `taskkill /T /F`, including any launcher and the runtime behind it.
+  An interrupt acknowledgement does not cancel this fallback; a turn end
+  does. A native refusal cancels only that abort attempt; it must not kill
+  work the runtime refused to interrupt. Hosts resume the native session to
+  continue after this fallback.
+- **An exit after a host stop ends the running turn as aborted.** `status()`,
+  `turnEndAfter` / `awaitTurnEnd`, and the record-based session view read an
+  exit after that turn's accepted abort (by the runtime or OAR), or its
+  `dispose` request, as `{ kind: "aborted" }`. An unanswered or rejected
+  abort, or no stop request, leaves the exit `failed: runtime_exited`.
+  Stop evidence is scoped to the root session and current turn and cleared
+  at its boundary. A native turn end that arrives first keeps its outcome.
+  `promptAndWait` reports `interrupted` with outcome `aborted` when its own
+  timeout or signal caused the accepted abort and the turn ended by exit.
+  The aborted outcome has no extra fields; the exit code remains on `exited`.
+  OAR synthesizes neither a `turn_ended` frame nor a `timeout` rejection.
+  The incremental `reduceStatus` keeps optional `stop` evidence in a running
+  status (pending abort ids and `abortedOnExit`) so checkpoints preserve the
+  same result as replay. Flat events alone omit accepted controls; feed
+  records to the session view for this classification.
+- **Spawned processes belong to the host's lifetime.** One synchronous Node
+  `exit` hook kills OAR's still-running sessions, probes (inventory and
+  account usage), updaters, logins and ACP terminals. POSIX sends SIGKILL to
+  their process groups, and to the descendants of each child still running
+  (read from the process table then, so not one already re-parented away
+  from it) and their groups; Windows synchronously runs `taskkill /T /F` for each
+  live child to include its descendants (bounded to ten seconds per call,
+  falling back to the direct child on failure). Windows cannot reclaim a
+  tree through a launcher that already exited: its pid may be reused. This is a final
+  fallback, not a substitute for disposal: no graceful hooks run. Node
+  does not emit `exit` for an unhandled terminating signal, including
+  SIGKILL, so hosts must handle ordinary termination signals themselves.
+  Processes spawned internally by an embedded SDK are outside this registry.
+- **A runtime's memory is read, never recorded.** `Session.resources()`
+  answers `{ rss, processes }`: the resident bytes of the runtime process,
+  the process group it leads and its descendants (those that left the group
+  too), counted from one reading of the process table (Linux:
+  `/proc/<pid>/stat`, its resident pages times the page size; other POSIX
+  systems: `ps -A -o pid=,ppid=,pgid=,rss=`), and how many processes that
+  was. It is `null` once the process has exited, on Windows, which has no
+  reader yet, and when the table cannot be read whole (a process gone between
+  the listing and its read is skipped; any other failure gives no reading,
+  never a short count). Concurrent calls share the read in flight. It is the host machine's state, not a runtime fact, so it
+  enters no record; nothing is signalled, and the pid stays inside OAR
+  (`dispose()` is the only way to stop the process). Sessions whose runtime
+  has no process of its own (pi's and cursor's SDKs, whose memory is the
+  host's) have no `resources` member
+  ([process-resources.ts](../../packages/oar/src/shared/executable/process-resources.ts),
+  [test](../../tests/session-resources.test.ts)).
+- **A context breakdown is read, never recorded.**
+  `Session.contextBreakdown()` asks the runtime now what fills its context
+  window, by its own categories (`ContextBreakdown`), the way an inventory
+  query asks what is installed: the session does nothing different for it, so
+  it enters no record, and its answer is consumed before the projection. It is
+  `null` once the process has exited. Only claude itemizes its context
+  ([claude.md](../runtimes/claude.md)); every other session has no
+  `contextBreakdown` member, and `contextUsage()` stays the fold of what each
+  runtime reported on its own.
+- **A turn is a span on the stream, not a control object.** The envelope's
+  optional `spanId` holds only runtime-native ids (red line in
+  [runtime-matrix.md](runtime-matrix.md)); records without a native turn
+  id, such as pi's session-scoped frames, have none.
+- **Query is a projection over the stream.** `model()`, `effort()`, `serviceTier()`,
+  `usage()`, `contextUsage()` and `status()` are folds over the retained
+  records and return `{ value, seq }`; `seq` is the last record consumed,
+  or `-1` before any record. `status()` is the one the control decisions
+  must agree with: a prompt recorded while it says `running` is rejected
+  `busy`, and one recorded while it says `idle` never is.
+- **Folds scope to the root session.** A derived child session's records
+  (own `sessionId`, a node in `graph()`) never satisfy the folds or
+  `awaitTurnEnd`. On codex the child's `turn/completed` was observed
+  arriving before the root's ([env] 0.149.0), and the child's usage total
+  would otherwise overwrite the root's under `agentPath []`. Scope a
+  fold to a child by passing its `sessionId` (`usageOf(records, sessionId)`).
+  `usage()` reads a derived child's records for one thing only: its
+  `withChildren` adds each child session's total, once
+  ([attribution](attribution.md#usage-one-constraint)), so its `seq` covers
+  those records too. `session_linked` carries native lineage on its source
+  frame; `graphOf(records)` gives the live and replay graph, and `usageOf`
+  derives it by default. SessionView uses the same child totals. Old logs
+  without lineage do not guess children
+  ([graph and checkpoints](session-graph-and-cursor.md#the-graph-is-in-the-records)).
+- **Tool input distinguishes fragments from complete arguments.**
+  `tool_call_started.input` is what the opening frame said, and stays so;
+  it may be absent while the runtime is still writing the arguments.
+  `tool_call_input_delta.delta` appends the native fragment verbatim. OAR
+  never parses partial JSON. `tool_call_input.input` replaces the whole
+  input, even when it differs from the accumulated fragments. The session
+  view applies both within the call's session/agent lane: a delta sets
+  `inputPartial: true`, and a complete input removes that flag. An interrupted
+  tool can retain partial input; late input updates it without reopening it.
+  Hosts can render the raw preview and wait for complete input before
+  parsing it or passing it to `classifyTool`.
+
+  Claude starts at the native `tool_use` block opening, appends
+  `input_json_delta.partial_json`, then replaces with the completed block's
+  input. Without a partial opening it keeps one `tool_call_started` carrying
+  the complete input. ACP still emits only whole `tool_call_input` snapshots
+  when `rawInput` changes for a call that has not ended. An unchanged repeat
+  adds none; on the frame that ends an ACP call the input comes before
+  `tool_call_ended`.
+- **Tool outcomes are the runtime's.** `tool_call_ended.result` (`"ok"` |
+  `"failed"`) is present only when the runtime explicitly reports the
+  outcome; oar never infers it from output, exit codes, or timing.
+  The session view marks a root turn's unresolved tools `ended` when that
+  turn ends or its process exits, without result content or a tool end time.
+  This is an unknown result in the view, not a synthesized `tool_call_ended`
+  event. Later native tool results still replace it; child tools and
+  background tasks retain their own lifecycles.
+  `exitCode` follows the same rule for the process status of a command the
+  runtime ran: present only when the runtime reported one (codex, grok,
+  antigravity, cursor, pi, and pi-durable for a nested call), `null` when it
+  reported an exit without a number (a signal), absent otherwise (claude,
+  and a tool that runs no command). pi and pi-durable report a signal as
+  128 plus its number, never `null`.
+- **A tool result is its parts.** `tool_call_ended.content` is the result
+  as the runtime reported it, in its order: `{type: "text", text}`,
+  `{type: "image", mediaType, data}` (base64, normalized from Anthropic
+  `source` blocks and MCP / pi / ACP `{data, mimeType}` blocks alike), and
+  `{type: "other", value}` for a block or a result OAR does not recognize,
+  kept whole. A plain string result is one text part; `content` is absent
+  when the runtime reported no result. The frame's `native` keeps the
+  original. `toolResultText(content)` (`@botiverse/oar/observe`) joins the
+  text parts for a host that shows only text. Streamed output while a call
+  runs stays in `tool_call_progress`: `output` replaces the preview and
+  `outputDelta` appends a chunk. Records written before 0.14.0
+  carry `output` instead; `eventsOf` and the session view read it as
+  `content` (`observe/legacy.ts`), so a persisted log keeps replaying.
+  Per-runtime sources, and the cut the ACP adapters apply to long text
+  parts, are in [runtime-matrix.md](runtime-matrix.md#tool-outcomes).
+
+## Record contracts
+
+```ts
+type RecordKind = "frame" | "request" | "response";
+// Derivable from field shape (kimi-cli's wire tells them apart by the id),
+// but a TS discriminated union needs an explicit discriminant: the one
+// deliberate convenience field.
+
+type RawEvent = Frame | RequestRecord | ResponseRecord;  // one record of the stream
+
+interface RecordEnvelope {
+  sessionId: string;            // runtime-native; a derived child session carries its own
+  agentPath: readonly string[]; // attribution + sub-agent lineage; [] = root
+  spanId?: string;              // runtime-native turn id, optional; oar never generates it
+  seq: number;                  // total order per stream, cursor anchor; record identity rests on seq alone
+  receivedAt: number;           // Unix epoch ms at adapter ingress; best-effort, outside the determinism guarantee
+}
+
+interface Frame extends RecordEnvelope {
+  kind: "frame";                // runtime verbatim; oar never synthesizes
+  body: FrameBody;
+}
+
+interface FrameBody {
+  type: string;                 // runtime-native discriminator (claude type[/subtype], codex method, pi event type, ACP sessionUpdate)
+  native: unknown;              // as sent, except credential-field values redacted before recording
+  events: readonly RuntimeEventBody[];  // what oar read out of the frame, in frame order; [] when oar read nothing
+}
+// RuntimeEventBody:
+//   user_message {input, inputId?, nativeMessageId?, turnId?, evidence} (conversation.md) |
+//   input_dropped {inputId, reason: "turn_interrupted"} |
+//   input_dropped {inputId, reason: "runtime_refused", failure?: FailureClass, message?: string} (conversation.md) |
+//   session_linked {parent, child, via: "tool_call"} |
+//   text_delta {text, messageId?} | reasoning {content, messageId?} |
+//   tool_call_started {callId, tool, input?} |
+//   tool_call_input {callId, input} |
+//   tool_call_input_delta {callId, delta} |
+//   tool_call_progress {callId, output?, outputDelta?} |
+//   tool_call_ended {callId, content?: ToolOutputPart[], result?: "ok" | "failed", exitCode?: number | null} |
+//   turn_ended {outcome} | usage {usage: {context?, tokens?: {input, output, reasoning?, cacheRead?, cacheWrite?}, total?: <same>}} | model {model} |
+//   effort {effort} | service_tier {serviceTier} | app_request_cancelled {requestId} |
+//   compaction_started {trigger?} |
+//   compaction_ended {outcome: completed | aborted | failed, trigger?, reason?} |
+//   retry {attempt, maxAttempts?, delayMs?, reason?} |
+//   task_started {taskId, taskType, nativeType?, description?, toolCallId?, childSessionId?, background?, ambient?} |
+//   task_updated {taskId, status?, background?, description?, error?} |   // status: pending | running | paused | completed | failed | stopped
+//   task_ended {taskId, status: completed | failed | stopped, summary?, outputFile?}
+// TurnOutcome: {kind: completed, structuredOutput?: unknown} | {kind: aborted} | FailedTurn, tagged by `failure`:
+//   {kind: failed, failure: auth, reason, status?, credential?} |
+//   {kind: failed, failure: quota, reason, status?, resetsAt?} |
+//   {kind: failed, failure: <any other FailureClass>, reason, status?}
+// structuredOutput is the native value, present only on completed turns
+// when reported by Claude or Grok, never parsed from Codex text. OAR does
+// not validate it. Missing differs from null. The same outcome is returned
+// by promptAndWait/awaitTurnEnd and retained by status and the session view.
+// `events` is a LIST because one frame can say several things (a claude
+// assistant message with thinking + text + tool_use is one frame carrying
+// three events) and one frame must stay one record: splitting it would
+// duplicate `native`, merging frames would lose the runtime's own framing.
+
+interface RequestRecord extends RecordEnvelope {
+  kind: "request";
+  id: string;
+  direction: "toRuntime" | "toApp";
+  body: RequestBody;            // prompt {input, inputId?, images?, origin?, carries?} | steer | queue {input, inputId?, images?, origin?} | withdraw {inputId} | abort | dispose | native {type, native} (toApp, verbatim)
+}
+
+interface ResponseRecord extends RecordEnvelope {
+  kind: "response";
+  requestId: string;            // must point to a request; reverse not guaranteed
+  body: ResponseBody;           // accepted {native?} | rejected {code, reason, native?} | answered {native} | exited {code}
+}
+// accepted/rejected: control answers only "taken over or not".
+// answered: oar's own reply to a toApp request (the automatic permission
+// grant): an outcome the runtime did not say.
+// exited: the process exit, the one outcome the runtime can never say
+// itself; answers the dispose request when oar caused it, stands alone
+// (requestId "") when the runtime died on its own.
+```
+
+The control surface that produces these records (`Session.prompt / steer /
+queue / withdraw / abort / dispose`, `rawEvents(observer, cursor?)`, `records()`,
+`graph()`, and the folds) is documented on the contract itself. A `prompt`
+while a turn runs is rejected `busy`, never queued: a session has one
+control plane and at most one active turn
+([decision](../design/decisions.md#concurrent-control-planes-and-prompts-2026-09-03)).
+`steer` and `withdraw` are optional: their presence is the capability
+([which sessions have them](runtime-matrix.md#session-controls)), and
+`steerOrQueue` and ordinary `deliver` queue where `steer` is absent.
+Explicit `deliver(..., { when: "interrupt", maxWaitMs })` can instead
+withdraw, abort and merge those inputs ([contract](conversation.md#interrupting-and-merging-held-inputs)). `queue` is on
+every session; `capabilities.queue.durable` says whether held input
+survives a restart. See [withdrawing held input](#withdrawing-held-input).
+An adapter's `prompt / steer / queue / withdraw / abort` return
+both records they appended (`ControlResult`); the `Session` a consumer holds
+returns them read (`ControlOutcome`): `kind` is `accepted` or `rejected`
+(the two answers a toRuntime control can get), a rejection has its `code`
+and `reason` at hand, `seq` is the request's position in the stream (what `awaitTurnEnd`
+takes), and `request` / `response` are still the records themselves.
+`dispose()` returns void: its request and response are read from the stream.
+Process adapters release owned work and record `exited`. A Session borrowing
+a host-owned durable Harness detaches its watch and answers `accepted`; it
+does not abort work, delete history, close the Harness or fabricate an exit.
+Call `abort()` first when stopping that durable work is intended. The turn helpers build on this:
+`promptAndWait(session, input, { timeoutMs?, signal? })` prompts and waits
+for the runtime's own turn end (aborting when a limit fires, and reporting
+that as `interrupted` with the runtime's outcome), and `awaitIdle(session)`
+waits for the running turn, if any, to end.
+
+An invalid `carries` claim produces a rejected prompt without calling the
+runtime. Validation precedes the request record: each id must belong to the
+same session and agent and have an accepted withdraw as its latest attempt.
+The rejected claim is retained for audit but does not transfer input ownership.
+
+A prompt's optional `carries: string[]` names earlier logical input ids sent
+in that same prompt, scoped to its session and agent lineage. It is a host
+control fact, not a native echo. Original queue and withdrawal records remain
+unchanged. The prompt's response settles every carried attempt, while the
+original content and origin remain available to views. Adapters copy this
+field to the prompt request only; it is never added to model text or vendor
+protocol fields. Older readers may ignore the additive field.
+
+Controls issued synchronously by a record observer can act before an adapter
+resumes draining its held queue. Reentrant records are retained immediately;
+the kernel finishes publishing the current record to every observer before
+publishing those new records, so all observers still receive monotonically
+ordered sequences.
+
+## Withdrawing held input
+
+`Session.withdraw(inputId)` takes back an input a `queue` request left in
+OAR's own held queue, before it is sent. It is its own operation targeting
+earlier input ([input cancellation](../runtimes/input-cancellation.md#consequences-for-oar-and-rao)):
+a `toRuntime` request `withdraw {inputId}` recorded through the kernel's
+control path, so a disposed or exited session refuses it like any control.
+Its answer is one of two:
+
+- `accepted`: the held entry was removed before it was sent, and the caller
+  owns the input again. `events()` reads it as `input_withdrawn {requestId,
+  inputId}`.
+- `rejected` `not_queued`: no held input with this `inputId` is waiting. It
+  was already sent to the runtime, never queued in this session, or already
+  withdrawn; the stream before the withdraw says which.
+
+The adapter decides and removes in one synchronous step, and its drain takes
+an entry off the same queue in one step before sending it, so a withdraw
+racing the drain either removes the entry first or finds it gone: an input
+is never both sent and withdrawn. The queue request and its `accepted`
+response stay in the stream as they were; the withdrawal is a fact of its
+own. A withdrawn input can be queued again under the same `inputId` (edit)
+or sent with `deliver` (send now): a new attempt, read by the ordinary
+rules ([conversation](conversation.md#withdrawing-held-input)).
+
+`withdraw` exists where OAR holds the queue: claude, pi, cursor, kimi, grok,
+antigravity and opencode. pi-durable's queue is native, and its `withdraw`
+aborts the input's native submission before it runs (`submission.abort()`).
+codex holds its queue natively, and its `thread/queue/delete` is
+experimental and not live-verified, so a codex session has no `withdraw`.
+
+```
+seq=30  ◆ request   root  id=rq-14  queue "and then this" inputId=in-7
+seq=31  ◇ response  root  →rq-14    accepted
+        ↳ held by the adapter: a turn is still running
+seq=32  ◆ request   root  id=rq-15  withdraw inputId=in-7
+seq=33  ◇ response  root  →rq-15    accepted
+        ↳ removed before the drain reached it; rq-14 and its answer stand
+seq=34  ✓ frame     root            result      → turn_ended completed
+        ↳ nothing is drained: no turn follows for in-7
+```
+
+## The Event layer: the consumer face, a projection over the stream
+
+Most consumers want the facts, not records. `Session.events()` delivers
+them as flat `Event`s and is the surface to start with; `rawEvents()` and
+`records()` are the stream itself, for when the native frame matters.
+
+```ts
+type Event = EventBody & RecordEnvelope;      // one attributed fact
+type EventBody = RuntimeEventBody | ControlEventBody;
+// ControlEventBody, read off request/response records so the consumer
+// never handles record kinds:
+//   turn_started {requestId, input}                    ← a prompt request
+//   input_withdrawn {requestId, inputId}               ← an accepted withdraw response
+//   control_rejected {requestId, action, code, reason} ← a rejected response
+//   app_request {requestId, type}                      ← a toApp request
+//   app_answered {requestId}                           ← an answered response
+//   exited {code}                                      ← an exited response
+```
+
+Which runtimes say which kinds (runtime pages hold the evidence):
+
+- `session_linked`: Codex collaboration items, ACP native lineage and
+  OpenCode v2 child attribution. The source frame carries both endpoints;
+  `graphOf` deduplicates repeated edges without changing the records.
+
+- `turn_active`: codex `turn/started`, pi `agent_start`, Pi Durable's
+  adopted conversation activity, and claude `system/init` when the root
+  starts a turn on its own. An optional `inputId` means the runtime started
+  its turn for that input; absent means unknown. Claude also maps
+  `command_lifecycle started` for prompt-like writes (including queue drains)
+  to `turn_active { inputId: command_uuid }`. A prompted turn can have both
+  `turn_started` (the request) and `turn_active` (the native start).
+- `input_queued { inputId }`: the runtime holds this input and has not started
+  its turn. Currently Claude-only, from `command_lifecycle queued` for an
+  input OAR wrote as a prompt or queue, never a steer. This fact gates
+  attribution: until the matching `turn_active { inputId }`, other root
+  activity and its end belong to separate spontaneous turns. No queued fact
+  means existing request-based behavior. `completed` never ends a turn.
+  Claude maps it (or a replayed user message) to a refused input only when
+  neither `queued` nor `started` has arrived since that registered write.
+  `promptAndWait` sends the caller's inputId or a generated UUID and waits for
+  that span; `awaitTurnEnd` and `turnEndAfter` opt in with an inputId and still
+  return the first root end without one. Native exits always settle waits.
+- `input_dropped`: native evidence that the input was interrupted before
+  delivery, or refused. Only `reason: "runtime_refused"` permits optional
+  `failure` and `message`. Input-scoped waits use them for the failed outcome;
+  absent fields yield `unknown` / `runtime refused the input`. An interruption
+  yields `aborted`. See [dropped input](conversation.md#dropped-input).
+- `text_delta`, `reasoning`, `tool_call_started`, `tool_call_ended`,
+  `turn_ended`, `usage`, `model`: every shipped adapter, except that
+  antigravity sent no reasoning and no usage in any probe ([env]
+  agy_acp_server 1.2.1).
+- `tool_call_progress`: partial output of a running tool. `output` is the
+  whole current preview, replacing earlier output; `outputDelta` appends a
+  chunk. An empty `output` clears the preview; an absent field changes
+  nothing. If both fields are present, replace first, then append. Pi
+  `tool_execution_update` uses `output` (the whole partial result as JSON),
+  as do non-terminal ACP updates for known calls carrying `rawOutput` and
+  Pi Durable's reconstructed, bounded output window. ACP `content` is not
+  progress output: Kimi streams arguments there while `in_progress`. Codex `item/commandExecution/outputDelta` uses
+  `outputDelta`, with `callId` equal to the item id. Records retain each
+  native chunk, never an ever-growing cumulative string. `SessionView`
+  applies these operations within the call's session/agent lane, accepts
+  late progress without reopening an ended call, and removes the preview
+  when `tool_call_ended` supplies the result. Claude streams none. Cursor's
+  independent `shell-output-delta` has no tool call id, so stays native
+  ([boundary and probe](../runtimes/cursor.md)).
+- `tool_call_input`: arguments reported after the call started. ACP (grok,
+  kimi, opencode, antigravity) a `tool_call_update` for a call that has not
+  ended, carrying a `rawInput` that differs from the input last read for
+  it: opencode's arguments (the opening frame has `{cwd}` or `{}`), kimi's
+  full `rawInput` after its streamed `content` chunks, grok's update adding
+  `is_background` and `variant` to `{command, description}`. Claude's
+  completed `assistant.tool_use` emits it if the partial stream already
+  started that call. In every case it holds a complete replacement.
+- `tool_call_input_delta`: append-only argument text, currently Claude's
+  `input_json_delta.partial_json`, attributed by block index to its tool-use
+  id within the agent's current message. Each record keeps only its fragment,
+  not an ever-growing input. It may be incomplete JSON; it is separate from
+  both complete `tool_call_input` and tool output `tool_call_progress`.
+  Codex 0.162.0 exposes no corresponding native argument notification.
+- `compaction_started`: pi `compaction_start` (`trigger` is pi's reason:
+  manual | threshold | overflow); codex `item/started` for a
+  `contextCompaction` item (no trigger). Never claude (it reports only the
+  boundary after the fact), cursor (its SDK drops the `summary` updates) or
+  ACP.
+- `compaction_ended`: pi `compaction_end` (`aborted` → aborted, an
+  `errorMessage` → failed with that reason, else completed; `trigger` as
+  above); claude `system/compact_boundary` → completed with `trigger` from
+  `compact_metadata.trigger` (manual | auto) [sym 2.1.272]; codex
+  `item/completed` for the `contextCompaction` item → completed, while the
+  deprecated `thread/compacted` notification closes an open compaction only
+  when the item did not already (the projection dedupes, so codex never ends
+  a compaction twice) [env 0.154.0 schema]. Cursor and ACP never. An ended
+  compaction starts no work: `statusOf` keeps an idle agent idle, and only
+  moves an already-running agent to `waiting_model`.
+- `retry`: pi `auto_retry_start` and `summarization_retry_scheduled`. No
+  other shipped runtime exposes a retry (claude retries silently).
+- `task_started` / `task_updated` / `task_ended`: work the runtime tracks
+  beside the turn that started it. claude `system/task_started`,
+  `task_updated` (its `patch`) and `task_notification` [env 2.1.284]:
+  commands (`local_bash` → shell), subagents and teammates (`local_agent`,
+  `remote_agent`, `in_process_teammate` → agent), workflow runs
+  (`local_workflow` → workflow), and MCP calls moved to the background
+  (`mcp_task` → tool), with
+  `tool_use_id` as `toolCallId`, `is_backgrounded` as `background` and
+  `killed` read as `stopped`; `background_tasks_changed` repeats the live
+  set and maps to nothing (a change of `ambient` alone shows only there).
+  For any Claude task type, `task_progress` emits a `task_updated` only when
+  its description changes. Nested `workflow_progress` remains native; its
+  agent/phase summaries are not child events, and task `total_tokens` is not
+  spend. `TaskType` is shell | agent | tool | workflow | other.
+  codex `subAgentActivity` items on the parent thread [env 0.158.0]:
+  started → `task_started` (the child thread is `taskId` and
+  `childSessionId`, its `/root/name` path the description), interacted →
+  `task_updated` running, completed → `task_ended` completed, interrupted →
+  `task_ended` stopped. A codex command the model detached itself
+  (`nohup … &`) leaves no task. ACP, pi and cursor report none. `tasksOf`
+  folds them into one row per task, including endings inferred from runtime
+  exit as described below.
+- `effort`: the reasoning-effort level the runtime reports in effect, in its
+  own spelling. codex: the `thread/start` / `thread/resume` reply's
+  `reasoningEffort` and `thread/settings/updated`; ACP (grok, kimi; opencode
+  and antigravity 1.4.0 where the model has the option): the
+  current value of the config option in ACP's `thought_level` category, in
+  a handshake answer or a `config_option_update`; pi: `thinkingLevel` on
+  `pi/session_opened` and pi's `thinking_level_changed`; cursor: the
+  reasoning parameter in the SDK's model selection at open and in each
+  run's answer, which the SDK passes through unchecked (codex's case: OAR
+  checks the level against the model's menu first). claude never: its
+  stream names no level, and its one report (`get_settings`) is read at open
+  but not recorded, since it also dumps the user's merged settings. A
+  requested `SessionOptions.effort` is never an event of its own: what the
+  runtime says back is.
+- `service_tier`: the tier reported by the runtime, never the requested option
+  echoed. Codex reads `serviceTier` from open replies and settings updates;
+  native null means `default` (no special tier), a missing field means no
+  event. Claude reads `fast_mode_state` from system/init or result frames:
+  on maps to `fast`, off or cooldown to `default`. Its initialization
+  readback confirms an open option privately, produces no event and is not
+  recorded because it carries account details. The native turn frame
+  retains the reason for a downgrade.
+  `Session.serviceTier()`, `serviceTierOf` and `SessionView.serviceTier` read
+  the latest root report, with null before any. Child reports do not change
+  the root's selection. The voyage header's optional `serviceTier` is the
+  requested choice, kept separate from these reported facts.
+- `app_request` / `app_answered`: any adapter that records `toApp` requests
+  (claude `control_request`, codex server requests, ACP permission and
+  terminal requests) and, for `app_answered`, one whose automatic reply is
+  recorded (the ACP adapters); `type` is the runtime's method or subtype.
+  `appRequestText(type, body)` reads the words of the ask off the recorded
+  body (what a question asks, the tool or command an approval is for), and is
+  undefined where OAR does not know where they are.
+- `app_request_cancelled`: the runtime withdrew a `toApp` request it had sent
+  and no longer waits on an answer: claude `control_cancel_request` (an
+  interrupt cancels a pending question), codex `serverRequest/resolved`
+  (OAR answers no codex request, so a resolved one was cleared by codex).
+  SessionView drops the request from `pendingRequests` and marks its part
+  `cancelled`; the process exit empties `pendingRequests` too. Never inferred
+  from a turn ending: a runtime may keep a request open across turns.
+
+The rules that make this a projection and not a second source of truth:
+
+- **Pure derivation.** `eventsOf(record)` (observe/events.ts) reads the
+  events out of one record: each entry of a Frame's `events` stamped with
+  the frame's envelope, a `turn_started` for a prompt request, an
+  `app_request` for a toApp request, a `control_rejected` for a rejected
+  response, an `input_withdrawn` for an accepted withdraw response, an
+  `app_answered` for an answered response, an `exited` for the exit. A
+  response names only its `requestId`, so the reading takes the toRuntime
+  requests seen before it (`controlActionsOf(records)` builds them from a
+  log). `events()` is `rawEvents()` with `eventsOf` applied to every
+  record, so a retained log replays into exactly the events the live
+  subscription delivered.
+- **Several events, one seq.** Events read from one frame share its `seq`,
+  `agentPath`, `spanId` and `receivedAt`; `seq` is how a consumer gets back
+  to the frame. A record oar read nothing from yields no event.
+- **Lossy by design, never lossy in the stream.** An Event carries no
+  `native` and no `type`. The Frame underneath keeps both.
+- **Coalescing is a consumer option.** `text_delta` arrives at the
+  granularity the runtime emits (claude, pi and codex: streamed pieces). `events(observer, { coalesceText })` merges
+  consecutive text (or readable reasoning) of one agent into one event
+  carrying the last piece's envelope (`{ maxHoldMs }` also flushes when the
+  stream goes quiet that long). Off by default, so events stay synchronous
+  and one-to-one with what was read.
+- **Text names its message when the runtime does.** `text_delta.messageId`
+  is the runtime's id of the assistant message the text is part of (codex:
+  the `agentMessage` item id; claude: the API `message.id`), so two messages
+  of one turn stay apart in coalescing and in the session view. pi, cursor
+  and the ACP runtimes name none, and older records lack it. Claude also
+  names streamed `reasoning` with `messageId`; coalescing keeps readable
+  reasoning from different API messages separate.
+
+## Tasks at runtime exit
+
+`tasksOf(records, rootSessionId?)` ends every pending, running or paused
+task when the root runtime process records an `exited` response. This
+includes tasks of child sessions and subagents in the same stream. A child
+exit does not end the stream's tasks; a turn ending while the runtime stays
+alive does not end background work either. Already terminal tasks stay as
+reported. The inferred `endedAt` is the exit record's `receivedAt`.
+
+Background work does not outlive the session. A task the runtime started
+(a dev server, a build, a claude Bash command run in the background) is a
+process in the runtime's tree, so ending the runtime ends it: `dispose()`,
+the abort fallback and host exit all do, since 0.36.1 also for processes
+that left the runtime's process group. A host that stops idle sessions and
+wants background work to keep running must not dispose a session whose
+tasks are still running; `tasksOf` says which are.
+
+The inferred status is `stopped` if the root received a `dispose` request
+before exit (including while idle), or this exit ends the running root turn
+as `aborted` under the accepted-abort rule. Otherwise it is `failed`, with
+`error: "runtime exited"` unless the task already has a native error. An
+accepted abort from a turn that already ended does not stop tasks at a later
+exit. No new task status or synthetic record is introduced.
+
+A later native `task_ended` or status-bearing `task_updated` overrides the
+inference normally. Reopening a task clears its ending. Only an error
+inferred from exit is cleared when a native status or error arrives; native
+errors remain facts, even if their text is also `runtime exited`.
+Metadata-only updates retain the inferred status and error.
+
+For incremental consumers, use `initialTaskState(rootSessionId?)` and
+`reduceTaskState(state, record)`. Its `tasks` is the existing `TaskMap`;
+`status` reuses `reduceStatus`'s current-turn stop evidence, `disposed`
+remembers a root dispose even while idle, and `exitErrors` identifies
+inferred errors. Persist the whole state, preserving its Map and Set, so a
+checkpoint can continue folding with the same result as replay. Supply the
+root id when the first retained record belongs to a child; otherwise the
+first record's session id becomes the root. Start fresh lifecycle state
+for each runtime start or resume, even when the session id is reused.
+
+The existing `reduceTasks(TaskMap, record)` and `applyTaskEvent` still fold
+only native task events. They have no lifecycle evidence and do not infer
+exit endings; crew's own task fold continues using `applyTaskEvent`.
+
+## Example 1 · An ordinary turn (claude): both ends of the turn are real records
+
+```
+seq=17  ◆ request   root  id=rq-9   prompt "run the tests"
+        ↳ the turn's start is this request itself: no synthesized turn_started
+seq=18  ◇ response  root  →rq-9     accepted
+        ↳ control answers only "taken over": the message was written to claude's stdin
+seq=19  ✓ frame     root            assistant   → text_delta "Running them…", tool_call_started call_1
+        ↳ ONE frame, one record, two events in the frame's order; `native` is the whole message
+seq=20  ✓ frame     root            user        → tool_call_ended call_1
+seq=21  ✓ frame     root            result      → turn_ended completed, usage {in:12034, out:512}
+        ↳ the turn's end = the runtime's own completion event. rq-9 gets no
+          further response: the runtime said the outcome itself
+```
+
+## Example 2 · dispose mid-flight: every frame up to the exit is recorded
+
+```
+seq=40  ◆ request   root  id=rq-12  dispose
+seq=41  ✓ frame     root            tool_result {call:"call_7", …}
+        ↳ arrived after the kill was requested, before the process died;
+          a settled-gate would swallow it, the stream keeps it
+seq=42  ✓ frame     root            result {usage:{in:45231, out:8120}, …}
+        ↳ usage is in-stream, with a seq, replayable, never a snapshot
+          held beside the stream
+seq=43  ◇ response  root  →rq-12    exited {code:143}
+        ↳ the one justification for a response: the exit code is an outcome
+          the runtime will never say itself; only oar observes it
+```
+
+## Example 3 · Dangling request: unobserved outcome stays unobserved
+
+```
+seq=57  ◆ request   root  id=rq-30  abort
+        ○ absence: oar's own process was SIGKILLed; rq-30 never gets a response
+        ↳ an honest record, not a bug: the action was initiated, its outcome
+          was not observed. Writing a guessed response after recovery is
+          forbidden
+```

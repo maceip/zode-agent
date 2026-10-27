@@ -1,0 +1,118 @@
+.code-tour-pane {
+  position: relative;
+  flex: 1 1 auto;
+  container-type: inline-size;
+}
+
+.code-tour-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--canvas);
+}
+
+.code-tour-scroll > .diff-viewer-state {
+  min-height: 100%;
+}
+
+.code-tour-document {
+  box-sizing: border-box;
+  width: min(100%, 1120px);
+  margin: 0 auto;
+  padding: clamp(32px, 5cqi, 64px) clamp(24px, 6cqi, 72px) 88px;
+}
+
+.code-tour-intro,
+.code-tour-narrative {
+  max-width: 760px;
+}
+
+.code-tour-intro {
+  margin-bottom: 44px;
+}
+
+.code-tour-markdown {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.code-tour-intro .code-tour-markdown h1 {
+  margin-bottom: 13px;
+  color: var(--text-strong);
+  font-size: clamp(24px, 4cqi, 36px);
+  font-weight: 620;
+  letter-spacing: -.025em;
+  line-height: 1.16;
+}
+
+.code-tour-stops {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.code-tour-stop {
+  position: relative;
+  margin: 0 0 58px;
+}
+
+.code-tour-narrative {
+  margin-bottom: 16px;
+}
+
+.code-tour-narrative .code-tour-markdown h2 {
+  margin: 0 0 8px;
+  color: var(--text-strong);
+  font-size: 18px;
+  font-weight: 610;
+  letter-spacing: -.012em;
+  line-height: 1.3;
+}
+
+.code-tour-narrative .code-tour-markdown p {
+  margin-bottom: 9px;
+}
+
+.code-tour-diff.diff-viewer-code {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  overflow-x: auto;
+  overflow-y: visible;
+  border: 1px solid color-mix(in srgb, var(--border) 86%, transparent);
+  border-radius: 13px;
+  background: var(--canvas);
+  box-shadow: 0 8px 24px rgb(38 40 52 / 5%);
+}
+
+@container (max-width: 540px) {
+  .code-tour-document {
+    padding: 26px 15px 64px;
+  }
+
+  .code-tour-intro {
+    margin-bottom: 36px;
+  }
+
+  .code-tour-stop {
+    margin-bottom: 44px;
+  }
+
+  .code-tour-narrative .code-tour-markdown h2 {
+    font-size: 16px;
+  }
+
+  .code-tour-markdown {
+    font-size: 13px;
+  }
+
+  .code-tour-diff.diff-viewer-code {
+    border-radius: 10px;
+    --diffs-font-size: 11.5px;
+    --diffs-line-height: 19px;
+  }
+}

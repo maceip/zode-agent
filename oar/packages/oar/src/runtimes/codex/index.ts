@@ -1,0 +1,38 @@
+/* oxlint-disable import/max-dependencies -- The runtime declaration imports one module per capability. */
+import { runtimeBrands } from "../../brands.js";
+import { codexSkills, codexMcpServers, codexTools } from "./inventory.js";
+import { defineRuntime } from "../../contracts/runtime.js";
+import { codexAuthStatus, codexLogin } from "./login.js";
+import { codexLogout } from "./logout.js";
+import { codexAccountUsage } from "./account-usage.js";
+import { codexInstallation } from "./installation.js";
+import { codexInstall, codexInstallPlan } from "./install.js";
+import { codexListModels } from "./list-models.js";
+import { codexCheckUpdate, codexUpgrade } from "./update.js";
+import { codexRefusedSessionOptions } from "./options.js";
+import { codexSession } from "./session.js";
+
+export const codexRuntime = defineRuntime({
+  id: "codex",
+  refusedSessionOptions: codexRefusedSessionOptions,
+  brand: runtimeBrands.codex,
+  skills: codexSkills,
+  mcpServers: codexMcpServers,
+  tools: codexTools,
+  mcpToolsListChanged: "none",
+  installation: codexInstallation,
+  installPlan: codexInstallPlan,
+  install: codexInstall,
+  accountUsage: codexAccountUsage,
+  listModels: codexListModels,
+  checkUpdate: codexCheckUpdate,
+  upgrade: codexUpgrade,
+  login: codexLogin,
+  logout: codexLogout,
+  authStatus: codexAuthStatus,
+  session: codexSession,
+});
+
+export { codexAccountUsage, projectCodexUsage } from "./account-usage.js";
+export { codexListModels, projectCodexModels } from "./list-models.js";
+export { codexSession } from "./session.js";

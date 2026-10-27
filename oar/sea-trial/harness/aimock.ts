@@ -1,0 +1,207 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { LLMock } from "@copilotkit/aimock";
+import { warmCodexHome } from "./codex-home.js";
+import { startRawCapture, type RawCapture, type RawProviderRequest, type ResponseRewrite } from "./raw-capture.js";
+
+export type { LLMock } from "@copilotkit/aimock";
+export type { RawProviderRequest } from "./raw-capture.js";
+export { namespaceMcpToolCalls } from "./raw-capture.js";
+
+/**
+ * Backend setup for the aimock-backed instances: the REAL claude/codex
+ * binaries run their REAL harnesses, only the model provider is a local
+ * scripted server. Zero tokens, no login needed, deterministic-leaning.
+ *
+ * Gotchas learned in evaluation (2026-08-22):
+ * - fixture string patterns are LITERAL; pass a RegExp for wildcards
+ * - codex under a ChatGPT login ignores OPENAI_BASE_URL: it needs a
+ *   CODEX_HOME config.toml declaring a custom provider with wire_api
+ *   "responses" and apikey auth
+ */
+/**
+ * No process.env mutation: each environment returns the vars its sessions
+ * need (passed per-session via SessionOptions.env), so differently-scripted
+ * providers can run concurrently. stop() reclaims the on-disk pieces
+ * (server socket, temp CODEX_HOME).
+ */
+export interface AimockEnv {
+  /** Session env overlay pointing the runtime at this scripted provider (absent for in-process pi, which is re-pointed via OAR_PI_AGENT_DIR at startup). */
+  readonly env?: Readonly<Record<string, string>>;
+  /** The scripted server itself. Vendor tests read its journal when a run goes sideways. */
+  readonly mock: LLMock;
+  /** Provider requests as the runtime sent them, in arrival order; empty unless started with `captureRaw` or `rewriteResponse` (see raw-capture.ts). */
+  readonly raw: readonly RawProviderRequest[];
+  stop(): Promise<void>;
+}
+
+/** Options every aimock environment takes. */
+export interface AimockOptions {
+  /** Put a raw-capture proxy between the runtime and aimock, so `raw` holds the request bodies aimock's journal normalizes away. */
+  readonly captureRaw?: boolean;
+  /** Put the same proxy in front and rewrite each response on its way back (`namespaceMcpToolCalls`: a reply shape aimock cannot script). */
+  readonly rewriteResponse?: ResponseRewrite;
+}
+
+/** The provider URL the runtime is pointed at: aimock itself, or the capture proxy in front of it. */
+async function providerUrl(mock: LLMock, options: AimockOptions): Promise<{ readonly url: string; readonly capture: RawCapture | null }> {
+  if (options.captureRaw !== true && options.rewriteResponse === undefined) {
+    return { url: mock.url, capture: null };
+  }
+  const capture = await startRawCapture(mock.url, options.rewriteResponse);
+  return { url: capture.url, capture };
+}
+
+function baseFixtures(mock: LLMock): void {
+  // Enough model behavior for every current behavior case: any prompt gets a
+  // short completion. Cases assert framing/invariants, not content.
+  // A little latency keeps the model pace realistic; instant replies are a
+  // chaos-experiment configuration, not a behavior baseline.
+  // Prompts mentioning "slow" get a LONG turn: the window the abort and
+  // mid-turn-steer cases need. The two patterns are disjoint because aimock
+  // picks among overlapping matches by turn position, not registration order.
+  mock.onMessage(/slow/u, { content: "ok" }, { latency: 900 });
+  mock.onMessage(/^(?![\s\S]*slow)[\s\S]*$/u, { content: "ok" }, { latency: 80 });
+}
+
+export async function startClaudeAimock(
+  configure: (mock: LLMock) => void = baseFixtures,
+  options: AimockOptions = {},
+): Promise<AimockEnv> {
+  const mock = new LLMock({ port: 0 });
+  configure(mock);
+  await mock.start();
+  const { url, capture } = await providerUrl(mock, options);
+  return {
+    env: { ANTHROPIC_BASE_URL: url, ANTHROPIC_API_KEY: "aimock" },
+    mock,
+    raw: capture?.requests ?? [],
+    stop: async () => {
+      await capture?.stop();
+      await mock.stop();
+    },
+  };
+}
+
+export async function startCodexAimock(
+  configure: (mock: LLMock) => void = baseFixtures,
+  options: AimockOptions & { readonly warmHome?: boolean } = {},
+): Promise<AimockEnv> {
+  const mock = new LLMock({ port: 0 });
+  configure(mock);
+  await mock.start();
+  const { url, capture } = await providerUrl(mock, options);
+  const codexHome = await mkdtemp(path.join(tmpdir(), "oar-codex-aimock-"));
+  await writeFile(path.join(codexHome, "config.toml"), [
+    'model = "gpt-5.1"',
+    'model_provider = "aimock"',
+    'preferred_auth_method = "apikey"',
+    // No sandbox_mode here: the codex ADAPTER now injects it as a launch -c
+    // override (its production YOLO default), so leaving it out of config.toml
+    // means this backend actually exercises that path. codex's exec runs
+    // under bubblewrap on Linux and GitHub runners forbid its netns setup
+    // ("bwrap: loopback: Failed RTM_NEWADDR", run 32617471968), so the
+    // adapter's danger-full-access default is what keeps CI green.
+    "",
+    "[model_providers.aimock]",
+    'name = "aimock"',
+    `base_url = "${url}/v1"`,
+    'env_key = "OPENAI_API_KEY"',
+    'wire_api = "responses"',
+    "",
+  ].join("\n"));
+  const env = { CODEX_HOME: codexHome, OPENAI_API_KEY: "aimock" };
+  // Warm the fresh home once: codex's first run initializes its sqlite state
+  // and installs system skills, and those writers race when instances cycle
+  // fast (observed: "failed to initialize sqlite state runtime"). One
+  // throwaway app-server does the heavy init; the suite then behaves like a
+  // long-lived home.
+  const result: AimockEnv = {
+    env,
+    mock,
+    raw: capture?.requests ?? [],
+    stop: async () => {
+      await capture?.stop();
+      await mock.stop();
+      try {
+        // codex leaves background writers (plugins clone) briefly alive after
+        // dispose; retry, and never fail a clean suite over teardown.
+        await rm(codexHome, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+      } catch (error) {
+        process.stderr.write(`codex home teardown left residue: ${String(error)}\n`);
+      }
+    },
+  };
+  try {
+    // Cold-start regressions must exercise the adapter without a prior process.
+    if (options.warmHome !== false) { await warmCodexHome(env); }
+    return result;
+  } catch (error) {
+    await result.stop();
+    throw error;
+  }
+}
+
+export async function startPiAimock(
+  configure: (mock: LLMock) => void = baseFixtures,
+  piOptions: {
+    /** Model contextWindow in the scripted models.json (default 200k). Shrink it plus report fat usage to trigger threshold auto-compaction deterministically. */
+    readonly contextWindow?: number;
+    /** Written as <agentDir>/settings.json when provided (e.g. compaction settings). */
+    readonly settings?: Readonly<Record<string, unknown>>;
+    /** Also list `aimock/aimock-thinking`, a `reasoning: true` model, so pi has thinking levels to apply (`aimock-model` has none). */
+    readonly reasoningModel?: boolean;
+    /** List `aimock-model` as taking images too (`input: ["text", "image"]`); pi drops images for a text-only model. */
+    readonly imageInput?: boolean;
+  } & AimockOptions = {},
+): Promise<AimockEnv> {
+  const mock = new LLMock({ port: 0 });
+  configure(mock);
+  await mock.start();
+  const { url, capture } = await providerUrl(mock, piOptions);
+  const model = (id: string, reasoning: boolean): Record<string, unknown> => ({
+    id,
+    name: id,
+    reasoning,
+    input: piOptions.imageInput === true ? ["text", "image"] : ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: piOptions.contextWindow ?? 200_000,
+    maxTokens: 16_384,
+  });
+  // pi is in-process: its model plane reads agentDir/models.json, not child
+  // env, so the re-point is a temp agentDir pinned via OAR_PI_AGENT_DIR
+  // (process-wide, set once at suite startup; recipe live-verified in
+  // experiments/pi-aimock.ts).
+  const agentDir = await mkdtemp(path.join(tmpdir(), "oar-pi-aimock-"));
+  await writeFile(path.join(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      aimock: {
+        name: "aimock",
+        baseUrl: url,
+        apiKey: "aimock",
+        api: "anthropic-messages",
+        models: [
+          { ...model("aimock-model", false), name: "aimock" },
+          ...(piOptions.reasoningModel === true ? [model("aimock-thinking", true)] : []),
+        ],
+      },
+    },
+  }));
+  if (piOptions.settings !== undefined) {
+    await writeFile(path.join(agentDir, "settings.json"), JSON.stringify(piOptions.settings));
+  }
+  process.env.OAR_PI_AGENT_DIR = agentDir;
+  // The Raft daemon injects its own PI_PACKAGE_DIR into shells on this
+  // machine; it must not leak into the pi under test.
+  delete process.env.PI_PACKAGE_DIR;
+  return {
+    mock,
+    raw: capture?.requests ?? [],
+    stop: async () => {
+      await capture?.stop();
+      await mock.stop();
+      await rm(agentDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+    },
+  };
+}

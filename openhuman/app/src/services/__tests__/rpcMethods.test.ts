@@ -1,0 +1,288 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { describe, expect, test } from 'vitest';
+
+import { CORE_RPC_METHODS, LEGACY_METHOD_ALIASES, normalizeRpcMethod } from '../rpcMethods';
+
+// Controller identity comes from the namespace/function fields on one literal.
+// Matching adjacent fields also keeps declarations in separate blocks apart.
+function schemaMethodPairs(source: string): Set<string> {
+  const pairs = source.matchAll(
+    /\b(?:Channel)?ControllerSchema\s*\{\s*namespace:\s*"([a-z0-9_]+)"\s*,\s*function:\s*"([a-z0-9_]+)"/g
+  );
+  return new Set(Array.from(pairs, ([, namespace, fn]) => `openhuman.${namespace}_${fn}`));
+}
+
+describe('schema method pairing', () => {
+  test('keeps shared function names scoped to their controller namespace', () => {
+    const methods = schemaMethodPairs(`
+      ControllerSchema { namespace: "config", function: "update", description: "config" }
+      ControllerSchema { namespace: "health", function: "get", description: "health" }
+    `);
+    expect(methods.has('openhuman.config_update')).toBe(true);
+    expect(methods.has('openhuman.health_get')).toBe(true);
+    expect(methods.has('openhuman.config_get')).toBe(false);
+  });
+
+  test('detects a removed controller while the namespace and function still exist', () => {
+    const declaration =
+      'ControllerSchema { namespace: "config", function: "get", description: "read" }';
+    const source = `${declaration}
+      ControllerSchema { namespace: "config", function: "update", description: "write" }
+      ChannelControllerSchema { namespace: "channels", function: "get", description: "channel" }
+    `;
+    expect(schemaMethodPairs(source).has(CORE_RPC_METHODS.configGet)).toBe(true);
+    const removed = source.replace(declaration, '');
+    expect(removed).toContain('namespace: "config"');
+    expect(removed).toContain('function: "get"');
+    expect(schemaMethodPairs(removed).has(CORE_RPC_METHODS.configGet)).toBe(false);
+  });
+
+  test('reads multiline and channel schema literals and ignores unrelated fields', () => {
+    const methods = schemaMethodPairs(`
+      ChannelControllerSchema {
+        namespace: "channels",
+        function: "list",
+        description: "List channels",
+      }
+      FieldSchema { namespace: "config", function: "get" }
+    `);
+    expect([...methods]).toEqual(['openhuman.channels_list']);
+  });
+});
+
+describe('rpcMethods catalog', () => {
+  describe('normalizeRpcMethod', () => {
+    test('resolves all legacy aliases to their canonical core method', () => {
+      for (const [legacyMethod, coreMethod] of Object.entries(LEGACY_METHOD_ALIASES)) {
+        expect(normalizeRpcMethod(legacyMethod)).toBe(coreMethod);
+      }
+    });
+
+    test('transforms auth methods by replacing dots with underscores', () => {
+      expect(normalizeRpcMethod('openhuman.auth.login')).toBe('openhuman.auth_login');
+      expect(normalizeRpcMethod('openhuman.auth.get.state')).toBe('openhuman.auth_get_state');
+      expect(normalizeRpcMethod('openhuman.auth.a.b.c')).toBe('openhuman.auth_a_b_c');
+    });
+
+    test('returns unmapped or unrecognized methods unchanged', () => {
+      expect(normalizeRpcMethod('openhuman.threads_list')).toBe('openhuman.threads_list');
+      expect(normalizeRpcMethod('openhuman.unknown_method')).toBe('openhuman.unknown_method');
+      expect(normalizeRpcMethod('')).toBe('');
+      expect(normalizeRpcMethod('random_string')).toBe('random_string');
+    });
+
+    test('trims whitespace and converts to lower case', () => {
+      expect(normalizeRpcMethod('  OpenHuman.Auth.Login  ')).toBe('openhuman.auth_login');
+      expect(normalizeRpcMethod('  OPENHUMAN.GET_CONFIG ')).toBe(CORE_RPC_METHODS.configGet);
+      expect(normalizeRpcMethod('OpenHuman.Unrecognized_Status  ')).toBe(
+        'openhuman.unrecognized_status'
+      );
+      expect(normalizeRpcMethod('   some_RANDOM_method  ')).toBe('some_random_method');
+    });
+  });
+
+  test('legacy aliases point at canonical method values', () => {
+    expect(LEGACY_METHOD_ALIASES['openhuman.update_model_settings']).toBe(
+      CORE_RPC_METHODS.inferenceUpdateModelSettings
+    );
+    expect(LEGACY_METHOD_ALIASES['openhuman.workspace_onboarding_flag_set']).toBe(
+      CORE_RPC_METHODS.configWorkspaceOnboardingFlagSet
+    );
+  });
+
+  describe('MCP client legacy alias resolution (Sentry CORE-RUST-DW/DV/DT/DS/DR)', () => {
+    test('mcp_clients.list resolves to mcp_clients_installed_list', () => {
+      expect(normalizeRpcMethod('mcp_clients.list')).toBe(CORE_RPC_METHODS.mcpClientsInstalledList);
+    });
+
+    test('openhuman.mcp_clients_list resolves to mcp_clients_installed_list', () => {
+      expect(normalizeRpcMethod('openhuman.mcp_clients_list')).toBe(
+        CORE_RPC_METHODS.mcpClientsInstalledList
+      );
+    });
+
+    test('openhuman.mcp_list resolves to mcp_clients_installed_list', () => {
+      expect(normalizeRpcMethod('openhuman.mcp_list')).toBe(
+        CORE_RPC_METHODS.mcpClientsInstalledList
+      );
+    });
+
+    test('openhuman.mcp_servers_list resolves to mcp_clients_installed_list', () => {
+      expect(normalizeRpcMethod('openhuman.mcp_servers_list')).toBe(
+        CORE_RPC_METHODS.mcpClientsInstalledList
+      );
+    });
+
+    test('openhuman.tool_registry_call resolves to mcp_clients_tool_call', () => {
+      expect(normalizeRpcMethod('openhuman.tool_registry_call')).toBe(
+        CORE_RPC_METHODS.mcpClientsToolCall
+      );
+    });
+
+    test('dotted tool_registry.diagnostics resolves to the canonical method (#3294)', () => {
+      expect(normalizeRpcMethod('tool_registry.diagnostics')).toBe(
+        CORE_RPC_METHODS.toolRegistryDiagnostics
+      );
+      expect(CORE_RPC_METHODS.toolRegistryDiagnostics).toBe('openhuman.tool_registry_diagnostics');
+    });
+
+    test('canonical mcp_clients_installed_list passes through unchanged', () => {
+      expect(normalizeRpcMethod('openhuman.mcp_clients_installed_list')).toBe(
+        'openhuman.mcp_clients_installed_list'
+      );
+    });
+
+    test('canonical mcp_clients_tool_call passes through unchanged', () => {
+      expect(normalizeRpcMethod('openhuman.mcp_clients_tool_call')).toBe(
+        'openhuman.mcp_clients_tool_call'
+      );
+    });
+  });
+
+  describe('health legacy alias resolution (Sentry CORE-RUST-FG / CORE-RUST-G0)', () => {
+    test('health_snapshot resolves to openhuman.health_snapshot', () => {
+      expect(normalizeRpcMethod('health_snapshot')).toBe(CORE_RPC_METHODS.healthSnapshot);
+    });
+
+    test('openhuman.system_info resolves to openhuman.health_system_info (Sentry CORE-RUST-G0)', () => {
+      // Older clients called openhuman.system_info before the method was
+      // namespaced under health as openhuman.health_system_info.
+      expect(normalizeRpcMethod('openhuman.system_info')).toBe(CORE_RPC_METHODS.healthSystemInfo);
+    });
+
+    test('canonical health_system_info passes through unchanged', () => {
+      expect(normalizeRpcMethod('openhuman.health_system_info')).toBe(
+        'openhuman.health_system_info'
+      );
+    });
+  });
+
+  describe('channels legacy alias resolution (Sentry OPENHUMAN-CORE-1Y / OPENHUMAN-CORE-1Z)', () => {
+    test('dotted channel list aliases resolve to channels_list', () => {
+      expect(normalizeRpcMethod('channels.list')).toBe(CORE_RPC_METHODS.channelsList);
+      expect(normalizeRpcMethod('openhuman.channels.list')).toBe(CORE_RPC_METHODS.channelsList);
+    });
+
+    test('canonical channels_list passes through unchanged', () => {
+      expect(normalizeRpcMethod('openhuman.channels_list')).toBe('openhuman.channels_list');
+    });
+  });
+
+  test('catalog canonical methods exist in core schema registry (drift guard)', () => {
+    // Read a schema file PLUS every `*_part_*.rs` sibling in its directory.
+    //
+    // The repo's 750-line layout limit keeps splitting schema files into
+    // `include!`-stitched parts (schema_defs.rs → schemas_schema_part_01.rs,
+    // inference/schemas.rs → schemas_part_01.rs, …), and each split silently
+    // moved the `function: "…"` literals this guard greps out of the file it
+    // was reading. Sweeping the siblings makes the corpus follow the splits.
+    // Each namespace/function pair is read from a single controller literal.
+    // `readFileSync` throws if a listed base file moves entirely.
+    const readRustTree = (dir: string): string[] =>
+      fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+        const entryPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) return readRustTree(entryPath);
+        return entry.name.endsWith('.rs') && !entry.name.endsWith('_tests.rs')
+          ? [fs.readFileSync(entryPath, 'utf8')]
+          : [];
+      });
+
+    const readWithParts = (relFile: string): string => {
+      const abs = path.resolve(__dirname, relFile);
+      const dir = path.dirname(abs);
+      const parts = fs
+        .readdirSync(dir)
+        .filter(name => name.endsWith('.rs') && name.includes('_part_'))
+        .sort()
+        .map(name => fs.readFileSync(path.join(dir, name), 'utf8'));
+      // A split can instead promote `foo.rs` to `foo/mod.rs` with the former
+      // file retained as the module root. Scan that named companion directory
+      // too, excluding test modules, so its controller literals stay covered.
+      const companionDir = path.join(dir, path.basename(abs, '.rs'));
+      const companion = fs.existsSync(companionDir) ? readRustTree(companionDir) : [];
+      return [fs.readFileSync(abs, 'utf8'), ...parts, ...companion].join('\n');
+    };
+
+    const schemaSources = [
+      readWithParts('../../../../crates/openhuman-core/src/config/schemas/schema_defs.rs'),
+      readWithParts('../../../../crates/openhuman-core/src/inference/schemas.rs'),
+      readWithParts('../../../../crates/openhuman-core/src/inference/host_runtime/schemas.rs'),
+      readWithParts('../../../../crates/openhuman-core/src/inference/embedding_host/schemas.rs'),
+      // Agent chat is owned by agent_runs; core/all.rs composes these host-side
+      // controllers into the inference capability group.
+      readWithParts('../../../../crates/openhuman-core/src/agent_runs/schemas.rs'),
+      // `inference_agent_chat` / `_simple` are declared next to their handlers.
+      readWithParts('../../../../crates/openhuman-core/src/agent_runs/agent_chat/controllers.rs'),
+      // The MCP registry split its schemas module into a directory. Controller
+      // definitions (and therefore the mcp_clients literals this guard owns)
+      // live in `registry.rs`; keep this path explicit so another move fails
+      // loudly instead of silently shortening the scanned catalog.
+      readWithParts('../../../../crates/openhuman-core/src/mcp/registry/schemas/registry.rs'),
+      readWithParts('../../../../crates/openhuman-core/src/tools/registry/schemas.rs'),
+      readWithParts('../../../../crates/openhuman-core/src/platform/health/schemas.rs'),
+      readWithParts('../../../../crates/openhuman-core/src/channels/controllers/schemas.rs'),
+      // The credential handoff RPCs (`auth_set_credential` / `auth_clear_credential`).
+      readWithParts('../../../../crates/openhuman-core/src/security/credentials/schemas.rs'),
+      // The channels_* namespace/function literals now live in the vendored
+      // tinychannels workspace (`ChannelControllerSchema`), not in the thin
+      // `crates/openhuman-core/src/channels/controllers/schemas.rs` adapter above, which
+      // only converts from it (#4557 "Use tinychannels provider
+      // implementations") — read both so this drift guard still sees them.
+      //
+      // Controller metadata is contract, so it lives in the `tinychannels-bus`
+      // crate rather than the implementation crate. `readFileSync` throws on a
+      // missing path, which is what we want: if this file moves again the guard
+      // fails loudly instead of silently checking a shorter corpus and passing.
+      fs.readFileSync(
+        path.resolve(
+          __dirname,
+          '../../../../vendor/tinychannels/crates/tinychannels-bus/src/controllers/schemas.rs'
+        ),
+        'utf8'
+      ),
+    ].join('\n');
+
+    const registeredMethods = schemaMethodPairs(schemaSources);
+    for (const method of Object.values(CORE_RPC_METHODS)) {
+      // core.* methods (e.g. core.ping) are special dispatch methods, not in the schema catalog.
+      if (!method.startsWith('openhuman.')) continue;
+      const methodRoot = method.slice('openhuman.'.length);
+      // Memory v2 methods have their own guard below.
+      if (methodRoot.startsWith('memory_')) continue;
+      expect(registeredMethods, `${method} must have a complete controller declaration`).toContain(
+        method
+      );
+    }
+  });
+  // Memory v2 (docs/specs/memory-v2.md): every `openhuman.memory_*` method the
+  // UI calls must be a controller somewhere under the core's memory domain.
+  // The whole tree is scanned so the guard follows the domain's layout instead
+  // of one schema file. Until the v2 controllers land in the core (marker:
+  // `memory_items_list`, which v1 never had) the check is reported as skipped
+  // rather than silently passing.
+  const memoryDomainDir = path.resolve(__dirname, '../../../../crates/openhuman-core/src/memory');
+  const readMemoryTree = (dir: string): string[] =>
+    fs.readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) return readMemoryTree(entryPath);
+      return entry.name.endsWith('.rs') && !entry.name.endsWith('_tests.rs')
+        ? [fs.readFileSync(entryPath, 'utf8')]
+        : [];
+    });
+  const memorySources = fs.existsSync(memoryDomainDir)
+    ? readMemoryTree(memoryDomainDir).join('\n')
+    : '';
+  const memoryV2Landed = memorySources.includes('function: "items_list"');
+
+  test.skipIf(!memoryV2Landed)('memory v2 methods exist in the core memory domain', () => {
+    const memoryMethods = Object.values(CORE_RPC_METHODS).filter(m =>
+      m.startsWith('openhuman.memory_')
+    );
+    expect(memoryMethods.length).toBeGreaterThan(0);
+    for (const method of memoryMethods) {
+      const fnName = method.slice('openhuman.memory_'.length);
+      expect(memorySources).toContain(`function: "${fnName}"`);
+    }
+  });
+});

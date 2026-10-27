@@ -1,0 +1,21 @@
+.open-in-ide-control {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+}
+
+.open-in-ide-error {
+  position: absolute;
+  z-index: 10;
+  bottom: calc(100% + var(--space-2));
+  left: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: min(var(--overview-group-width), 65cqw);
+  padding: var(--space-3);
+  font-size: var(--type-label);
+}
+
+.open-in-ide-error > span { flex: 1; min-width: 0; }

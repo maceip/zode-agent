@@ -1,0 +1,138 @@
+.cordis-code-block {
+  --code-block-font-size: 13px;
+  --code-block-radius: 12px;
+  margin: 14px 0 16px;
+  overflow: hidden;
+  color: var(--code-block-text, #4d536b);
+  border: 1px solid var(--code-block-border, rgba(75, 81, 105, 0.045));
+  border-radius: var(--code-block-radius);
+  background: var(--code-block-background, rgba(229, 230, 236, 0.9));
+  box-shadow: none;
+}
+
+.cordis-code-block figcaption {
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 9px 3px;
+  color: var(--code-block-muted, #7d8294);
+  font: 500 11px/1.2 var(--sans);
+}
+
+.cordis-code-block figcaption > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cordis-code-block-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: calc(var(--space-1) / 2);
+  margin-left: var(--space-2);
+}
+
+.cordis-code-block figcaption button {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: var(--code-block-muted, #777d91);
+  border: 0;
+  border-radius: 7px;
+  outline: 0;
+  background: transparent;
+  cursor: pointer;
+}
+
+.cordis-code-block figcaption button:hover,
+.cordis-code-block figcaption button:focus-visible {
+  color: var(--code-block-text, #4e556e);
+  background: var(--code-block-hover, rgba(255, 255, 255, 0.44));
+}
+
+.cordis-code-block figcaption button:focus-visible { box-shadow: 0 0 0 3px var(--accent-ring); }
+
+figure.cordis-code-block > pre {
+  max-width: 100%;
+  margin: 0;
+  overflow: auto;
+  padding: 9px 9px 14px;
+  color: var(--code-block-text, #4d536b);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+figure.cordis-code-block > pre > code {
+  display: block;
+  padding: 0;
+  color: inherit;
+  border: 0;
+  background: transparent;
+  font: 500 var(--code-block-font-size)/1.62 var(--mono);
+  tab-size: 2;
+  white-space: pre;
+}
+
+figure.cordis-code-block[data-wrap='true'] > pre {
+  overflow: visible;
+}
+
+figure.cordis-code-block[data-wrap='true'] > pre > code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.cordis-code-block .token.comment,
+.cordis-code-block .token.prolog,
+.cordis-code-block .token.doctype,
+.cordis-code-block .token.cdata {
+  color: var(--code-block-comment, #a4a5ae);
+  font-style: italic;
+}
+
+.cordis-code-block .token.punctuation { color: var(--code-block-punctuation, #51576e); }
+.cordis-code-block .token.namespace { opacity: 0.78; }
+.cordis-code-block .token.keyword,
+.cordis-code-block .token.atrule { color: var(--code-block-keyword, #c023b6); }
+.cordis-code-block .token.function,
+.cordis-code-block .token.method,
+.cordis-code-block .token.function-variable { color: var(--code-block-function, #326df0); }
+.cordis-code-block .token.class-name,
+.cordis-code-block .token.builtin,
+.cordis-code-block .token.constant { color: var(--code-block-class, #7352bd); }
+.cordis-code-block .token.string,
+.cordis-code-block .token.char,
+.cordis-code-block .token.attr-value { color: var(--code-block-string, #18876e); }
+.cordis-code-block .token.number,
+.cordis-code-block .token.boolean { color: var(--code-block-number, #b56418); }
+.cordis-code-block .token.operator,
+.cordis-code-block .token.entity,
+.cordis-code-block .token.url { color: var(--code-block-operator, #555d78); }
+.cordis-code-block .token.variable,
+.cordis-code-block .token.parameter { color: var(--code-block-variable, #4d536b); }
+.cordis-code-block .token.property,
+.cordis-code-block .token.tag,
+.cordis-code-block .token.symbol { color: var(--code-block-property, #b83486); }
+.cordis-code-block .token.regex,
+.cordis-code-block .token.important { color: var(--code-block-regex, #a46300); }
+
+.cordis-code-block[data-language='diff'] .token.coord {
+  color: var(--code-block-diff-meta, #858b9d);
+}
+
+.cordis-code-block[data-language='diff'] .token.deleted-sign {
+  color: var(--code-block-diff-deleted, #a84354);
+  background: var(--code-block-diff-deleted-bg, rgba(212, 45, 67, 0.075));
+}
+
+.cordis-code-block[data-language='diff'] .token.inserted-sign {
+  color: var(--code-block-diff-inserted, #277e31);
+  background: var(--code-block-diff-inserted-bg, rgba(45, 154, 49, 0.075));
+}

@@ -1,0 +1,53 @@
+{
+  "name": "comma-agents",
+  "private": true,
+  "version": "2.0.0-rc.1",
+  "description": "Composable agent orchestration framework",
+  "workspaces": [
+    "packages/*",
+    "examples",
+    "examples/e2e"
+  ],
+  "scripts": {
+    "build": "bun run --filter '*' build",
+    "test": "bun run --filter '*' test",
+    "test:e2e": "bun test examples/e2e/",
+    "lint": "bunx @biomejs/biome check .",
+    "lint:fix": "bunx @biomejs/biome check --write .",
+    "format": "bunx @biomejs/biome format --write .",
+    "knip": "knip",
+    "cli": "bun run packages/cli/src/main.ts",
+    "cli:build": "bun run --cwd packages/cli build",
+    "cli:build:standalone": "bun run --cwd packages/cli build:standalone",
+    "cli:link": "bun run --cwd packages/cli link:global",
+    "cli:unlink": "bun run --cwd packages/cli unlink:global",
+    "packages:build": "bun run --cwd packages/core build && bun run --cwd packages/daemon build && bun run --cwd packages/tui build && bun run --cwd packages/cli build",
+    "packages:validate": "bun run scripts/validate-public-packages.ts",
+    "release:version": "bun run scripts/release-version.ts sync",
+    "release:check-tag": "bun run scripts/release-version.ts check-tag",
+    "hooks:install": "git config core.hooksPath .githooks",
+    "version": "bun run release:version && bun run packages:build && bun run packages:validate",
+    "daemon": "bun run --filter @comma-agents/daemon start",
+    "tui": "bun run --cwd packages/tui start",
+    "example": "bun run examples/core/strategies/run.ts",
+    "example:tui": "bun run --cwd examples tui",
+    "docs": "bun run --cwd docs dev",
+    "docs:build": "bun run --cwd docs build",
+    "tui:docs": "bun run --cwd packages/tui/docs dev",
+    "tui:docs:build": "bun run --cwd packages/tui/docs build",
+    "tui:e2e": "COMMA_TUI_E2E=1 bun test examples/e2e/tui --max-concurrency=1",
+    "tui:storybook": "bun run --cwd packages/tui-storybook storybook",
+    "tui:storybook:build": "bun run --cwd packages/tui-storybook build"
+  },
+  "author": "CloAI",
+  "license": "MIT",
+  "devDependencies": {
+    "@biomejs/biome": "2.4.2",
+    "bun-types": "1.3.9",
+    "knip": "6.0.5",
+    "typescript": "6.0.2"
+  },
+  "patchedDependencies": {
+    "ink@7.0.1": "patches/ink@7.0.1.patch"
+  }
+}

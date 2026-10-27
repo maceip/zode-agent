@@ -1,0 +1,186 @@
+use crate::core::runtime::DispatchCtx;
+use serde::de::{self, DeserializeOwned};
+use serde::Deserialize;
+use serde_json::{Map, Value};
+
+use crate::core::all::{
+    BoundRegisteredController, ControllerEntry, ControllerFuture, RegisteredController,
+};
+use crate::core::{ControllerSchema, FieldSchema, TypeSchema};
+
+use super::ops::StoredAppStatePatch;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateLocalStateParams {
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    encryption_key: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    onboarding_tasks: Option<Option<super::ops::StoredOnboardingTasks>>,
+    #[serde(default, deserialize_with = "deserialize_nullable_patch")]
+    keyring_consent: Option<Option<crate::security::keyring_consent::ConsentPreference>>,
+}
+
+pub fn all_app_state_controller_schemas() -> Vec<ControllerSchema> {
+    vec![
+        app_state_schemas("snapshot"),
+        app_state_schemas("update_local_state"),
+    ]
+}
+
+pub fn all_app_state_registered_controllers() -> Vec<RegisteredController> {
+    vec![
+        RegisteredController {
+            schema: app_state_schemas("snapshot"),
+            handler: handle_snapshot,
+        },
+        RegisteredController {
+            schema: app_state_schemas("update_local_state"),
+            handler: handle_update_local_state,
+        },
+    ]
+}
+
+pub(crate) fn all_app_state_controller_entries() -> Vec<ControllerEntry> {
+    vec![
+        ControllerEntry::bound(snapshot_controller()),
+        ControllerEntry::bound(update_local_state_controller()),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn app_state_parameter_contracts() -> Vec<crate::core::all::ControllerParamContract> {
+    tests::parameter_contracts()
+}
+
+pub fn app_state_schemas(function: &str) -> ControllerSchema {
+    match function {
+        "snapshot" => ControllerSchema {
+            namespace: "app_state",
+            function: "snapshot",
+            description: "Fetch the core-owned app snapshot for the React shell.",
+            inputs: vec![],
+            outputs: vec![FieldSchema {
+                name: "result",
+                ty: TypeSchema::Json,
+                comment: "Auth, current user, local app state, and compact runtime status for the React shell.",
+                required: true,
+            }],
+        },
+        "update_local_state" => ControllerSchema {
+            namespace: "app_state",
+            function: "update_local_state",
+            description: "Update core-owned local app state persisted under the workspace.",
+            inputs: vec![
+                optional_json(
+                    "encryptionKey",
+                    "Set or clear the locally stored encryption key.",
+                ),
+                optional_json(
+                    "onboardingTasks",
+                    "Set or clear locally stored onboarding task progress.",
+                ),
+                optional_json(
+                    "keyringConsent",
+                    "Set or clear the user's keyring consent preference.",
+                ),
+            ],
+            outputs: vec![FieldSchema {
+                name: "result",
+                ty: TypeSchema::Json,
+                comment: "Updated locally persisted app state.",
+                required: true,
+            }],
+        },
+        _ => ControllerSchema {
+            namespace: "app_state",
+            function: "unknown",
+            description: "Unknown app_state controller.",
+            inputs: vec![],
+            outputs: vec![FieldSchema {
+                name: "error",
+                ty: TypeSchema::String,
+                comment: "Lookup error details.",
+                required: true,
+            }],
+        },
+    }
+}
+
+fn handle_snapshot(ctx: DispatchCtx, _params: Map<String, Value>) -> ControllerFuture {
+    snapshot_controller().invoke(ctx, _params)
+}
+
+fn handle_update_local_state(ctx: DispatchCtx, params: Map<String, Value>) -> ControllerFuture {
+    update_local_state_controller().invoke(ctx, params)
+}
+
+fn snapshot_controller() -> BoundRegisteredController {
+    BoundRegisteredController::typed(app_state_schemas("snapshot"), parse_snapshot, run_snapshot)
+}
+
+fn update_local_state_controller() -> BoundRegisteredController {
+    BoundRegisteredController::typed(
+        app_state_schemas("update_local_state"),
+        parse_update_local_state,
+        run_update_local_state,
+    )
+}
+
+fn parse_snapshot(_params: Map<String, Value>) -> Result<(), String> {
+    Ok(())
+}
+
+fn parse_update_local_state(params: Map<String, Value>) -> Result<StoredAppStatePatch, String> {
+    let payload: UpdateLocalStateParams = serde_json::from_value(Value::Object(params))
+        .map_err(|e| format!("invalid params: {e}"))?;
+    Ok(StoredAppStatePatch {
+        encryption_key: payload.encryption_key,
+        onboarding_tasks: payload.onboarding_tasks,
+        keyring_consent: payload.keyring_consent,
+    })
+}
+
+fn run_snapshot(ctx: DispatchCtx, (): ()) -> ControllerFuture {
+    Box::pin(async move {
+        crate::desktop::app_state::snapshot(&ctx)
+            .await?
+            .into_cli_compatible_json()
+    })
+}
+
+fn run_update_local_state(ctx: DispatchCtx, patch: StoredAppStatePatch) -> ControllerFuture {
+    Box::pin(async move {
+        crate::desktop::app_state::update_local_state(&ctx, patch)
+            .await?
+            .into_cli_compatible_json()
+    })
+}
+
+fn optional_json(name: &'static str, comment: &'static str) -> FieldSchema {
+    FieldSchema {
+        name,
+        ty: TypeSchema::Json,
+        comment,
+        required: false,
+    }
+}
+
+fn deserialize_nullable_patch<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: DeserializeOwned,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        Some(value) => T::deserialize(value)
+            .map(Some)
+            .map(Some)
+            .map_err(de::Error::custom),
+        None => Ok(Some(None)),
+    }
+}
+
+#[cfg(test)]
+#[path = "schemas_tests.rs"]
+mod tests;

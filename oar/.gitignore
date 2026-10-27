@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.DS_Store
+*.tgz
+oar-trial-run/
+
+# Local host-detection / bake artifacts (never publish)
+artifacts-local/
+
+*.tsbuildinfo

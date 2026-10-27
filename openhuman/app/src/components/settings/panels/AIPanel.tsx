@@ -1,0 +1,465 @@
+/*
+ * AI settings — three orthogonal sections:
+ *   1. Cloud providers (credentials + primary selection)
+ *   2. Local provider (Ollama runtime + installed models)
+ *   3. Workload routing (8-row matrix; per-workload provider + model, always
+ *      shown in full — there is no collapsed "managed / one model" mode)
+ *
+ * "Primary cloud" is an abstraction: any workload set to "Primary" inherits
+ * whichever cloud provider is currently marked primary. Overrides are explicit
+ * per row, so the resolved provider+model is always rendered inline.
+ *
+ * This file is a thin composition — every section lives in `./ai/*`.
+ */
+import { useCallback, useEffect, useRef, useState } from 'react';
+
+import { useT } from '../../../lib/i18n/I18nContext';
+import {
+  clearCloudProviderKey,
+  upsertModelRegistryVision,
+} from '../../../services/api/aiSettingsApi';
+import { connectOpenRouterViaOAuth } from '../../../utils/openrouterOAuth';
+import PanelPage from '../../layout/PanelPage';
+import SettingsBackButton from '../components/SettingsBackButton';
+import { useSettingsNavigation } from '../hooks/useSettingsNavigation';
+import {
+  buildRoutingDiffSummary,
+  BUILTIN_PROVIDER_META,
+  type CloudProvider,
+  defaultEndpointFor,
+  inferRoutingMode,
+  ROUTING_WORKLOAD_IDS,
+  type WorkloadId,
+  WORKLOADS,
+} from './ai/aiPanelTypes';
+import { BackgroundLoopControls } from './ai/BackgroundLoopControls';
+import { CloudProviderEditor } from './ai/CloudProviderEditor';
+import { CustomRoutingDialog } from './ai/CustomRoutingDialog';
+import { DefaultModelRow } from './ai/DefaultModelRow';
+import { ProviderAuthSection } from './ai/ProviderAuthSection';
+import { ProviderKeyDialog } from './ai/ProviderConnectControls';
+import { SaveBar } from './ai/SaveBar';
+import { useAISettings, useInstalledModels, useOllamaStatus } from './ai/useAISettingsState';
+import { useCloudProviderEditorSubmit } from './ai/useCloudProviderEditorSubmit';
+import { useProviderConnect } from './ai/useProviderConnect';
+import { WorkloadRow } from './ai/WorkloadRow';
+import { WorkloadTable } from './ai/WorkloadTable';
+import { routingWithProviderRemoved } from './aiRouting';
+
+export type { CloudProvider, ProviderRef, RoutingMap } from './ai/aiPanelTypes';
+export { buildRoutingDiffSummary, BackgroundLoopControls };
+
+export type AIPanelTab = 'providers' | 'routing';
+
+interface AIPanelProps {
+  /** When true, the panel is rendered embedded inside another flow (e.g. the
+   *  onboarding custom wizard) and skips its own SettingsHeader chrome so the
+   *  host frame's title/back controls aren't duplicated. */
+  embedded?: boolean;
+  /** Selected section when the host owns the page-level chip tabs. */
+  tab?: AIPanelTab;
+  /** Called when the selected section changes. */
+  onTabChange?: (tab: AIPanelTab) => void;
+  /** Suppress PanelPage's internal tab chrome for a host-rendered chip row. */
+  hideTabChrome?: boolean;
+  /**
+   * Reports whether the panel holds unsaved edits.
+   *
+   * The onboarding wizard needs this: the panel keeps its own `SaveBar`, so a
+   * host with its own Continue button offers two competing ways to commit, and
+   * Continue used to navigate away and drop the edits silently. The wizard
+   * subscribes and disables Continue while dirty. Undefined for Settings,
+   * which has no second commit control.
+   */
+  onDirtyChange?: (dirty: boolean) => void;
+  /** Host-owned "Add provider" dialog state (the host renders the button in
+   *  its header). Undefined lets the providers section keep its own button. */
+  addProviderOpen?: boolean;
+  onAddProviderOpenChange?: (open: boolean) => void;
+}
+
+const AIPanel = ({
+  embedded = false,
+  tab: controlledTab,
+  onTabChange,
+  hideTabChrome = false,
+  addProviderOpen,
+  onAddProviderOpenChange,
+  onDirtyChange,
+}: AIPanelProps = {}) => {
+  const { t } = useT();
+  const { navigateBack } = useSettingsNavigation();
+  const { saved, draft, isDirty, save, persist, discard, loading, error, reload } = useAISettings();
+
+  // Let a host with its own commit control know there are unsaved edits. See
+  // the prop's note: without this the wizard's Continue silently discarded them.
+  useEffect(() => {
+    onDirtyChange?.(isDirty);
+  }, [isDirty, onDirtyChange]);
+  // #1574 §4b: advisory re-embed modal, driven by the backend status RPC.
+  const ollama = useOllamaStatus();
+  const installed = useInstalledModels(ollama.snapshot);
+  const [editing, setEditing] = useState<CloudProvider | 'new' | null>(null);
+  // Which workload's "Custom" dialog is currently open (null = closed).
+  const [pickerFor, setPickerFor] = useState<WorkloadId | null>(null);
+  // Which provider slug's API-key dialog is currently open (null = closed).
+  const [keyDialogFor, setKeyDialogFor] = useState<string | null>(null);
+  // When the user toggles LM Studio / Ollama (local runtimes), we need to
+  // remember which label to attach to the upserted provider. Cleared when
+  // the dialog closes.
+  const [pendingLocalLabel, setPendingLocalLabel] = useState<string | null>(null);
+  const openRouterOauthAbortRef = useRef<AbortController | null>(null);
+  // Two orthogonal jobs on one page: WHICH providers exist, and WHICH one
+  // each workload uses. They were stacked, so the routing controls sat below
+  // a provider list whose length varies with the user's setup. Tabs give each
+  // the full pane and a stable position.
+  const [uncontrolledTab, setUncontrolledTab] = useState<AIPanelTab>('providers');
+  const tab = controlledTab ?? uncontrolledTab;
+  const handleTabChange = (nextTab: AIPanelTab) => {
+    if (controlledTab === undefined) setUncontrolledTab(nextTab);
+    onTabChange?.(nextTab);
+  };
+
+  const {
+    busyAction,
+    setBusyAction,
+    codexAuthError,
+    providerAuthErrors,
+    providerSaveNotice,
+    setProviderSaveNotice,
+    connectProvider,
+    connectOpenAiViaCodexAuth,
+  } = useProviderConnect({
+    draft,
+    saved,
+    persist,
+    t,
+    onConnected: () => {
+      setKeyDialogFor(null);
+      setPendingLocalLabel(null);
+    },
+  });
+
+  const handleOpenAiOAuthCompleted = useCallback(async () => {
+    try {
+      await connectProvider({ slug: 'openai', value: 'oauth', credentialMode: 'codex_oauth' });
+      console.debug('[ai-settings:openai-oauth] provider registration succeeded', {
+        provider: 'openai',
+      });
+    } catch (err) {
+      console.warn('[ai-settings:openai-oauth] provider registration failed', {
+        provider: 'openai',
+      });
+      await reload();
+      throw err;
+    }
+  }, [connectProvider, reload]);
+
+  const handleOpenAiOAuthDisconnected = useCallback(async () => {
+    const existing = draft.cloudProviders.find(cp => cp.slug === 'openai');
+    if (!existing) return;
+    const remaining = draft.cloudProviders.filter(cp => cp.id !== existing.id);
+    const nextRouting = routingWithProviderRemoved(
+      draft.routing,
+      { slug: existing.slug, isLocalRuntime: false },
+      remaining
+    );
+    try {
+      await persist({ ...draft, cloudProviders: remaining, routing: nextRouting });
+      console.debug('[ai-settings:openai-oauth] provider removal succeeded', {
+        provider: 'openai',
+      });
+    } catch (err) {
+      console.warn('[ai-settings:openai-oauth] provider removal failed', { provider: 'openai' });
+      await reload();
+      throw err;
+    }
+  }, [draft, persist, reload]);
+
+  const submitCloudProviderEdit = useCloudProviderEditorSubmit({
+    editing,
+    draft,
+    saved,
+    persist,
+    t,
+    onDone: () => setEditing(null),
+  });
+
+  const diffSummary = buildRoutingDiffSummary(saved.routing, draft.routing, t);
+  const chatRows = WORKLOADS.filter(w => w.group === 'chat');
+  const bgRows = WORKLOADS.filter(w => w.group === 'background');
+  const inferredRoutingModeRaw = inferRoutingMode(draft.routing);
+  // Routing mode is derived purely from the workload routing map, not from the
+  // set of configured providers: saving a provider key only adds a
+  // `cloudProviders` entry, it does not rewrite `routing`. Surfaced for
+  // support diagnostics (the recurring "my key is added but not used" question).
+  const configuredWithKey = draft.cloudProviders.filter(p => p.maskedKey.startsWith('••••'));
+  console.debug('[ai-settings][routing] inferred mode', {
+    mode: inferredRoutingModeRaw,
+    routing: ROUTING_WORKLOAD_IDS.map(id => `${id}:${draft.routing[id]?.kind}`),
+    configured_providers: draft.cloudProviders.map(p => p.slug),
+    configured_with_key: configuredWithKey.map(p => p.slug),
+    configured_but_managed: inferredRoutingModeRaw === 'managed' && configuredWithKey.length > 0,
+  });
+
+  return (
+    <>
+      <PanelPage
+        className="z-10"
+        contentClassName=""
+        description={embedded ? undefined : t('pages.settings.ai.llmDesc')}
+        leading={embedded ? undefined : <SettingsBackButton onBack={navigateBack} />}
+        tabsAriaLabel={t('pages.settings.ai.llm')}
+        tabsTestIdPrefix="ai-tab"
+        value={tab}
+        onChange={handleTabChange}
+        hideTabChrome={hideTabChrome}
+        scrollable={!hideTabChrome}
+        tabs={[
+          {
+            id: 'providers',
+            label: t('settings.ai.llmProviders'),
+            contentClassName: embedded || hideTabChrome ? '' : 'p-4',
+            content: (
+              <div className="flex w-full flex-col gap-4">
+                <ProviderAuthSection
+                  hideAddButton={hideTabChrome}
+                  draft={draft}
+                  persist={persist}
+                  loading={loading}
+                  error={error}
+                  busyAction={busyAction}
+                  providerAuthErrors={providerAuthErrors}
+                  providerSaveNotice={providerSaveNotice}
+                  onDismissProviderSaveNotice={() => setProviderSaveNotice(null)}
+                  onProviderRemoved={slug =>
+                    setProviderSaveNotice(prev => (prev?.slug === slug ? null : prev))
+                  }
+                  codexAuthError={codexAuthError}
+                  onConnectCodex={() => void connectOpenAiViaCodexAuth()}
+                  onConnectProvider={connectProvider}
+                  onOpenKeyDialog={(slug, localLabel) => {
+                    setKeyDialogFor(slug);
+                    setPendingLocalLabel(localLabel);
+                  }}
+                  onAddCustomProvider={() => setEditing('new')}
+                  onEditCustomProvider={provider => setEditing(provider)}
+                  addOpen={addProviderOpen}
+                  onAddOpenChange={onAddProviderOpenChange}
+                />
+                {isDirty && (
+                  <SaveBar
+                    diffSummary={diffSummary}
+                    changeCount={diffSummary.length}
+                    onSave={() => void save()}
+                    onDiscard={discard}
+                  />
+                )}
+              </div>
+            ),
+          },
+          {
+            id: 'routing',
+            label: t('settings.ai.routing'),
+            contentClassName: embedded || hideTabChrome ? '' : 'p-4',
+            content: (
+              <div className="flex w-full flex-col gap-4">
+                {/* ═══════════════════════════════════════════════════════════════
+              ROUTING — per-workload provider + model. There is no separate
+              "managed / own / custom" mode any more: every row is explicit,
+              and Managed is just one of the sources a row can pick.
+              ═══════════════════════════════════════════════════════════════ */}
+                <WorkloadTable
+                  title={t('settings.ai.routing.chatAndConversations')}
+                  description={t('settings.ai.routing.chatDesc')}
+                  data-testid="routing-group-chat">
+                  <DefaultModelRow
+                    value={draft.defaultModel}
+                    onChange={model => persist({ ...draft, defaultModel: model })}
+                  />
+                  {chatRows.map(w => (
+                    <WorkloadRow
+                      key={w.id}
+                      workload={w}
+                      ref_={draft.routing[w.id]}
+                      cloudProviders={draft.cloudProviders}
+                      onCustomClick={() => setPickerFor(w.id)}
+                    />
+                  ))}
+                </WorkloadTable>
+
+                <WorkloadTable
+                  title={t('settings.ai.routing.backgroundTasks')}
+                  description={t('settings.ai.routing.bgTasksDesc')}
+                  data-testid="routing-group-background">
+                  {bgRows.map(w => (
+                    <WorkloadRow
+                      key={w.id}
+                      workload={w}
+                      ref_={draft.routing[w.id]}
+                      cloudProviders={draft.cloudProviders}
+                      onCustomClick={() => setPickerFor(w.id)}
+                    />
+                  ))}
+                </WorkloadTable>
+                {isDirty && (
+                  <SaveBar
+                    diffSummary={diffSummary}
+                    changeCount={diffSummary.length}
+                    onSave={() => void save()}
+                    onDiscard={discard}
+                  />
+                )}
+              </div>
+            ),
+          },
+        ]}
+      />
+      {editing && (
+        <CloudProviderEditor
+          initial={editing === 'new' ? null : editing}
+          existingSlugs={draft.cloudProviders
+            .filter(p => p.id !== (editing === 'new' ? '' : editing.id))
+            .map(p => p.slug)}
+          onClose={() => setEditing(null)}
+          onSubmit={async (next, apiKey, opts) => {
+            setBusyAction('save-provider');
+            try {
+              await submitCloudProviderEdit(next, apiKey, opts);
+            } finally {
+              setBusyAction(null);
+            }
+          }}
+          onClearKey={async slug => {
+            // Clearing this provider's key drops its own advisory (#5341).
+            setProviderSaveNotice(prev => (prev?.slug === slug ? null : prev));
+            try {
+              await clearCloudProviderKey(slug);
+              await reload();
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              console.warn('[ai-settings] clearCloudProviderKey failed', msg);
+            }
+          }}
+        />
+      )}
+
+      {pickerFor &&
+        (() => {
+          const current = draft.routing[pickerFor];
+          const workload = WORKLOADS.find(candidate => candidate.id === pickerFor);
+          if (!workload) return null;
+          return (
+            <CustomRoutingDialog
+              workload={workload}
+              initial={current}
+              cloudProviders={draft.cloudProviders}
+              localModels={installed}
+              ollamaRunning={ollama.state === 'running' || ollama.state === 'degraded'}
+              modelRegistry={draft.modelRegistry}
+              onClose={() => setPickerFor(null)}
+              onSubmit={(next, vision) => {
+                const registryTarget =
+                  next.kind === 'cloud'
+                    ? { slug: next.providerSlug, model: next.model }
+                    : next.kind === 'local'
+                      ? { slug: 'ollama', model: next.model }
+                      : next.kind === 'claude-code'
+                        ? { slug: 'claude-code', model: next.model }
+                        : null;
+                void persist({
+                  ...draft,
+                  routing: { ...draft.routing, [pickerFor]: next },
+                  modelRegistry: registryTarget
+                    ? upsertModelRegistryVision(
+                        draft.modelRegistry,
+                        registryTarget.slug,
+                        registryTarget.model,
+                        vision
+                      )
+                    : draft.modelRegistry,
+                });
+                setPickerFor(null);
+              }}
+            />
+          );
+        })()}
+
+      {keyDialogFor && (
+        <ProviderKeyDialog
+          slug={keyDialogFor}
+          label={pendingLocalLabel ?? BUILTIN_PROVIDER_META[keyDialogFor]?.label ?? keyDialogFor}
+          isLocalRuntime={Boolean(pendingLocalLabel)}
+          // OMLX is the only endpoint+key local runtime: render both an endpoint
+          // field (prefilled with the localhost default) and an API key field.
+          endpointKeyMode={keyDialogFor === 'omlx'}
+          initialValue={
+            pendingLocalLabel
+              ? (draft.cloudProviders.find(cp => cp.slug === keyDialogFor)?.endpoint ??
+                (keyDialogFor === 'omlx' ? defaultEndpointFor('omlx') : undefined))
+              : undefined
+          }
+          oauthAction={
+            keyDialogFor === 'openrouter' && !pendingLocalLabel
+              ? {
+                  label: t('settings.ai.signInWithOpenRouter'),
+                  onClick: async ({ onPersisting }) => {
+                    const controller = new AbortController();
+                    openRouterOauthAbortRef.current = controller;
+                    try {
+                      const apiKey = await connectOpenRouterViaOAuth({ signal: controller.signal });
+                      // A key exists now and cancelling cannot undo saving it, so a
+                      // cancel that already landed wins and later ones are locked out.
+                      if (controller.signal.aborted) return;
+                      onPersisting();
+                      await connectProvider({
+                        slug: 'openrouter',
+                        value: apiKey,
+                        credentialMode: 'oauth',
+                      });
+                    } finally {
+                      if (openRouterOauthAbortRef.current === controller) {
+                        openRouterOauthAbortRef.current = null;
+                      }
+                    }
+                  },
+                }
+              : null
+          }
+          openAiOAuth={
+            keyDialogFor === 'openai' && !pendingLocalLabel
+              ? {
+                  onCompleted: handleOpenAiOAuthCompleted,
+                  onDisconnected: handleOpenAiOAuthDisconnected,
+                }
+              : null
+          }
+          onCancel={() => {
+            openRouterOauthAbortRef.current?.abort();
+            openRouterOauthAbortRef.current = null;
+            setKeyDialogFor(null);
+            setPendingLocalLabel(null);
+          }}
+          onSubmit={async (value, endpoint) =>
+            await connectProvider({
+              slug: keyDialogFor,
+              localLabel: pendingLocalLabel,
+              // In endpoint_key (OMLX) mode the dialog hands back the API key as
+              // `value` and the endpoint URL as `endpoint`.
+              value,
+              endpoint,
+              credentialMode:
+                keyDialogFor === 'omlx'
+                  ? 'endpoint_key'
+                  : pendingLocalLabel
+                    ? 'endpoint'
+                    : 'api_key',
+            })
+          }
+        />
+      )}
+    </>
+  );
+};
+
+export default AIPanel;

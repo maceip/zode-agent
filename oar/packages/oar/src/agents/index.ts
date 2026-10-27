@@ -1,0 +1,24 @@
+/**
+ * Subagents: child sessions on any runtime that a host starts, follows and
+ * feeds back into a parent. Node-only, like the root entry. See
+ * docs/spec/subagents.md.
+ */
+export { createSubagents } from "./crew.js";
+export { SUBAGENT_DEPTH_ENV } from "./helpers.js";
+export { formatReport, parseReport, reportOrigin } from "./report.js";
+export type { ParsedReport, ReportOutcome } from "./report.js";
+export type {
+  SendMode,
+  SendResult,
+  SpawnOptions,
+  SpawnRefusalCode,
+  SpawnResult,
+  Subagent,
+  SubagentInfo,
+  SubagentReport,
+  Subagents,
+  SubagentsOptions,
+  SubagentState,
+  SubagentTaskEvent,
+  WaitOptions,
+} from "./types.js";

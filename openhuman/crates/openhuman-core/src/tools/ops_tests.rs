@@ -1,0 +1,363 @@
+use super::*;
+use crate::config::{BrowserConfig, Config};
+use crate::security::credentials::{AuthService, APP_SESSION_PROVIDER, DEFAULT_AUTH_PROFILE_NAME};
+use crate::security::AuditLogger;
+use crate::tools::ops::{all_tools, tool_group};
+use tempfile::TempDir;
+use tinytools::ToolContent;
+use tinytools::ToolResult;
+
+fn test_config(tmp: &TempDir) -> Config {
+    Config {
+        workspace_dir: tmp.path().join("workspace"),
+        action_dir: tmp.path().join("workspace"),
+        config_path: tmp.path().join("config.toml"),
+        ..Config::default()
+    }
+}
+
+fn tool_names(tools: &[Box<dyn Tool>]) -> Vec<String> {
+    tools.iter().map(|t| t.name().to_string()).collect()
+}
+
+fn assert_contains_all(names: &[String], expected: &[&str]) {
+    for name in expected {
+        assert!(
+            names.iter().any(|n| n == name),
+            "expected tool `{name}` to be registered; got: {names:?}"
+        );
+    }
+}
+
+fn only_json_content(result: &ToolResult) -> &serde_json::Value {
+    match result.content.as_slice() {
+        [ToolContent::Json { data }] => data,
+        other => panic!("expected a single JSON content block, got {other:?}"),
+    }
+}
+
+fn store_test_session_token(config: &Config) {
+    AuthService::from_config(config)
+        .store_provider_token(
+            APP_SESSION_PROVIDER,
+            DEFAULT_AUTH_PROFILE_NAME,
+            "test-token",
+            std::collections::HashMap::new(),
+            true,
+        )
+        .expect("store test session token");
+}
+
+fn integration_test_config(tmp: &TempDir, backend_url: &str) -> Config {
+    let mut cfg = test_config(tmp);
+    cfg.api_url = Some(backend_url.to_string());
+    cfg.integrations.google_places.enabled = true;
+    cfg.integrations.parallel.enabled = true;
+    cfg.integrations.tinyfish.enabled = true;
+    cfg.integrations.stock_prices.enabled = true;
+    cfg
+}
+
+fn integration_tools_for_config(tmp: &TempDir, cfg: &Config) -> Vec<Box<dyn Tool>> {
+    let security = Arc::new(SecurityPolicy::default());
+    let browser = BrowserConfig::default();
+    let http = crate::config::HttpRequestConfig::default();
+    all_tools(
+        Arc::new(cfg.clone()),
+        &security,
+        AuditLogger::disabled(),
+        &browser,
+        &http,
+        tmp.path(),
+        cfg,
+    )
+}
+
+fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> &'a dyn Tool {
+    tools
+        .iter()
+        .find(|tool| tool.name() == name)
+        .map(|tool| tool.as_ref())
+        .unwrap_or_else(|| panic!("tool `{name}` not registered"))
+}
+
+// ── Agent-tool expansion: shared e2e harness ────────────────────────────────
+//
+// Both themes (Task & workflow productivity; Knowledge & memory) exercise the
+// full `all_tools` registry: that every tool registers, that the overextending
+// siblings are stripped by the user-filter when not opted in (and restored
+// when opted in), and a couple of real executions through the boxed `dyn Tool`
+// surface.
+
+/// Build the full tool registry with a disabled browser and a tmp-scoped
+/// workspace — enough to exercise the expansion tools end-to-end.
+fn expansion_tools_for(tmp: &TempDir) -> Vec<Box<dyn Tool>> {
+    let security = Arc::new(SecurityPolicy::default());
+    let browser = BrowserConfig {
+        enabled: false,
+        allowed_domains: vec![],
+        session_name: None,
+        ..BrowserConfig::default()
+    };
+    let http = crate::config::HttpRequestConfig::default();
+    let cfg = test_config(tmp);
+    all_tools(
+        Arc::new(cfg.clone()),
+        &security,
+        AuditLogger::disabled(),
+        &browser,
+        &http,
+        tmp.path(),
+        &cfg,
+    )
+}
+
+// ── Theme: Task & workflow productivity ─────────────────────────────────────
+
+const PRODUCTIVITY_TOOLS: &[&str] = &[
+    // NOTE: the old `agent_workflow_*` tools were removed when the
+    // `agent_workflows` domain was dissolved into `workflows`; workflow
+    // discovery/run tools now live under the Knowledge theme
+    // (`list_workflows`, `run_workflow`, …).
+    "create_artifact",
+    "read_artifact",
+    "update_artifact",
+    "list_artifacts",
+    "delete_artifact",
+    "task_source_list",
+    "task_source_get",
+    "task_source_fetch",
+    "task_source_list_tasks",
+    "task_source_preview_filter",
+    "task_source_status",
+    "task_source_add",
+    "task_source_update",
+    "task_source_remove",
+];
+
+const PRODUCTIVITY_DEFAULT_OFF: &[&str] = &[
+    "delete_artifact",
+    "task_source_add",
+    "task_source_update",
+    "task_source_remove",
+];
+
+const PRODUCTIVITY_ALWAYS_ON: &[&str] = &[
+    "create_artifact",
+    "read_artifact",
+    "update_artifact",
+    "list_artifacts",
+    "task_source_fetch",
+    "task_source_status",
+];
+
+// ── Theme: Knowledge & memory ───────────────────────────────────────────────
+
+const KNOWLEDGE_TOOLS: &[&str] = &[
+    "list_workflows",
+    "describe_workflow",
+    "read_workflow_resource",
+    "list_workflow_runs",
+    "read_workflow_run_log",
+    "create_skill",
+    "install_workflow_from_url",
+    "uninstall_workflow",
+];
+
+fn knowledge_default_off() -> Vec<&'static str> {
+    let mut tools: Vec<&'static str> = Vec::new();
+    // These tools exist only when their feature gates are on. All of
+    // create_skill / install_workflow_from_url / uninstall_workflow are
+    // registered under `#[cfg(feature = "skills")]` in ops.rs — none of
+    // them are behind `flows`.
+    if cfg!(feature = "skills") {
+        tools.push("create_skill");
+        tools.push("install_workflow_from_url");
+        tools.push("uninstall_workflow");
+    }
+    tools
+}
+
+fn knowledge_always_on() -> Vec<&'static str> {
+    let mut tools: Vec<&'static str> = Vec::new();
+    // These tools exist only when the skills feature is on (`WorkflowListTool`
+    // / `WorkflowRecentRunsTool` — both `#[cfg(feature = "skills")]`).
+    if cfg!(feature = "skills") {
+        tools.extend(&["list_workflows", "list_workflow_runs"]);
+    }
+    tools
+}
+
+// ── Theme: System & self-management (observability + service) ───────────────
+
+const SYSTEM_TOOLS: &[&str] = &[
+    "doctor_health",
+    "doctor_models",
+    "health_snapshot",
+    "health_system_info",
+    "cost_get_dashboard",
+    "cost_get_daily_history",
+    "cost_get_summary",
+    "dashboard_model_health",
+    "security_policy_info",
+    "service_status",
+    "daemon_host_prefs_get",
+    "service_start",
+    "service_stop",
+    "service_restart",
+    "service_shutdown",
+    "service_install",
+    "service_uninstall",
+    "daemon_host_prefs_set",
+    "config_snapshot",
+    "config_get_client_config",
+    "config_get_autonomy",
+    "config_get_search",
+    "config_get_runtime_flags",
+    "config_resolve_api_url",
+    "config_get_data_paths",
+];
+
+const SYSTEM_DEFAULT_OFF: &[&str] = &[
+    "service_start",
+    "service_stop",
+    "service_restart",
+    "service_shutdown",
+    "service_install",
+    "service_uninstall",
+    "daemon_host_prefs_set",
+];
+
+const SYSTEM_ALWAYS_ON: &[&str] = &[
+    "doctor_health",
+    "health_snapshot",
+    "cost_get_summary",
+    "dashboard_model_health",
+    "security_policy_info",
+    "service_status",
+    "daemon_host_prefs_get",
+    "config_snapshot",
+    "config_get_autonomy",
+];
+
+// ── Theme: Account & session ────────────────────────────────────────────────
+//
+// The `billing_*`, `team_*` and `referral_*` agent-tool families were removed:
+// money movement and team administration are dashboard surfaces, and their
+// controllers stay registered for the UI. What remains here is read-only
+// account *state* — who is signed in, what is connected — which moved to
+// `settings_agent` when `account_admin_agent` went with those families.
+
+const ACCOUNT_TOOLS: &[&str] = &[
+    "credential_list",
+    "session_state",
+    "oauth_connect_url",
+    "oauth_list",
+];
+
+// ── Theme: MCP registry and workspace ───────────────────────────────────────
+
+const DESKTOP_TOOLS: &[&str] = &[
+    // The `mcp_registry_*` desktop surface is compiled out with the `mcp`
+    // feature, so these expectations are gated per-element rather than gating
+    // the three tests below away wholesale — the non-MCP desktop tools must
+    // keep their coverage in both builds.
+    #[cfg(feature = "mcp")]
+    "mcp_registry_search",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_get",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_installed_list",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_status",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_connect",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_disconnect",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_tool_call",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_uninstall",
+    "workspace_read_persona",
+    "workspace_update_persona",
+    "workspace_reset_persona",
+    "workspace_init",
+];
+
+const DESKTOP_DEFAULT_OFF: &[&str] = &[
+    #[cfg(feature = "mcp")]
+    "mcp_registry_uninstall",
+    "workspace_update_persona",
+    "workspace_reset_persona",
+    "workspace_init",
+];
+
+const DESKTOP_ALWAYS_ON: &[&str] = &[
+    #[cfg(feature = "mcp")]
+    "mcp_registry_search",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_tool_call",
+    #[cfg(feature = "mcp")]
+    "mcp_registry_connect",
+    "workspace_read_persona",
+];
+
+/// One real tool name per family that owns tools.
+const REPRESENTATIVE: &[(&str, crate::core::all::DomainGroup)] = {
+    use crate::core::all::DomainGroup as G;
+    &[
+        ("spawn_subagent", G::Agent),
+        ("memory", G::Memory),
+        ("goal_get", G::Threads),
+        ("mcp_list_servers", G::Mcp),
+        ("wallet_get_address", G::Web3),
+        ("media_generate_image", G::Media),
+        ("create_workflow", G::Flows),
+        ("run_workflow", G::Skills),
+        ("cron_add", G::Automation),
+        ("composio_execute", G::Integrations),
+        ("dashboard_model_health", G::Desktop),
+        ("juice_retrieve", G::Inference),
+        ("shell", G::Platform),
+    ]
+};
+
+/// Families with no agent tools of their own.
+const TOOL_LESS: &[crate::core::all::DomainGroup] = {
+    use crate::core::all::DomainGroup as G;
+    // `Modules` is the loader, not a capability: a loaded module's own surface
+    // is reached through whichever domain calls it (documents go through the
+    // document tools), so the family itself owns no agent tool.
+    // `Channels` joined this list when the three `whatsapp_data_*` tools went —
+    // the channel runtime,
+    // its controllers and its inbound dispatch are all still there.
+    // `Operator` is the SaaS provisioning plane: controllers for the gateway,
+    // never tools an agent could call on itself.
+    &[
+        G::Config,
+        G::Security,
+        G::Modules,
+        G::Channels,
+        // Voice retains RPC and dictation capabilities, but owns no agent tools.
+        G::Voice,
+        G::Hosted,
+        G::Operator,
+        // Reserved domain after managed runtime tools were removed.
+        G::Runtimes,
+    ]
+};
+
+#[path = "ops_tests_capability_gating_tests.rs"]
+mod capability_gating_tests;
+#[path = "ops_tests_catalog_fixture_tests.rs"]
+mod catalog_fixture_tests;
+#[path = "ops_tests_composio_registration_tests.rs"]
+mod composio_registration_tests;
+#[path = "ops_tests_default_registry_tests.rs"]
+mod default_registry_tests;
+#[path = "ops_tests_domain_family_tests.rs"]
+mod domain_family_tests;
+#[path = "ops_tests_execution_and_serde_tests.rs"]
+mod execution_and_serde_tests;
+#[path = "ops_tests_repl_tools_tests.rs"]
+mod repl_tools_tests;

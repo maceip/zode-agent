@@ -1,0 +1,300 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { expect, test } from "vitest";
+import {
+  foldCodexNotification,
+  initialCodexProjection,
+  type CodexProjectionState,
+  type ProjectionCommand,
+} from "../../packages/oar/src/runtimes/codex/projection.js";
+import { asRecord, parseJson } from "../../packages/oar/src/shared/json.js";
+/**
+ * Record/replay for codex, same shape as the claude test. A REAL recorded
+ * codex notification stream (fixtures/*.raw.jsonl from `pnpm sea-trial:record
+ * codex ...`, scrubbed to consumed fields) folds through the production
+ * projection; the frame|records table snapshots to a FILE beside the input.
+ * Every notification yields exactly one event (nothing is dropped); the
+ * events column is what oar read out of it.
+ */
+
+const here = import.meta.dirname;
+const scenarios = ["tool-round", "subagent", "file-change", "mcp-echo"];
+const ROOT = "thread-root";
+
+function describeCommand(command: ProjectionCommand): string {
+  switch (command.kind) {
+    case "link":
+      return `link ${command.edge.parent} → ${command.edge.child} (${command.edge.via})`;
+    case "frame": {
+      const where = command.sessionId === undefined ? "" : ` @thread:${command.sessionId}`;
+      const events = command.body.events.map((view) => {
+        switch (view.kind) {
+          case "tool_call_started":
+            return `tool_call_started ${view.tool}`;
+          case "reasoning":
+            return `reasoning ${view.content.kind}`;
+          case "turn_ended":
+            return `turn_ended ${view.outcome.kind}`;
+          case "text_delta":
+          case "turn_active": case "input_queued":
+          case "tool_call_ended":
+          case "service_tier": case "app_request_cancelled":
+          case "input_dropped":
+          case "session_linked": case "user_message":
+          case "usage":
+          case "model":
+          case "effort":
+          case "tool_call_progress":
+          case "tool_call_input": case "tool_call_input_delta":
+          case "compaction_started":
+          case "compaction_ended":
+          case "retry":
+          case "task_started":
+          case "task_updated":
+          case "task_ended":
+            return view.kind;
+          default:
+            return "?";
+        }
+      });
+      return `event${where}${events.length === 0 ? "" : ` → ${events.join(", ")}`}`;
+    }
+    default:
+      return "?";
+  }
+}
+
+function foldLine(state: CodexProjectionState, line: string): { state: CodexProjectionState; row: string | null } {
+  const frame = asRecord(parseJson(line));
+  const method = typeof frame?.method === "string" ? frame.method : null;
+  if (frame === null || method === null) {
+    return { state, row: null };
+  }
+  const { state: next, commands } = foldCodexNotification(state, method, frame);
+  const produced = commands.map((command) => describeCommand(command)).join(", ") || "-";
+  return { state: next, row: `${method.padEnd(28)} │ ${produced}` };
+}
+
+function foldFixture(lines: readonly string[]): string {
+  let state: CodexProjectionState = initialCodexProjection(ROOT);
+  const rows: string[] = [];
+  for (const line of lines) {
+    const { state: next, row } = foldLine(state, line);
+    state = next;
+    if (row !== null) {
+      rows.push(row);
+    }
+  }
+  return `${rows.join("\n")}\n`;
+}
+
+for (const scenario of scenarios) {
+  test(`codex ${scenario}: recorded notifications fold to the expected records`, async () => {
+    const lines = readFileSync(path.join(here, "fixtures", `codex-${scenario}.raw.jsonl`), "utf8")
+      .split("\n")
+      .filter((line) => line.trim().length > 0);
+    await expect(foldFixture(lines)).toMatchFileSnapshot(
+      path.join(here, "fixtures", `codex-${scenario}.projected.txt`),
+    );
+  });
+}
+
+const CHILD_FRAMES: readonly { method: string; params: Record<string, unknown> }[] = [
+  { method: "item/started", params: { threadId: ROOT, turnId: "t1", item: { type: "collabAgentToolCall", id: "c1", senderThreadId: ROOT, receiverThreadIds: ["thread-child"] } } },
+  { method: "turn/started", params: { threadId: "thread-child", turn: { id: "t-child" } } },
+  { method: "item/agentMessage/delta", params: { threadId: "thread-child", turnId: "t-child", delta: "hi" } },
+  { method: "item/completed", params: { threadId: ROOT, turnId: "t1", item: { type: "subAgentActivity", id: "s1", agentThreadId: "thread-child" } } },
+];
+
+function foldFrames(frames: readonly { method: string; params: Record<string, unknown> }[]): string[] {
+  let state = initialCodexProjection(ROOT);
+  const rows: string[] = [];
+  for (const frame of frames) {
+    const { state: next, commands } = foldCodexNotification(state, frame.method, frame.params);
+    state = next;
+    rows.push(commands.map((command) => describeCommand(command)).join(", "));
+  }
+  return rows;
+}
+
+test("codex notifications of another thread are child-session records; collab items link them", () => {
+  expect(foldFrames(CHILD_FRAMES)).toEqual([
+    "event, link thread-root → thread-child (tool_call)",
+    "event @thread:thread-child → turn_active",
+    "event @thread:thread-child → text_delta",
+    "event, link thread-root → thread-child (tool_call)",
+  ]);
+  const { commands } = foldCodexNotification(initialCodexProjection(ROOT), "item/agentMessage/delta", { threadId: "thread-child", turnId: "t-child", delta: "x" });
+  const [event] = commands;
+  expect(event?.kind === "frame" ? event.spanId : null).toBe("t-child");
+});
+
+/** The task events (`reporting thread: kind taskId`) and distinct edges a recorded fixture folds to. */
+function tasksAndEdges(lines: readonly string[]): { tasks: string[]; edges: string[] } {
+  let state = initialCodexProjection(ROOT);
+  const commands = lines.flatMap((line) => {
+    const frame = asRecord(parseJson(line)) ?? {};
+    const result = foldCodexNotification(state, String(frame.method), frame);
+    ({ state } = result);
+    return result.commands;
+  });
+  const tasks = commands.flatMap((command) => (command.kind === "frame"
+    ? command.body.events.flatMap((view) => (view.kind === "task_started" || view.kind === "task_updated" || view.kind === "task_ended"
+      ? [`${command.sessionId ?? ROOT}: ${view.kind} ${view.taskId}`]
+      : []))
+    : []));
+  const edges = commands.flatMap((command) => (command.kind === "link" ? [`${command.edge.parent} → ${command.edge.child}`] : []));
+  return { tasks, edges: [...new Set(edges)] };
+}
+
+test("codex peers: a thread's subAgentActivity changes only its own children's tasks and edges", () => {
+  // Recorded on 0.158.0: root starts alpha and beta, alpha messages beta and
+  // starts gamma, gamma messages the root. Each reports on its own thread.
+  const lines = readFileSync(path.join(here, "fixtures", "codex-peers.raw.jsonl"), "utf8")
+    .split("\n")
+    .filter((line) => line.trim().length > 0);
+  expect(tasksAndEdges(lines)).toEqual({
+    tasks: [
+      "thread-root: task_started thread-alpha",
+      "thread-root: task_started thread-beta",
+      "thread-alpha: task_started thread-gamma",
+      "thread-root: task_ended thread-beta",
+      "thread-alpha: task_ended thread-gamma",
+      "thread-root: task_ended thread-alpha",
+    ],
+    edges: ["thread-root → thread-alpha", "thread-root → thread-beta", "thread-alpha → thread-gamma"],
+  });
+});
+
+/** A `subAgentActivity` item reported on `thread`, as a fixture line. */
+function activity([thread, kind, agentThreadId, agentPath]: readonly [string, string, string, string]): string {
+  return JSON.stringify({ method: "item/completed", threadId: thread, item: { type: "subAgentActivity", id: `${thread}-${kind}`, kind, agentThreadId, agentPath } });
+}
+
+test("codex peers after a resume: the agentPath decides whose child an unstarted thread is", () => {
+  // alpha, beta and gamma were started before the resume, so no `started`
+  // item names them; the parent path says beta is the root's, gamma alpha's.
+  expect(tasksAndEdges([
+    activity(["thread-alpha", "interacted", "thread-beta", "/root/beta"]),
+    activity(["thread-alpha", "completed", "thread-gamma", "/root/alpha/gamma"]),
+    activity([ROOT, "completed", "thread-beta", "/root/beta"]),
+    activity([ROOT, "interacted", "thread-gamma", "/root/alpha/gamma"]),
+  ])).toEqual({
+    tasks: ["thread-alpha: task_ended thread-gamma", "thread-root: task_ended thread-beta"],
+    edges: ["thread-alpha → thread-gamma", "thread-root → thread-beta"],
+  });
+});
+
+test("codex error detail folds into the failed turn_ended and usage is the cumulative total", () => {
+  let state = initialCodexProjection(ROOT);
+  const errored = foldCodexNotification(state, "error", { threadId: ROOT, error: { message: "boom", additionalDetails: "quota" } });
+  ({ state } = errored);
+  // The class is the turn's own codexErrorInfo, not the words.
+  const completed = foldCodexNotification(state, "turn/completed", { threadId: ROOT, turn: { id: "t1", status: "failed", error: { message: "boom", codexErrorInfo: "usageLimitExceeded" } } });
+  const [end] = completed.commands;
+  expect(end?.kind === "frame" ? end.body.events : null).toEqual([
+    { kind: "turn_ended", outcome: { kind: "failed", reason: "failed: boom: quota", failure: "quota" } },
+  ]);
+  expect(completed.state.lastErrorDetail).toBeNull();
+  const usage = foldCodexNotification(state, "thread/tokenUsage/updated", { threadId: ROOT, tokenUsage: { total: { inputTokens: 120, outputTokens: 30 } } });
+  const { commands: [record] } = usage;
+  expect(record?.kind === "frame" ? record.body.events : null).toEqual([
+    { kind: "usage", usage: { context: { tokens: 120, contextWindow: null, percent: null }, tokens: { input: 120, output: 30 } } },
+  ]);
+});
+
+test("codex tool completion maps an explicit item status and otherwise leaves result absent", () => {
+  const failed = foldCodexNotification(initialCodexProjection(ROOT), "item/completed", {
+    threadId: ROOT,
+    item: { type: "commandExecution", id: "exec-fail", status: "failed", aggregatedOutput: "boom" },
+  });
+  expect(failed.commands[0]?.kind === "frame" ? failed.commands[0].body.events : null).toEqual([
+    { kind: "tool_call_ended", callId: "exec-fail", content: [{ type: "text", text: "boom" }], result: "failed" },
+  ]);
+  const unknown = foldCodexNotification(initialCodexProjection(ROOT), "item/completed", {
+    threadId: ROOT,
+    item: { type: "commandExecution", id: "exec-unknown", aggregatedOutput: "?" },
+  });
+  expect(unknown.commands[0]?.kind === "frame" ? unknown.commands[0].body.events : null).toEqual([
+    { kind: "tool_call_ended", callId: "exec-unknown", content: [{ type: "text", text: "?" }] },
+  ]);
+});
+
+/**
+ * Live, codex 0.154.0 (oar-trial-run/live-codex-a/multi-turn.voyage.jsonl
+ * seq 31/48/64): `total.inputTokens` grew 12661 → 28404 → 44166 over three
+ * one-word turns while `last.totalTokens` stayed near 15.7k and
+ * `modelContextWindow` was 121600. The context reading is the last call's
+ * total (codex's own `tokens_in_context_window`) against that window;
+ * `tokens` stays the cumulative total.
+ */
+test("codex context fullness is the last model call's total against modelContextWindow, usage stays cumulative", () => {
+  const state = initialCodexProjection(ROOT);
+  const { commands: [record] } = foldCodexNotification(state, "thread/tokenUsage/updated", {
+    threadId: ROOT,
+    turnId: "t3",
+    tokenUsage: {
+      total: { totalTokens: 44_201, inputTokens: 44_166, cachedInputTokens: 32_512, outputTokens: 35, reasoningOutputTokens: 0 },
+      last: { totalTokens: 15_774, inputTokens: 15_762, cachedInputTokens: 15_616, outputTokens: 12, reasoningOutputTokens: 0 },
+      modelContextWindow: 121_600,
+    },
+  });
+  expect(record?.kind === "frame" ? record.body.events : null).toEqual([
+    { kind: "usage", usage: { context: { tokens: 15_774, contextWindow: 121_600, percent: 13 }, tokens: { input: 44_166, output: 35, cacheRead: 32_512, reasoning: 0 } } },
+  ]);
+  const nullWindow = foldCodexNotification(state, "thread/tokenUsage/updated", {
+    threadId: ROOT,
+    tokenUsage: { total: { inputTokens: 200, outputTokens: 5 }, last: { totalTokens: 85, inputTokens: 80, outputTokens: 5 }, modelContextWindow: null },
+  });
+  const [fallback] = nullWindow.commands;
+  expect(fallback?.kind === "frame" ? fallback.body.events : null).toEqual([
+    { kind: "usage", usage: { context: { tokens: 85, contextWindow: null, percent: null }, tokens: { input: 200, output: 5 } } },
+  ]);
+  // No `last` (older builds): occupancy is unknown, so the window is null and
+  // no percent is computed even when the notification names a window; the
+  // cumulative total is never read against it.
+  const noLast = foldCodexNotification(state, "thread/tokenUsage/updated", {
+    threadId: ROOT,
+    tokenUsage: { total: { inputTokens: 200, outputTokens: 5 }, modelContextWindow: 121_600 },
+  });
+  const [unknown] = noLast.commands;
+  expect(unknown?.kind === "frame" ? unknown.body.events : null).toEqual([
+    { kind: "usage", usage: { context: { tokens: 200, contextWindow: null, percent: null }, tokens: { input: 200, output: 5 } } },
+  ]);
+});
+
+test("codex compaction is the contextCompaction item; the deprecated thread/compacted closes nothing twice", () => {
+  expect(foldFrames([
+    { method: "item/started", params: { threadId: ROOT, turnId: "t1", item: { id: "cc_1", type: "contextCompaction" } } },
+    { method: "item/completed", params: { threadId: ROOT, turnId: "t1", item: { id: "cc_1", type: "contextCompaction" } } },
+    { method: "thread/compacted", params: { threadId: ROOT, turnId: "t1" } },
+    { method: "item/commandExecution/outputDelta", params: { threadId: ROOT, turnId: "t1", itemId: "call_9", delta: "hello\n" } },
+  ])).toMatchInlineSnapshot(`
+    [
+      "event → compaction_started",
+      "event → compaction_ended",
+      "event",
+      "event → tool_call_progress",
+    ]
+  `);
+});
+
+const frameEvents = (result: { commands: readonly { kind: string; body?: { events: readonly unknown[] } }[] }): unknown =>
+  result.commands.flatMap((command) => (command.kind === "frame" ? command.body?.events ?? [] : []));
+
+test("codex thread/compacted alone ends an open compaction once", () => {
+  const started = foldCodexNotification(initialCodexProjection(ROOT), "item/started", { threadId: ROOT, item: { id: "cc_2", type: "contextCompaction" } });
+  const compacted = foldCodexNotification(started.state, "thread/compacted", { threadId: ROOT, turnId: "t2" });
+  const again = foldCodexNotification(compacted.state, "thread/compacted", { threadId: ROOT, turnId: "t2" });
+  expect([frameEvents(compacted), frameEvents(again)]).toMatchInlineSnapshot(`
+    [
+      [
+        {
+          "kind": "compaction_ended",
+          "outcome": "completed",
+        },
+      ],
+      [],
+    ]
+  `);
+});

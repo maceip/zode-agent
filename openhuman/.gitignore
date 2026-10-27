@@ -1,0 +1,175 @@
+worktrees/*
+!worktrees/.gitkeep
+
+# Workflow docs (local only)
+create_issue
+review_pr
+sentry_bugs
+remove_dupe_nonsense_issues
+
+# Diagnostic harness output (scripts/diagnose-cef-runtime.mjs)
+diagnosis-*.json
+
+# Dev-mode keyring file backend (plain-text secrets, dev artifact only)
+dev-keychain.json
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+package-lock.json
+
+node_modules
+dist
+dist-ssr
+dist-web
+*.local
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# pnpm local store (created when --store-dir points into the repo)
+.pnpm-store/
+
+# sccache local compiler cache (used by CI and act)
+.sccache/
+
+my_docs
+
+# Local prompt dumps written by `scripts/debug-agent-prompts.sh`.
+# Run-specific snapshots — never checked in.
+prompt-dumps/
+
+# CI secrets for local testing (contains real tokens)
+scripts/ci-secrets.json
+scripts/ci-secrets.local.json
+
+# act (local GitHub Actions runner)
+.secrets
+.vars
+.actrc
+.github/act-event.json
+
+# Editor directories and files
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+references/
+# Flow-authoring pages are compiled into the core binary; do not hide them
+# behind the generic generated-reference-directory rule above.
+!crates/openhuman-core/src/flows/skills/flow-authoring/references/
+!crates/openhuman-core/src/flows/skills/flow-authoring/references/*.md
+crates/openhuman-app/runtime-skill-*
+.mypy_cache
+.ruff_cache
+.kotlin
+# Keep .cargo/ untracked (local per-machine config + credentials) EXCEPT the
+# shared, opt-in repo config that documents faster-linker setup.
+.cargo/*
+!.cargo/config.toml
+
+CLAUDE.local.md
+
+# Test artifacts
+e2e-results/
+wdio-logs/
+test-results/
+coverage/
+app/public/generated/remotion/
+app/test/e2e/artifacts/
+
+tauri.key
+tauri.key.pub
+/target/
+/crates/*/target/
+src-tauri/target/
+app/src-tauri-mobile/gen/
+app/src-tauri-mobile/target/
+.target-codex/
+
+workflow
+.fastembed_cache
+overlay/src-tauri/target/
+.claude/*.lock
+app/.claude/scheduled_tasks.lock
+# Subagent lifecycle checkpoints written by test runs that have no
+# workspace_dir (the `.openhuman/subagent_checkpoints` fallback in lifecycle.rs).
+crates/*/.openhuman/
+/.openhuman/
+target-test-run
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+tmp/
+app/test/e2e/.cache/
+.cache/cargo-install/
+test-map.md
+.test-gap-analysis.md
+
+# Local AI assistant state and scratch files
+.kimi/
+.specify/
+.claude/skills/*
+!.claude/skills/migrate-to-submodule/
+.claude/memory.md
+.claude/projects/
+.claude/scratch/
+/SCRATCH/
+.codex-tmp
+*.enc
+
+# Apple signing and App Store Connect credentials
+AuthKey_*.p8
+*.mobileprovision
+*.certSigningRequest
+*.p12
+distribution.cer
+
+# Release note previews
+CHANGELOG.preview.md
+*.profraw
+*.diff
+
+.claude/worktrees/
+
+# Python bytecode from scripts/dep-sim.py
+__pycache__/
+
+# Coverage/diff-cover artifacts (generated locally, never shipped)
+lcov*.info
+diff-coverage.md
+
+# CI lane runner output (scripts/ci/self-hosted/lanes.mjs)
+/ci-out/
+
+# Local/self-hosted CI run output (never commit)
+ci-out/
+ci-out-ex63/
+
+# Proptest failures are promoted to named unit tests.
+proptest-regressions/
+
+# Stray SQLite files a test run can leave beside the crate when a storage
+# path is not pointed at a tempdir.
+crates/openhuman-core/storage/*.db
+crates/openhuman-core/storage/*.db-wal
+crates/openhuman-core/storage/*.db-shm
+
+# Local root-profile SQLite state is runtime data, never repository source.
+/storage/storage.db
+/storage/storage.db-shm
+/storage/storage.db-wal
+
+# Retired generated app schema snapshot; the runtime schema is registered in Rust.
+/app/schema.json

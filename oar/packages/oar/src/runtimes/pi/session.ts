@@ -1,0 +1,273 @@
+import type {
+  RequestRecord, ContextUsage, ControlResult, InputOptions, ResponseBody, Session, StartSession } from "../../contracts/session.js";
+import type { PiProjectOptions } from "./options.js";
+import { classifyFailure } from "../../shared/failure-class.js";
+import { withdrawControl } from "../../shared/held-input.js";
+import { withInputImages, type LoadedImage } from "../../shared/input-images.js";
+import { withSessionCredentials } from "../../shared/session-credentials.js";
+import {
+  foldPiEvent,
+  initialPiProjection,
+  piPrompted,
+  type PiProjectionState,
+} from "./projection.js";
+import { disposePiAgentSession } from "./lifecycle.js";
+import { openPiAgentSession, piEffectiveModel } from "./open.js";
+
+/** pi's ImageContent: base64 data and its type. */
+const piImages = (images: readonly LoadedImage[]): { type: "image"; data: string; mimeType: string }[] =>
+  images.map((image) => ({ type: "image", data: image.data, mimeType: image.mediaType }));
+
+export { piEffectiveModel, piEnvBashTool, type PiModelSource } from "./open.js";
+
+/*
+ * Bundled pi SDK mapping (in-process, no fork; settled 2026-08-21, record
+ * stream 2026-09-11): every SDK event is one frame; pi's own
+ * `agent_settled` is the turn end; steer acceptance means entry into pi's queue;
+ * abort is cooperative. Resume opens the cwd's session file by id and
+ * options.model resolves through the ModelRuntime (see resolve.ts);
+ * options.effort is pi's creation-time thinking level (open.ts).
+ * Process-global lazy env reads mean another embedded pi cannot safely share
+ * this process.
+ */
+
+export const createPiSession = (project: PiProjectOptions = {}): StartSession => withSessionCredentials(async (installation, options, credentials) => {
+  if (installation.via !== "bundled") {
+    throw new Error("The pi session adapter needs the bundled sdk installation");
+  }
+  const piAgentSession = await openPiAgentSession(options, credentials.add, project);
+  // pi-ai's own test for an oversized context, on a failed assistant message (failure.ts).
+  const { isContextOverflow } = await import("@earendil-works/pi-ai");
+  const overflowOf = (event: Parameters<Parameters<typeof piAgentSession.subscribe>[0]>[0]): boolean => {
+    if (event.type === "turn_end") {
+      return event.message.role === "assistant" && event.message.stopReason === "error" && isContextOverflow(event.message);
+    }
+    return event.type === "message_update" && event.assistantMessageEvent.type === "error" && isContextOverflow(event.assistantMessageEvent.error);
+  };
+
+  const kernel = credentials.kernel(piAgentSession.sessionId);
+  // abort() signals synchronously, then waits for idle. Accept delivery now;
+  // its later settlement is a native event, never a control-intent inference.
+  const abortNative = async (): Promise<void> => {
+    try {
+      await piAgentSession.abort();
+    } catch (error) {
+      kernel.frame({ type: "pi/abort_rejected", native: { message: error instanceof Error ? error.message : String(error) }, events: [] });
+    }
+  };
+  let projection: PiProjectionState = initialPiProjection;
+  // A run is in progress: from an accepted prompt (or a drained queue input,
+  // or an adopted agent_start) until pi's own agent_settled. Held in an
+  // object so closures always read the live value.
+  const gate = { running: false };
+  // Identity of the latest launched prompt, so a late rejection of an older
+  // one cannot be misread as the current run's.
+  let launch: object | null = null;
+  // The dispose request once issued: dispose is idempotent on it. Liveness
+  // itself is the kernel's business (kernel.unreachable() reads the stream).
+  let disposeRequest: RequestRecord | null = null;
+  // An abort taken over before pi created the run (pi's abort calls are no-ops
+  // until then): delivered on agent_start.
+  let pendingAbort = false;
+  // Adapter-held queue, drained one input per run end. pi's native followUp
+  // CONTINUES the active run (more internal turns, one agent_end), which
+  // would land the queued input inside the same turn; the queue contract
+  // promises a later turn of its own, so the adapter owns the handoff (and
+  // can withdraw an entry by its inputId until the drain takes it).
+  const held: { readonly input: string; readonly inputId: string | undefined; readonly images: readonly LoadedImage[] }[] = [];
+
+  // pi is authoritative on context fullness: getContextUsage() returns
+  // tokens (null right after compaction, before the next response),
+  // contextWindow, percent. Read at agent_end so the turn-end record carries
+  // it and Session.contextUsage() (a fold) is current at turn end (which
+  // is agent_settled, after any threshold compaction; see projection.ts).
+  const contextOf = (): ContextUsage | null => {
+    const usage = piAgentSession.getContextUsage();
+    return usage === undefined
+      ? null
+      : { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: usage.percent };
+  };
+
+  // agent_start waiters: a prompt is `accepted` once pi actually starts the
+  // run, `rejected` with pi's own message if pi refuses it first.
+  const startWaiters = new Set<() => void>();
+  const start = async (input: string, images: readonly LoadedImage[]): Promise<ResponseBody> => {
+    gate.running = true;
+    projection = piPrompted(projection);
+    const token = {};
+    launch = token;
+    const { promise: started, resolve: onStarted } = Promise.withResolvers<void>();
+    startWaiters.add(onStarted);
+    const run = piAgentSession.prompt(input, images.length === 0 ? undefined : { images: piImages(images) });
+    const decided = await Promise.race<ResponseBody>([
+      started.then(() => ({ kind: "accepted" })),
+      run.then(
+        () => ({ kind: "accepted" }),
+        (error: unknown) => ({ kind: "rejected", code: "runtime_refused", reason: error instanceof Error ? error.message : "pi prompt failed" }),
+      ),
+    ]);
+    startWaiters.delete(onStarted);
+    if (decided.kind === "rejected") {
+      gate.running = false;
+      launch = null;
+      return decided;
+    }
+    void (async (): Promise<void> => {
+      try {
+        await run;
+      } catch (error) {
+        // pi failed the run after starting it and without its own settlement.
+        // That failure is pi's own word, recorded as an event carrying pi's
+        // message, not a synthesized boundary; it ends the turn only when no
+        // agent_settled already did.
+        if (launch === token && gate.running) {
+          const reason = error instanceof Error ? error.message : "pi prompt failed";
+          gate.running = false;
+          kernel.frame({
+            type: "pi/prompt_rejected",
+            native: { message: reason },
+            events: [{ kind: "turn_ended", outcome: { kind: "failed", reason, failure: classifyFailure(reason) } }],
+          });
+          drainHeld();
+        }
+      }
+    })();
+    return decided;
+  };
+  function drainHeld(): void {
+    if (disposeRequest !== null || gate.running) {
+      return;
+    }
+    const next = held.shift();
+    if (next === undefined) {
+      return;
+    }
+    void (async (): Promise<void> => {
+      const decided = await start(next.input, next.images);
+      if (decided.kind === "rejected") {
+        // The queue took the input over; pi refusing it is not silent: pi's
+        // refusal enters the stream (no turn ever started, so no turn end).
+        kernel.frame({ type: "pi/prompt_rejected", native: { message: decided.reason, input: next }, events: [] });
+        drainHeld();
+      }
+    })();
+  }
+
+  // Drive the pure projection fold: one SDK event → one frame. The
+  // fold owns events and outcome classification; this owns the run gate.
+  piAgentSession.subscribe((event) => {
+    if (event.type === "agent_start") {
+      gate.running = true;
+      for (const waiter of startWaiters) {
+        waiter();
+      }
+      if (pendingAbort) {
+        pendingAbort = false;
+        void abortNative();
+      }
+    }
+    const extra = event.type === "agent_settled" ? { context: contextOf() } : { overflow: overflowOf(event) };
+    const { state: nextProjection, commands } = foldPiEvent(projection, event, extra);
+    projection = nextProjection;
+    for (const command of commands) {
+      kernel.frame(command.body);
+      if (command.body.events.some((item) => item.kind === "turn_ended")) {
+        gate.running = false;
+        drainHeld();
+      }
+    }
+  });
+
+  const openedModel = piEffectiveModel(piAgentSession);
+  if (openedModel !== null) {
+    // The SDK's own report of the model and thinking level in effect at open,
+    // captured as the runtime's word (never the request echoed: the mismatch
+    // checks in open.ts already rejected a request pi did not apply).
+    const { thinkingLevel } = piAgentSession;
+    kernel.frame({
+      type: "pi/session_opened",
+      native: { sessionId: piAgentSession.sessionId, model: openedModel, thinkingLevel },
+      events: [{ kind: "model", model: openedModel }, { kind: "effort", effort: thinkingLevel }],
+    });
+  }
+
+  const capabilities = { queue: { durable: false }, attribution: "none", images: true } as const;
+  const session: Session = credentials.seal({
+    id: kernel.sessionId,
+    capabilities,
+    prompt: async (input, inputOptions?: InputOptions): Promise<ControlResult> => {
+      const body = { kind: "prompt" as const, input, ...inputOptions };
+      const result = await kernel.control(body, async () => {
+        if (gate.running) {
+          return { kind: "rejected", code: "busy", reason: "busy" };
+        }
+        const decided = await withInputImages(capabilities, inputOptions?.images, async (images) => {
+          const started = await start(input, images);
+          return started;
+        });
+        return decided;
+      });
+      return result;
+    },
+    steer: async (input, inputOptions?: InputOptions): Promise<ControlResult> => {
+      const result = await kernel.control({ kind: "steer", input, ...inputOptions }, async () => {
+        if (!gate.running) {
+          return { kind: "rejected", code: "no_active_turn", reason: "not_steerable: no active turn" };
+        }
+        const decided = await withInputImages(capabilities, inputOptions?.images, async (images): Promise<ResponseBody> => {
+          await piAgentSession.steer(input, images.length === 0 ? undefined : piImages(images));
+          return { kind: "accepted" };
+        });
+        return decided;
+      });
+      return result;
+    },
+    queue: async (input, inputOptions?: InputOptions): Promise<ControlResult> => {
+      const result = await kernel.control({ kind: "queue", input, ...inputOptions }, () =>
+        withInputImages(capabilities, inputOptions?.images, (images) => {
+          held.push({ input, inputId: inputOptions?.inputId, images });
+          drainHeld();
+          return { kind: "accepted" };
+        }));
+      return result;
+    },
+    withdraw: withdrawControl(kernel, held),
+    abort: async (): Promise<ControlResult> => {
+      const result = await kernel.control({ kind: "abort" }, () => {
+        if (!gate.running) {
+          return { kind: "rejected", code: "no_active_turn", reason: "no active turn" };
+        }
+        // Use the complete SDK cancellation path, including its run-aborted
+        // flag, retries, compaction and branch summaries. Before agent_start,
+        // hold the intent until Pi has created the run that owns that flag.
+        if (piAgentSession.isStreaming) {
+          void abortNative();
+        } else {
+          pendingAbort = true;
+        }
+        return { kind: "accepted" };
+      });
+      return result;
+    },
+    rawEvents: (observer, cursor) => kernel.rawEvents(observer, cursor),
+    records: () => kernel.records(),
+    graph: () => kernel.graph(),
+    dispose: async () => {
+      if (disposeRequest !== null) {
+        return;
+      }
+      held.splice(0);
+      const request = kernel.request("toRuntime", { kind: "dispose" });
+      disposeRequest = request;
+      // Abort and hooks share a deadline. Only Pi's own agent_settled ends a
+      // turn in the stream; forced local cleanup invents no native end.
+      await disposePiAgentSession(piAgentSession, gate.running);
+      // pi runs in this process: there is no process exit to observe, so the
+      // dispose is answered as taken over rather than with an exit code.
+      kernel.respond(request.id, { kind: "accepted" });
+    },
+  });
+  return session;
+});
+
+export const piSession = createPiSession();

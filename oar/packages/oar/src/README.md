@@ -1,0 +1,69 @@
+# Source layout
+
+For each runtime's native programming interface and its current mapping to
+these contracts, see [`docs/runtimes/`](../../../docs/runtimes/README.md).
+
+```text
+src/
+  index.ts                 # public exports + built-in composition
+  browser.ts               # portable core composition: contracts/kernel/observe/report
+  pi-durable.ts            # host-owned durable runtime, optional native peers
+  registry.ts              # runtime collection and lookup
+  voyage.ts                # oar-voyage/3 evidence log: line builders + recorder
+  brands.ts                # @botiverse/oar/brands: browser-safe names and icons
+  kernel.ts                # @botiverse/oar/kernel: the runtime-author SPI
+  contracts/               # provider-independent agreements; index.ts is shared by the root and browser entries
+  runtimes/<id>/           # one runtime, split by capability; index.ts is also the @botiverse/oar/runtimes/<id> entry
+  community/<id>/          # a contributor-maintained runtime, exported from @botiverse/oar/community, not in the built-in registry
+  shared/                  # mechanisms + shared contract implementations
+  mcp/                     # serveMcpTools: host-implemented tools served as a loopback MCP server
+  forms/                   # @botiverse/oar/forms: runtime config forms as data, with pure validation and launch mapping (no runtime SDK)
+  observe/                 # consumer-side derivations over the record stream (events.ts: eventsOf + coalesceText behind Session.events(); status fold, turn helpers, usage folds, conversation and session view)
+  agents/                  # @botiverse/oar/agents: subagents over a runtime registry (built-in by default)
+  testing/                 # @botiverse/oar/testing: scriptedRuntime on the kernel SPI
+```
+
+```mermaid
+flowchart TB
+  Entry[index.ts<br/>only built-in composition root]
+  Registry[registry.ts<br/>imports contracts only]
+  Contracts[contracts/*<br/>what every implementation promises]
+  Runtimes[runtimes/*<br/>runtime-specific policy + native handling]
+  Shared[shared/*<br/>no runtime identity; may implement contracts]
+  Observe[observe/*<br/>consumes the public contract: status fold, stream transforms]
+  Native[vendor CLI / app-server / SDK]
+
+  Entry --> Registry
+  Entry --> Contracts
+  Entry --> Runtimes
+  Entry --> Observe
+  Registry --> Contracts
+  Runtimes --> Contracts
+  Runtimes --> Shared
+  Runtimes --> Native
+  Shared --> Contracts
+  Shared -- Session API derivations --> Observe
+  Observe --> Contracts
+  Observe -- Node-free helpers only --> Shared
+
+  Contracts -. never import .-> Shared
+  Contracts -. never import .-> Runtimes
+  Shared -. never import .-> Runtimes
+  Observe -. never import .-> Runtimes
+```
+
+- Simple capabilities use one behavior contract; add separate API/SPI contracts only when abstraction level or call direction differs. Say "runtime X passed the behavior tests", not "conformance": one word, no ceremony.
+- `runtimes/<id>/index.ts` declares that runtime's supported capabilities. Keep its parsing, compatibility policy, and protocol details nearby.
+- `shared/stream-json/` owns line-message projection, control pairing and session input/interrupt mechanics. Runtime profiles supply native result/usage meanings, launch policy, private readbacks and capabilities; the shared layer never selects policy by runtime ID. Its per-frame Claude baselines are in `tests/replay/claude-stream-json-equivalence.test.ts`.
+- Keep host dependencies as constructor inputs until multiple runtimes prove a stable shared boundary. Do not create empty architecture directories.
+- Test layers (`tests/`, `sea-trial/`, `experiments/`) are described in [`docs/development.md`](../../../docs/development.md#how-to-validate-the-changes).
+- Installation probing is local-only. Account usage is a separate authenticated observation capability.
+- Behavior invariants live as comments on the exact contract member they constrain; every must/never has (or gets) a sea-trial case.
+- The agent-facing dependency direction is discovery/capabilities → control →
+  records → observe → continue. Keep host policy and persistence outside the
+  package; see [`docs/design/system.md`](../../../docs/design/system.md).
+
+- `shared/orientation/` composes runtime readers with explicit cost depths,
+  deadlines and two model/inventory slots. Adapters declare local auth evidence;
+  the aggregate never chooses behavior by runtime ID. `observe/usability.ts`
+  is the separate browser-safe readiness policy over those facts.

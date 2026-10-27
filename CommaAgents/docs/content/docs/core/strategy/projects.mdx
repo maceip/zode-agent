@@ -1,0 +1,78 @@
+---
+title: Project Packages
+description: Bundle declarative strategies and executable registrations with comma-project.json.
+---
+
+A CommaAgents project is a folder with a strict `comma-project.json` manifest. The same contract is used for local projects and packages published through CommaAgentsHub.
+
+## Manifest
+
+<AutoTypeTable path="../packages/core/src/hub/hub.types.ts" name="CommaProjectManifest" />
+
+Package names use `@scope/project` and versions use semantic versioning. Artifact fields are maps keyed by stable kebab-case IDs:
+
+```json
+{
+  "name": "@example/review-workflow",
+  "version": "1.0.0",
+  "strategies": {
+    "review": {
+      "path": "strategies/review.jsonc",
+      "expose": true,
+      "description": "Review a code change."
+    }
+  },
+  "agents": {
+    "reviewer": { "path": "agents/reviewer.yaml", "expose": false }
+  },
+  "tools": {
+    "issue-lookup": { "path": "tools/issue-lookup.ts", "expose": false }
+  },
+  "entry": "entry.ts",
+  "permissions": {
+    "network": true,
+    "filesystem": true,
+    "shell": false,
+    "executesCode": true
+  }
+}
+```
+
+Legacy artifact arrays are rejected. Every declared path must be relative, remain inside the project after resolving symlinks, and refer to an existing file. There is no implicit `index.ts` entry.
+
+## Artifact behavior
+
+- `strategies` contains JSON, JSONC, YAML, or YML strategy files.
+- `agents` contains standalone declarative agent files. These files are parsed as data and are never imported.
+- `tools` and `flows` contain executable registration modules and are imported by `loadProject()`.
+- `entry` is an executable setup module. Register custom coded agent types from this module.
+- `expose: true` makes an artifact globally discoverable. Internal strategies can be addressed explicitly with `@scope/project/strategies/artifact-id`.
+
+Packages with `entry`, `tools`, or `flows` must declare `permissions.executesCode`. Hub installation and updates require explicit code approval, and the daemon checks the stored approval before importing those modules.
+
+## Discovery
+
+Core discovers strategies from:
+
+1. `<cwd>/.comma/strategies/*.{json,jsonc,yaml,yml}`
+2. `<cwd>/.comma/strategies/<project>/comma-project.json`
+3. `<cwd>/.comma/comma-project.json`
+4. `<dataDir>/strategies/*.{json,jsonc,yaml,yml}`
+5. `<dataDir>/strategies/<project>/comma-project.json`
+6. exposed artifacts under `<dataDir>/packages/@scope/project`
+7. bundled defaults under Core’s `strategies/@comma/core-strategies`
+
+Official strategies are bundled with Core for first-run availability and are also published as the `@comma/core-strategies` Hub package for explicit installation or updates.
+
+## Loading executable registrations
+
+```ts
+import { loadProject } from "@comma-agents/core";
+
+const project = await loadProject("/path/to/comma-project.json");
+console.log(project.name);
+```
+
+`loadProject()` imports the explicit entry, tool modules, and flow modules before a strategy is loaded. Installation itself never imports package code.
+
+<AutoTypeTable path="../packages/core/src/strategy/loader/project-loader.ts" name="LoadedProject" />

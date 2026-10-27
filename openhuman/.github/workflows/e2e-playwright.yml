@@ -1,0 +1,148 @@
+---
+name: E2E Playwright
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  # `actions: read` lets scripts/ci-cancel-aware.sh poll the run status so
+  # cancelled builds inside container jobs stop themselves (docker exec
+  # swallows the runner's signals).
+  actions: read
+  contents: read
+  packages: read
+
+env:
+  # Consumed by scripts/ci-cancel-aware.sh's cancellation watchdog.
+  GH_TOKEN: ${{ github.token }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-playwright:
+    name: Build Playwright E2E artifact
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/tinyhumansai/openhuman_ci:latest@sha256:c3c20d625bcc9f75e50c3c2c2b75c88d3e60a3f4352b0f19f5327b490438722d
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+      - name: Install dependencies
+        run: bash scripts/ci-cancel-aware.sh pnpm install --frozen-lockfile
+      - name: Ensure .env exists for E2E build
+        run: |
+          touch .env
+          touch app/.env
+      - name: Build Playwright web E2E bundle and core
+        run: bash scripts/ci-cancel-aware.sh pnpm --filter openhuman-app test:e2e:web:build
+      - name: Package Playwright E2E artifact
+        run: |
+          set -euo pipefail
+          host="$(rustc -vV | awk '/^host: / { print $2 }')"
+          stage="target/playwright-artifact/repo"
+          mkdir -p "$stage/app/dist-web" "$stage/target/e2e-web-$host/debug"
+          cp -a app/dist-web/. "$stage/app/dist-web/"
+          cp -a "target/e2e-web-$host/debug/openhuman-core" "$stage/target/e2e-web-$host/debug/"
+          tar -czf e2e-playwright-linux.tar.gz -C target/playwright-artifact repo
+      - name: Upload Playwright E2E artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-playwright-linux-${{ github.run_id }}
+          path: e2e-playwright-linux.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+
+  e2e-playwright:
+    name: E2E (Playwright / lane ${{ matrix.lane }})
+    needs: [build-playwright]
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [1, 2, 3, 4]
+    runs-on: ubuntu-22.04
+    container:
+      image: ghcr.io/tinyhumansai/openhuman_ci:latest
+    # The complete serial web suite currently takes about 45 minutes on the
+    # shared runner; keep the standalone diagnostic workflow aligned with the
+    # 90-minute budget used by CI Full.
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Cache pnpm store
+        uses: actions/cache@v6
+        with:
+          path: ~/.local/share/pnpm/store
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            pnpm-store-${{ runner.os }}-
+
+      - name: Install JS dependencies
+        run: bash scripts/ci-cancel-aware.sh pnpm install --frozen-lockfile
+
+      - name: Download Playwright E2E artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-playwright-linux-${{ github.run_id }}
+          path: .
+
+      - name: Restore Playwright E2E artifact
+        run: |
+          set -euo pipefail
+          tar -xzf e2e-playwright-linux.tar.gz
+          cp -a repo/app/dist-web app/
+          touch app/dist-web/openhuman-e2e-bundle.marker
+          mkdir -p target
+          cp -a repo/target/. target/
+          chmod +x target/e2e-web-*/debug/openhuman-core
+
+      - name: Install native test modules
+        run: |
+          # Keep fixtures in a trusted tree and resolve their verified releases
+          # from the same registry the product uses.
+          module_root="/root/openhuman-test-modules-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          bash scripts/ci/self-hosted/install-test-modules.sh \
+            "$module_root" "$module_root/modules.env"
+          cat "$module_root/modules.env" >> "$GITHUB_ENV"
+
+      - name: Install Playwright Chromium dependencies
+        run: bash scripts/ci-cancel-aware.sh pnpm --filter openhuman-app exec playwright install-deps chromium
+
+      - name: Install Playwright Chromium headless shell
+        run: bash scripts/ci-cancel-aware.sh pnpm --filter openhuman-app exec playwright install chromium-headless-shell
+
+      - name: Run Playwright web E2E suite
+        env:
+          OPENHUMAN_WORKSPACE: ${{ runner.temp }}/openhuman-playwright-workspace
+          OPENHUMAN_E2E_ALLOW_EPHEMERAL_KEY: "1"
+        run: bash app/scripts/e2e-web-shards.sh --lane=${{ matrix.lane }} --lanes=4 --selection=all
+
+      - name: Pack Playwright E2E failure artifacts
+        if: failure()
+        run: |
+          mkdir -p .ci/artifacts
+          tar -czf .ci/artifacts/openhuman-playwright-failure-logs.tar.gz \
+            -C "$OPENHUMAN_WORKSPACE" .
+        env:
+          OPENHUMAN_WORKSPACE: ${{ runner.temp }}/openhuman-playwright-workspace
+
+      - name: Upload Playwright E2E failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-playwright-all-failure-logs-${{ github.run_id }}-lane-${{ matrix.lane }}
+          path: .ci/artifacts/openhuman-playwright-failure-logs.tar.gz
+          retention-days: 7
+          if-no-files-found: ignore

@@ -1,0 +1,152 @@
+import { sessionEnvironment } from "../../shared/environment.js";
+/* oxlint-disable typescript/promise-function-async -- Deadline callbacks deliberately return the SDK's native promises. */
+import {
+  client as createClient,
+  methods,
+  PROTOCOL_VERSION,
+  RequestError,
+} from "@agentclientprotocol/sdk";
+import type { ModelEntry, ModelLister } from "../../contracts/list-models.js";
+import { startAcpProcess, withAcpDeadline } from "../../shared/acp/process.js";
+import { acpThoughtLevelOption } from "../../shared/acp/model.js";
+import { closeAcpSession } from "../../shared/acp/profile.js";
+import { effortLevelOf } from "../../shared/effort-levels.js";
+import { asRecord, asRecordList, type JsonRecord } from "../../shared/json.js";
+import { listingCwd } from "../../shared/listing-cwd.js";
+import { selectKimiAuthMethod } from "./session.js";
+
+function text(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function configOption(response: JsonRecord, id: string): JsonRecord | undefined {
+  return asRecordList(response.configOptions).find((option) => option.id === id);
+}
+
+/**
+ * Project a `session/new` response. Kimi has no model-list method; the usable
+ * list for the logged-in account rides on every new session as the
+ * `configOptions` entry with id `model` (acp-server config-options.ts). The
+ * effort menu is the option in ACP's `thought_level` category (kimi 2.0.0:
+ * id `thinking`, low/high/max on k3), the same lookup the session uses to
+ * apply `SessionOptions.effort` (shared/acp/model.ts), so what is listed is
+ * what a session accepts. It is only emitted for the currently selected
+ * model, so effort levels can only be attached to that entry; an `off` value
+ * is a toggle, not an effort level, and is dropped.
+ */
+export function projectKimiModels(response: unknown): ModelEntry[] | undefined {
+  const root = asRecord(response) ?? {};
+  const modelOption = configOption(root, "model");
+  if (modelOption === undefined) {
+    return undefined;
+  }
+  const current = text(modelOption.currentValue);
+  const thinking = acpThoughtLevelOption(root) ?? undefined;
+  const effortLevels = thinking === undefined
+    ? undefined
+    : asRecordList(thinking.options)
+        .map((option) => effortLevelOf(option.value))
+        .filter((level): level is string => level !== undefined && level !== "off");
+  const defaultEffort = thinking === undefined ? undefined : effortLevelOf(thinking.currentValue);
+  const entries: ModelEntry[] = [];
+  for (const model of asRecordList(modelOption.options)) {
+    const id = text(model.value);
+    if (id === undefined) {
+      continue;
+    }
+    const displayName = text(model.name);
+    const isCurrent = id === current;
+    entries.push({
+      id,
+      ...(displayName === undefined ? {} : { displayName }),
+      ...(isCurrent && effortLevels !== undefined && effortLevels.length > 0 ? { effortLevels } : {}),
+      ...(isCurrent && defaultEffort !== undefined && defaultEffort !== "off" ? { defaultEffort } : {}),
+      // A new session's current model: what a session uses with no `model` set.
+      ...(isCurrent ? { default: true as const } : {}),
+    });
+  }
+  return entries;
+}
+
+async function readNewSession(command: string, cwd: string, timeoutMs: number, env: NodeJS.ProcessEnv): Promise<JsonRecord> {
+  const runtime = startAcpProcess(command, ["acp"], createClient({ name: "oar" }), { cwd, env });
+  try {
+    const initialize = methods.agent.initialize;
+    const initialized = await withAcpDeadline(
+      runtime,
+      initialize,
+      timeoutMs,
+      (requestOptions) => runtime.connection.agent.request(initialize, {
+        protocolVersion: PROTOCOL_VERSION,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        },
+        clientInfo: { name: "oar", version: "0.0.0" },
+      }, requestOptions),
+    );
+    const method = selectKimiAuthMethod(asRecord(initialized) ?? {});
+    if (method !== undefined) {
+      const authenticate = methods.agent.authenticate;
+      await withAcpDeadline(
+        runtime,
+        authenticate,
+        timeoutMs,
+        (requestOptions) => runtime.connection.agent.request(
+          authenticate,
+          { methodId: method },
+          requestOptions,
+        ),
+      );
+    }
+    const newSession = methods.agent.session.new;
+    const response = await withAcpDeadline(
+      runtime,
+      newSession,
+      timeoutMs,
+      (requestOptions) => runtime.connection.agent.request<JsonRecord>(
+        newSession,
+        { cwd, mcpServers: [] },
+        requestOptions,
+      ),
+    );
+    const record = asRecord(response) ?? {};
+    const sessionId = text(record.sessionId);
+    if (sessionId !== undefined) {
+      // Best effort: the list is already in hand and the process is killed next.
+      await closeAcpSession(runtime, sessionId).catch(() => {});
+    }
+    return record;
+  } finally {
+    runtime.kill();
+    await runtime.exited;
+  }
+}
+
+export const kimiListModels: ModelLister = async (installation, options = {}) => {
+  if (installation.via !== "executable") {
+    return { kind: "unsupported", reason: "kimi model listing requires the kimi executable" };
+  }
+  try {
+    const response = await readNewSession(installation.command, listingCwd(options), options.timeoutMs ?? 30_000, sessionEnvironment(options.env));
+    const models = projectKimiModels(response);
+    if (models === undefined) {
+      return { kind: "unsupported", reason: "this kimi build returns no model config option on session/new" };
+    }
+    return { kind: "ok", models };
+  } catch (error) {
+    if (error instanceof RequestError) {
+      if (error.code === -32_601) {
+        return { kind: "unsupported", reason: "this kimi build has no session/new method" };
+      }
+      if (error.code === -32_000 || /auth(?:entication)?|log(?:ged)? ?in/iu.test(error.message)) {
+        return { kind: "unauthenticated", detail: error.message };
+      }
+    }
+    throw new Error("Failed to list Kimi models", { cause: error });
+  }
+};

@@ -1,0 +1,49 @@
+.turn-progress-pill .turn-subagents-trigger {
+  min-height: var(--control-compact); flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: var(--space-2);
+  padding: 0 var(--space-2); margin-inline: calc(-1 * var(--space-1));
+  border: 0; border-radius: var(--radius-pill);
+  background: transparent; color: var(--muted); font: inherit;
+}
+.turn-progress-pill .turn-subagents-trigger:hover,
+.turn-progress-pill .turn-subagents-trigger[aria-expanded="true"] { background: var(--panel-soft); color: var(--text); }
+.turn-subagents-trigger:focus-visible { outline: 2px solid var(--accent-focus); outline-offset: -2px; }
+.turn-subagents-dots { display: inline-flex; align-items: center; gap: var(--space-1); }
+.turn-subagent-dot { display: block; flex: 0 0 auto; width: var(--space-2); height: var(--space-2); border-radius: var(--radius-pill); background: var(--muted); }
+.turn-subagent-dot.is-working, .turn-subagent-dot.is-starting { background: var(--accent); animation: subagent-dot-pulse 2.4s ease-in-out infinite; }
+.turn-subagent-dot.is-waiting { background: var(--yellow); }
+.turn-subagent-dot.is-failed { background: var(--red); }
+.turn-subagent-dot.is-done { background: var(--green); }
+.turn-subagents-overflow { color: var(--text-secondary); font-size: var(--type-supporting); }
+.turn-subagents-chevron { flex-shrink: 0; }
+.turn-subagents-trigger[aria-expanded="true"] .turn-subagents-chevron { transform: rotate(180deg); }
+.turn-subagents-popover {
+  position: absolute; z-index: 1; bottom: calc(100% + var(--space-2)); left: 50%;
+  width: min(calc(var(--control-button) * 9), calc(100vw - var(--space-3) * 2));
+  max-height: min(var(--subagents-max-height, 50dvh), calc(var(--control-button) * 9));
+  display: flex; flex-direction: column; overflow: hidden;
+  padding: var(--space-2); color: var(--text); font: var(--weight-regular) var(--type-body) var(--sans);
+  transform: translateX(calc(-50% + var(--subagents-shift, 0px)));
+}
+.turn-subagents-popover header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; padding: 0 var(--space-2) var(--space-1); color: var(--text-secondary); font-size: var(--type-label); }
+.turn-subagents-popover header .alto-icon-button { --alto-icon-button-size: var(--control-compact); }
+.turn-subagents-count { margin-left: var(--space-2); font-variant-numeric: tabular-nums; }
+.turn-subagents-list { min-height: 0; overflow: auto; overscroll-behavior: contain; }
+.turn-subagents-popover .turn-subagent-row {
+  width: 100%; min-height: var(--control-button); display: flex; align-items: center; gap: var(--space-2);
+  padding: var(--space-2); border: 0; border-radius: var(--radius-row);
+  background: transparent; color: var(--text); font: inherit; text-align: left;
+}
+.turn-subagents-popover .turn-subagent-row:hover { background: var(--floating-row-hover); }
+.turn-subagent-name { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.turn-subagent-status { color: var(--text-secondary); font-size: var(--type-label); white-space: nowrap; }
+.turn-subagent-row svg { color: var(--muted); flex: 0 0 auto; }
+.turn-subagents-notice { margin: var(--space-2); color: var(--text-secondary); font-size: var(--type-label); }
+
+/* The three affordances share a pill, but only one owns its popup at a time. */
+.turn-progress-control:has(.turn-subagents-trigger:is(:hover, :focus-visible, [aria-expanded="true"])) .turn-progress-details,
+.turn-progress-control:has(.turn-subagents-trigger[aria-expanded="true"]) .turn-progress-file-details {
+  visibility: hidden; opacity: 0; pointer-events: none;
+}
+@keyframes subagent-dot-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .turn-subagent-dot { animation: none; } }

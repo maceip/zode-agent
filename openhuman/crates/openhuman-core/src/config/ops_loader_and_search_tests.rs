@@ -1,0 +1,632 @@
+use super::*;
+
+#[tokio::test]
+async fn reset_local_data_removes_active_user_and_markers_only() {
+    let temp = tempdir().unwrap();
+    let default_openhuman_dir = temp.path().join("default-openhuman");
+    // Active user lives under the shared root's `users/` tree, mirroring the
+    // real layout (`~/.openhuman/users/<id>`).
+    let current_openhuman_dir = default_openhuman_dir.join("users").join("active-user");
+    let workspace_marker = active_workspace_marker_path(&default_openhuman_dir);
+    let user_marker = crate::config::active_user_marker_path(&default_openhuman_dir);
+
+    tokio::fs::create_dir_all(current_openhuman_dir.join("workspace"))
+        .await
+        .unwrap();
+    tokio::fs::write(&workspace_marker, "config_dir = 'users/active-user'\n")
+        .await
+        .unwrap();
+    tokio::fs::write(&user_marker, "user_id = 'active-user'\n")
+        .await
+        .unwrap();
+
+    let outcome = reset_local_data_for_paths(&current_openhuman_dir, &default_openhuman_dir)
+        .await
+        .unwrap();
+
+    // Active user's slice and both shared markers are gone …
+    assert!(!current_openhuman_dir.exists());
+    assert!(!workspace_marker.exists());
+    assert!(!user_marker.exists());
+    // … but the shared root itself survives.
+    assert!(default_openhuman_dir.exists());
+    assert!(outcome
+        .value
+        .get("removed_paths")
+        .and_then(|value| value.as_array())
+        .is_some_and(|paths| !paths.is_empty()));
+}
+
+#[tokio::test]
+async fn reset_local_data_preserves_sibling_users() {
+    let temp = tempdir().unwrap();
+    let default_openhuman_dir = temp.path().join("default-openhuman");
+    let current_openhuman_dir = default_openhuman_dir.join("users").join("active-user");
+    let sibling_user_dir = default_openhuman_dir.join("users").join("other-user");
+    let sibling_file = sibling_user_dir.join("config.toml");
+
+    tokio::fs::create_dir_all(current_openhuman_dir.join("workspace"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(&sibling_user_dir).await.unwrap();
+    tokio::fs::write(&sibling_file, "api_key = 'sibling'\n")
+        .await
+        .unwrap();
+
+    reset_local_data_for_paths(&current_openhuman_dir, &default_openhuman_dir)
+        .await
+        .unwrap();
+
+    // The active user is wiped; the sibling account is untouched — this is the
+    // regression this fix addresses.
+    assert!(!current_openhuman_dir.exists());
+    assert!(sibling_user_dir.exists());
+    assert!(sibling_file.exists());
+}
+
+#[tokio::test]
+async fn reset_local_data_tolerates_absent_paths() {
+    let temp = tempdir().unwrap();
+    let default_openhuman_dir = temp.path().join("default-openhuman");
+    let current_openhuman_dir = default_openhuman_dir.join("users").join("active-user");
+    tokio::fs::create_dir_all(&default_openhuman_dir)
+        .await
+        .unwrap();
+
+    // No current user dir, no markers — a fresh / already-cleared install.
+    let outcome = reset_local_data_for_paths(&current_openhuman_dir, &default_openhuman_dir)
+        .await
+        .unwrap();
+
+    assert!(default_openhuman_dir.exists());
+    assert!(outcome
+        .value
+        .get("removed_paths")
+        .and_then(|value| value.as_array())
+        .is_some_and(|paths| paths.is_empty()));
+}
+
+#[test]
+fn env_flag_enabled_recognizes_truthy_forms() {
+    let _g = ENV_LOCK.blocking_lock();
+    let key = "OPENHUMAN_TEST_FLAG_A";
+    for truthy in ["1", "true", "TRUE", "yes", "YES"] {
+        unsafe {
+            std::env::set_var(key, truthy);
+        }
+        assert!(env_flag_enabled(key), "{truthy} should be truthy");
+    }
+    for falsy in ["0", "false", "off", "", "No"] {
+        unsafe {
+            std::env::set_var(key, falsy);
+        }
+        assert!(!env_flag_enabled(key), "{falsy} should be falsy");
+    }
+    unsafe {
+        std::env::remove_var(key);
+    }
+    assert!(!env_flag_enabled(key), "unset must be falsy");
+}
+
+// ── core_rpc_url_from_env ───────────────────────────────────────
+
+#[test]
+fn core_rpc_url_from_env_returns_default_when_unset() {
+    let _g = ENV_LOCK.blocking_lock();
+    unsafe {
+        std::env::remove_var("OPENHUMAN_CORE_RPC_URL");
+    }
+    assert_eq!(core_rpc_url_from_env(), "http://127.0.0.1:7788/rpc");
+}
+
+#[test]
+fn core_rpc_url_from_env_uses_override_when_set() {
+    let _g = ENV_LOCK.blocking_lock();
+    unsafe {
+        std::env::set_var("OPENHUMAN_CORE_RPC_URL", "http://1.2.3.4:9999/rpc");
+    }
+    assert_eq!(core_rpc_url_from_env(), "http://1.2.3.4:9999/rpc");
+    unsafe {
+        std::env::remove_var("OPENHUMAN_CORE_RPC_URL");
+    }
+}
+
+// ── Pure path helpers ──────────────────────────────────────────
+
+#[test]
+fn fallback_workspace_dir_ends_in_workspace_under_openhuman() {
+    let p = fallback_workspace_dir();
+    assert!(p.ends_with("workspace"));
+    assert!(p
+        .parent()
+        .map(|d| d.ends_with(".openhuman"))
+        .unwrap_or(false));
+}
+
+#[test]
+fn default_openhuman_dir_ends_in_dot_openhuman() {
+    let p = default_openhuman_dir();
+    assert!(p.ends_with(".openhuman"));
+}
+
+#[test]
+fn active_workspace_marker_path_is_under_default_dir() {
+    let default_dir = std::path::Path::new("/tmp/openhuman-test");
+    let marker = active_workspace_marker_path(default_dir);
+    assert_eq!(marker, default_dir.join("active_workspace.toml"));
+}
+
+#[test]
+fn config_openhuman_dir_returns_config_path_parent() {
+    let mut cfg = Config::default();
+    cfg.config_path = PathBuf::from("/tmp/xyz/config.toml");
+    assert_eq!(config_openhuman_dir(&cfg), PathBuf::from("/tmp/xyz"));
+}
+
+#[cfg(windows)]
+#[test]
+fn reset_local_data_remove_error_explains_windows_file_locks() {
+    let err = std::io::Error::from_raw_os_error(32);
+    let msg =
+        reset_local_data_remove_error(std::path::Path::new("C:\\Users\\me\\.openhuman"), &err);
+
+    assert!(msg.contains("locked by another OpenHuman window or process"));
+    assert!(msg.contains("Close all OpenHuman windows and try again"));
+}
+
+#[cfg(windows)]
+#[test]
+fn reset_local_data_remove_error_explains_windows_lock_violation() {
+    let err = std::io::Error::from_raw_os_error(33);
+    let msg =
+        reset_local_data_remove_error(std::path::Path::new("C:\\Users\\me\\.openhuman"), &err);
+
+    assert!(msg.contains("locked by another OpenHuman window or process"));
+    assert!(msg.contains("Close all OpenHuman windows and try again"));
+}
+
+// ── get_runtime_flags / set_browser_allow_all ─────────────────
+
+#[test]
+fn get_runtime_flags_reads_env_overrides() {
+    let _g = ENV_LOCK.blocking_lock();
+    unsafe {
+        std::env::remove_var("OPENHUMAN_BROWSER_ALLOW_ALL");
+    }
+    let flags = get_runtime_flags();
+    // Just exercise the path — we don't assume anything about
+    // what other tests in the suite may have set.
+    let _ = flags.value;
+}
+
+#[test]
+fn set_browser_allow_all_rejects_enable_without_operator_override() {
+    let _g = ENV_LOCK.blocking_lock();
+    let before = std::env::var(BROWSER_ALLOW_ALL_ENV).ok();
+    let before_override = std::env::var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV).ok();
+
+    unsafe {
+        std::env::remove_var(BROWSER_ALLOW_ALL_ENV);
+        std::env::remove_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV);
+    }
+
+    let err = set_browser_allow_all(true).expect_err("runtime enable should require override");
+    assert!(
+        err.contains("Refusing to enable OPENHUMAN_BROWSER_ALLOW_ALL via RPC"),
+        "unexpected error: {err}"
+    );
+    assert!(!env_flag_enabled(BROWSER_ALLOW_ALL_ENV));
+
+    unsafe {
+        match before {
+            Some(v) => std::env::set_var(BROWSER_ALLOW_ALL_ENV, v),
+            None => std::env::remove_var(BROWSER_ALLOW_ALL_ENV),
+        }
+        match before_override {
+            Some(v) => std::env::set_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV, v),
+            None => std::env::remove_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV),
+        }
+    }
+}
+
+#[test]
+fn set_browser_allow_all_toggles_env_var_when_operator_override_is_set() {
+    let _g = ENV_LOCK.blocking_lock();
+    let before = std::env::var(BROWSER_ALLOW_ALL_ENV).ok();
+    let before_override = std::env::var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV).ok();
+
+    unsafe {
+        std::env::remove_var(BROWSER_ALLOW_ALL_ENV);
+        std::env::set_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV, "1");
+    }
+
+    let enable_outcome = set_browser_allow_all(true).expect("override should allow runtime enable");
+    assert_eq!(enable_outcome.logs.len(), 1);
+    let enable_log = &enable_outcome.logs[0];
+    assert!(
+        enable_log.contains("[SECURITY]"),
+        "enable log should be audit-tagged: {enable_log}"
+    );
+    assert!(
+        enable_log.contains("enabled"),
+        "enable log should mention enabled state: {enable_log}"
+    );
+    assert!(enable_outcome.value.browser_allow_all);
+    assert!(env_flag_enabled(BROWSER_ALLOW_ALL_ENV));
+
+    let disable_outcome = set_browser_allow_all(false).expect("runtime disable should always work");
+    assert_eq!(disable_outcome.logs.len(), 1);
+    let disable_log = &disable_outcome.logs[0];
+    assert!(
+        disable_log.contains("[SECURITY]"),
+        "disable log should be audit-tagged: {disable_log}"
+    );
+    assert!(
+        disable_log.contains("disabled"),
+        "disable log should mention disabled state: {disable_log}"
+    );
+    assert!(!disable_outcome.value.browser_allow_all);
+    assert!(!env_flag_enabled(BROWSER_ALLOW_ALL_ENV));
+
+    unsafe {
+        match before {
+            Some(v) => std::env::set_var(BROWSER_ALLOW_ALL_ENV, v),
+            None => std::env::remove_var(BROWSER_ALLOW_ALL_ENV),
+        }
+        match before_override {
+            Some(v) => std::env::set_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV, v),
+            None => std::env::remove_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV),
+        }
+    }
+}
+
+#[test]
+fn set_browser_allow_all_disable_does_not_require_operator_override() {
+    let _g = ENV_LOCK.blocking_lock();
+    let before = std::env::var(BROWSER_ALLOW_ALL_ENV).ok();
+    let before_override = std::env::var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV).ok();
+
+    unsafe {
+        std::env::set_var(BROWSER_ALLOW_ALL_ENV, "1");
+        std::env::remove_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV);
+    }
+
+    let disable_outcome =
+        set_browser_allow_all(false).expect("runtime disable should not require override");
+    assert!(
+        disable_outcome.logs[0].contains("[SECURITY]"),
+        "disable log should be audit-tagged: {:?}",
+        disable_outcome.logs
+    );
+    assert!(!disable_outcome.value.browser_allow_all);
+    assert!(!env_flag_enabled(BROWSER_ALLOW_ALL_ENV));
+
+    unsafe {
+        match before {
+            Some(v) => std::env::set_var(BROWSER_ALLOW_ALL_ENV, v),
+            None => std::env::remove_var(BROWSER_ALLOW_ALL_ENV),
+        }
+        match before_override {
+            Some(v) => std::env::set_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV, v),
+            None => std::env::remove_var(BROWSER_ALLOW_ALL_RPC_ENABLE_ENV),
+        }
+    }
+}
+
+// ── snapshot_config_json ───────────────────────────────────────
+
+#[test]
+fn snapshot_config_json_emits_config_and_workspace_and_config_path() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.workspace_dir = tmp.path().join("workspace");
+    cfg.config_path = tmp.path().join("config.toml");
+
+    let snap = snapshot_config_json(&cfg).expect("snapshot should succeed");
+    assert!(snap.get("config").is_some());
+    assert!(snap.get("workspace_dir").is_some());
+    assert!(snap.get("config_path").is_some());
+    // Workspace + config paths must point at our tempdir.
+    let ws = snap["workspace_dir"].as_str().unwrap_or("");
+    assert!(ws.contains(tmp.path().to_str().unwrap_or("")));
+}
+
+#[test]
+fn snapshot_config_json_redacts_every_search_key_but_keeps_settings() {
+    let mut cfg = Config::default();
+    cfg.search.max_results = 13;
+    cfg.search.parallel.api_key = Some("parallel-sentinel".into());
+    cfg.search.brave.api_key = Some("brave-sentinel".into());
+    cfg.search.querit.api_key = Some("querit-sentinel".into());
+    cfg.search.exa.api_key = Some("exa-sentinel".into());
+    cfg.search.tavily.api_key = Some("tavily-sentinel".into());
+    cfg.search.gemini.api_key = Some("gemini-sentinel".into());
+    cfg.seltz.api_key = Some("seltz-sentinel".into());
+    let snapshot = snapshot_config_json(&cfg).unwrap();
+    let serialized = snapshot.to_string();
+    assert!(!serialized.contains("-sentinel"));
+    assert_eq!(snapshot["config"]["search"]["max_results"], 13);
+    for provider in ["parallel", "brave", "querit", "exa", "tavily", "gemini"] {
+        assert!(snapshot["config"]["search"][provider]["api_key"].is_null());
+    }
+    assert!(snapshot["config"]["seltz"]["api_key"].is_null());
+}
+
+#[test]
+fn snapshot_config_json_redacts_the_storage_url_credentials() {
+    let mut cfg = Config::default();
+    cfg.storage.url = Some("mongodb://app:hunter2@db.internal/openhuman".into());
+    let snapshot = snapshot_config_json(&cfg).unwrap();
+    assert!(!snapshot.to_string().contains("hunter2"));
+    assert_eq!(
+        snapshot["config"]["storage"]["url"],
+        "mongodb://***@db.internal/openhuman"
+    );
+}
+
+#[test]
+fn snapshot_config_json_redacts_the_inbound_queue_url_credentials() {
+    let mut cfg = Config::default();
+    cfg.inbound.queue_url = Some("amqp://app:hunter2@broker.internal/vhost".into());
+    let snapshot = snapshot_config_json(&cfg).unwrap();
+    assert!(!snapshot.to_string().contains("hunter2"));
+    assert_eq!(
+        snapshot["config"]["inbound"]["queue_url"],
+        "amqp://***@broker.internal/vhost"
+    );
+}
+
+// ── agent_server_status ────────────────────────────────────────
+
+#[test]
+fn agent_server_status_exposes_running_and_url() {
+    let outcome = agent_server_status();
+    assert!(outcome.value.get("running").is_some());
+    assert!(outcome.value.get("url").is_some());
+}
+
+// ── workspace_onboarding_flag_exists ───────────────────────────
+
+#[test]
+fn workspace_onboarding_flag_exists_returns_false_for_fresh_workspace() {
+    let tmp = tempdir().unwrap();
+    let res = workspace_onboarding_flag_exists(tmp.path().join("workspace"), "onboarding.done")
+        .expect("flag check ok");
+    assert!(!res.value);
+}
+
+#[test]
+fn workspace_onboarding_flag_exists_rejects_invalid_flag_names() {
+    let tmp = tempdir().unwrap();
+    for bad in ["", "   ", "a/b", "a\\b", "..", "foo/.."] {
+        let err = workspace_onboarding_flag_exists(tmp.path().join("workspace"), bad).unwrap_err();
+        assert!(
+            err.contains("Invalid onboarding flag"),
+            "name `{bad}`: {err}"
+        );
+    }
+}
+
+#[test]
+fn workspace_onboarding_flag_exists_true_when_file_present() {
+    let tmp = tempdir().unwrap();
+    let ws = tmp.path().join("workspace");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("onboarding.done"), "").unwrap();
+    let res = workspace_onboarding_flag_exists(ws, "onboarding.done").expect("flag check ok");
+    assert!(res.value);
+}
+
+#[tokio::test]
+async fn apply_model_settings_updates_fields_and_persists_snapshot() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+    let patch = ModelSettingsPatch {
+        api_url: Some("https://api.example.test".into()),
+        inference_url: None,
+        api_key: None,
+        default_model: Some("gpt-4o".into()),
+        default_temperature: Some(0.25),
+        model_routes: None,
+        ..Default::default()
+    };
+    let outcome = apply_model_settings(&mut cfg, patch).await.expect("apply");
+    assert_eq!(cfg.api_url.as_deref(), Some("https://api.example.test"));
+    assert_eq!(cfg.default_model.as_deref(), Some("gpt-4o"));
+    assert!((cfg.default_temperature - 0.25).abs() < f64::EPSILON);
+    assert_eq!(
+        outcome.value["config"]["api_url"],
+        "https://api.example.test"
+    );
+}
+
+#[tokio::test]
+async fn apply_search_settings_sets_and_clears_allowed_domains() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    // Explicit host list is trimmed, blanks dropped, sorted + de-duped.
+    let patch = SearchSettingsPatch {
+        allowed_domains: Some(vec![
+            " reuters.com ".into(),
+            "reuters.com".into(),
+            String::new(),
+            "github.com".into(),
+        ]),
+        ..Default::default()
+    };
+    apply_search_settings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &mut cfg,
+        patch,
+    )
+    .await
+    .expect("apply");
+    assert_eq!(
+        cfg.http_request.allowed_domains,
+        vec!["github.com".to_string(), "reuters.com".to_string()]
+    );
+
+    // allow_all = true collapses the list to the wildcard.
+    let patch = SearchSettingsPatch {
+        allow_all: Some(true),
+        ..Default::default()
+    };
+    apply_search_settings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &mut cfg,
+        patch,
+    )
+    .await
+    .expect("apply");
+    assert_eq!(cfg.http_request.allowed_domains, vec!["*".to_string()]);
+
+    // allow_all = false drops the wildcard (explicit hosts only / blocked).
+    let patch = SearchSettingsPatch {
+        allow_all: Some(false),
+        ..Default::default()
+    };
+    apply_search_settings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &mut cfg,
+        patch,
+    )
+    .await
+    .expect("apply");
+    assert!(cfg.http_request.allowed_domains.is_empty());
+}
+
+#[tokio::test]
+async fn apply_search_settings_accepts_disabled_engine() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let result = apply_search_settings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &mut cfg,
+        SearchSettingsPatch {
+            engine: Some("disabled".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("apply disabled search engine");
+
+    assert!(!cfg.search.is_enabled());
+    assert_eq!(result.value["enabled"], false);
+}
+
+#[tokio::test]
+async fn apply_search_settings_stores_and_clears_tavily_key() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let enable: SearchSettingsPatch = serde_json::from_value(serde_json::json!({
+        "providers": {"tavily": {"enabled": true, "api_key": " tvly-test-key "}},
+        "roles": {"search": ["tavily", "exa"]}
+    }))
+    .unwrap();
+    let result = apply_search_settings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &mut cfg,
+        enable,
+    )
+    .await
+    .expect("save Tavily settings");
+    let tavily = result.value["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "tavily")
+        .unwrap()
+        .clone();
+    assert_eq!(tavily["key_configured"], true);
+    assert_eq!(tavily["status"], "ready");
+    assert_eq!(result.value["effective_roles"]["search"][0], "tavily");
+    assert!(!result.value.to_string().contains("tvly-test-key"));
+    assert_eq!(cfg.search.tavily.api_key.as_deref(), Some("tvly-test-key"));
+
+    let clear: SearchSettingsPatch = serde_json::from_value(serde_json::json!({
+        "providers": {"tavily": {"api_key": "  "}}
+    }))
+    .unwrap();
+    let result = apply_search_settings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &mut cfg,
+        clear,
+    )
+    .await
+    .expect("clear Tavily key");
+    assert!(cfg.search.tavily.api_key.is_none());
+    assert!(!result.value["effective_roles"]["search"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "tavily"));
+}
+
+#[tokio::test]
+async fn apply_search_settings_rejects_unknown_search_engine() {
+    let tmp = tempdir().unwrap();
+    let mut cfg = tmp_config(&tmp);
+
+    let err = apply_search_settings(
+        &crate::core::runtime::DispatchCtx::unbound(),
+        &mut cfg,
+        SearchSettingsPatch {
+            engine: Some("unknown".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("unknown engine should be rejected");
+
+    assert!(err.contains("unknown search engine"), "{err}");
+}
+
+#[tokio::test]
+async fn reset_local_data_refuses_the_shared_root_of_a_legacy_layout() {
+    let temp = tempdir().unwrap();
+    let default_openhuman_dir = temp.path().join("default-openhuman");
+    // Legacy single-user layout: the config dir IS the shared root, which also
+    // holds every signed-in account under `users/`.
+    let sibling_file = default_openhuman_dir.join("users/other-user/config.toml");
+    let user_marker = crate::config::active_user_marker_path(&default_openhuman_dir);
+    tokio::fs::create_dir_all(sibling_file.parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(&sibling_file, "api_key = 'sibling'\n")
+        .await
+        .unwrap();
+    tokio::fs::write(&user_marker, "user_id = 'other-user'\n")
+        .await
+        .unwrap();
+
+    let err = reset_local_data_for_paths(&default_openhuman_dir, &default_openhuman_dir)
+        .await
+        .unwrap_err();
+
+    assert!(err.contains("legacy"), "{err}");
+    // A refusal changes nothing: not the root, not a sibling, not a marker.
+    assert!(sibling_file.exists());
+    assert!(user_marker.exists());
+}
+
+#[tokio::test]
+async fn reset_local_data_refuses_a_target_outside_users() {
+    let temp = tempdir().unwrap();
+    let default_openhuman_dir = temp.path().join("default-openhuman");
+    for target in [
+        temp.path().join("elsewhere"),
+        default_openhuman_dir.join("users"),
+        default_openhuman_dir.join("users").join(".."),
+        default_openhuman_dir.join("users/a/b"),
+    ] {
+        tokio::fs::create_dir_all(&target).await.unwrap();
+        let err = reset_local_data_for_paths(&target, &default_openhuman_dir)
+            .await
+            .unwrap_err();
+        assert!(err.contains("refusing"), "{target:?}: {err}");
+        assert!(target.exists(), "{target:?} was deleted");
+    }
+}

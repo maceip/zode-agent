@@ -1,0 +1,32 @@
+{
+  "name": "@comma-agents/examples",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Example scripts and strategies for comma-agents (not published)",
+  "type": "module",
+  "scripts": {
+    "tui": "bun run tui/main.tsx",
+    "run:all": "bun run tui/main.tsx --all"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "3.0.54",
+    "@ai-sdk/openai": "3.0.39",
+    "@ai-sdk/openai-compatible": "2.0.33",
+    "@comma-agents/core": "workspace:*",
+    "@comma-agents/daemon": "workspace:*",
+    "@comma-agents/debug": "workspace:*",
+    "@comma-agents/utils": "workspace:*",
+    "ai": "6.0.91",
+    "ink": "7.0.1",
+    "ink-select-input": "6.2.0",
+    "ink-spinner": "5.0.0",
+    "ink-text-input": "6.0.0",
+    "react": "19.2.5",
+    "yargs": "17.7.2",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.14",
+    "@types/yargs": "17.0.33"
+  }
+}

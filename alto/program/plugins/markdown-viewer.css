@@ -1,0 +1,210 @@
+.markdown-viewer-pane {
+  position: relative;
+  flex: 1 1 auto;
+}
+
+.markdown-viewer-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-width: thin;
+}
+
+.markdown-viewer-rendered-editor {
+  min-height: 100%;
+  outline: none;
+}
+
+.markdown-viewer-rendered-editor.is-editing {
+  cursor: text;
+  caret-color: var(--accent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.markdown-viewer-rendered-editor.is-editing .markdown-viewer-document {
+  min-height: 100%;
+}
+
+.markdown-viewer-rendered-editor.is-editing :is(a, code) {
+  cursor: text;
+}
+
+.markdown-viewer-rendered-editor.is-editing .markdown-table-resize-handle {
+  display: none;
+}
+
+.markdown-viewer-document pre[data-markdown-math="display"] {
+  margin: var(--space-4) 0;
+  padding: var(--space-3) var(--space-4);
+  color: var(--text);
+  border: thin solid var(--border-soft);
+  border-radius: var(--radius-panel);
+  background: var(--panel);
+  box-shadow: none;
+  scrollbar-width: thin;
+}
+
+.markdown-viewer-document pre[data-markdown-math="display"] > code {
+  font-family: var(--mono);
+  font-size: var(--type-label);
+  line-height: var(--line-body);
+}
+
+.markdown-viewer-document code[data-markdown-math="inline"] {
+  padding: calc(var(--space-1) / 2) var(--space-2);
+  color: var(--text);
+  border: thin solid var(--border-soft);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  font-size: var(--type-label);
+}
+
+.markdown-viewer-save-error {
+  position: sticky;
+  z-index: 2;
+  bottom: 0;
+  padding: 8px 14px;
+  color: var(--red);
+  border-top: 1px solid color-mix(in srgb, var(--red) 22%, var(--border-soft));
+  background: color-mix(in srgb, var(--red) 6%, var(--panel));
+  font-size: 12px;
+}
+
+.markdown-viewer-save-spinner {
+  animation: markdown-viewer-spin 900ms linear infinite;
+}
+
+.markdown-viewer-document {
+  box-sizing: border-box;
+  width: min(100%, 860px);
+  max-width: none;
+  margin: 0 auto;
+  padding: 34px clamp(24px, 5vw, 56px) 72px;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: var(--type-reading);
+  font-weight: 430;
+  line-height: 1.55;
+  word-break: break-word;
+}
+
+.markdown-viewer-document > :first-child { margin-top: 0; }
+.markdown-viewer-document > :last-child { margin-bottom: 0; }
+
+.markdown-viewer-document blockquote {
+  margin: 16px 0 16px 4px;
+  padding: 0 2px 0 16px;
+  color: var(--text);
+  border-left: 2px solid color-mix(in srgb, var(--text-strong) 38%, transparent);
+  border-radius: 0;
+  background: transparent;
+}
+
+.markdown-viewer-document blockquote > :first-child { margin-top: 0; }
+.markdown-viewer-document blockquote > :last-child { margin-bottom: 0; }
+
+.markdown-viewer-pane.is-line-wrapped .markdown-viewer-document pre code,
+.markdown-viewer-pane.is-line-wrapped .markdown-viewer-document figure.cordis-code-block > pre > code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.markdown-viewer-pane.is-line-wrapped .markdown-viewer-document .markdown-table-shell table {
+  width: 100% !important;
+  table-layout: fixed !important;
+}
+
+.markdown-viewer-pane.is-line-wrapped .markdown-viewer-document .markdown-table-shell th,
+.markdown-viewer-pane.is-line-wrapped .markdown-viewer-document .markdown-table-shell td {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.activity-markdown .file-citation[data-file-link-handler="markdown-viewer"] {
+  gap: 5px;
+  padding: 0;
+  color: var(--accent);
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: 1em;
+  font-weight: 500;
+  line-height: 1.2;
+  vertical-align: -0.08em;
+}
+
+.activity-markdown .file-citation[data-file-link-handler="markdown-viewer"]:hover {
+  color: var(--accent-bright);
+  border-color: transparent;
+  background: transparent;
+}
+
+.activity-markdown .file-citation[data-file-link-handler="markdown-viewer"]:hover span {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown-viewer-empty,
+.markdown-viewer-loading,
+.markdown-viewer-error {
+  display: flex;
+  min-height: 180px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 28px;
+  color: var(--text-muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.markdown-viewer-loading svg { animation: markdown-viewer-spin 1.8s linear infinite; }
+.markdown-viewer-error { flex-direction: column; }
+.markdown-viewer-error button {
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--panel-soft);
+}
+
+@keyframes markdown-viewer-spin { to { transform: rotate(360deg); } }
+
+@media (max-width: 720px) {
+  .markdown-viewer-toolbar { padding-left: 8px; }
+  .markdown-viewer-document { padding: 26px 20px 56px; }
+}
+
+.markdown-selection-menu {
+  --alto-floating-panel-radius: var(--radius-pill);
+  --alto-button-height: var(--control-compact);
+  --alto-button-padding: var(--space-1) var(--space-3);
+  --alto-button-radius: var(--radius-pill);
+  --alto-button-font-size: var(--type-label);
+  --alto-button-border: transparent;
+  --alto-button-border-hover: transparent;
+  --alto-button-background: transparent;
+  --alto-button-background-hover: var(--floating-row-hover);
+  --alto-button-shadow: none;
+  --alto-button-shadow-hover: none;
+  position: absolute;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: calc(var(--space-1) / 2);
+  padding: calc(var(--space-1) / 2);
+  corner-shape: var(--corner-shape-pill, round);
+  visibility: hidden;
+  user-select: none;
+}
+
+.markdown-selection-menu .alto-button {
+  corner-shape: var(--corner-shape-pill, round);
+  line-height: var(--line-control);
+  white-space: nowrap;
+}
+
+.markdown-selection-menu .alto-button:focus-visible {
+  outline: thin solid var(--accent-focus);
+  outline-offset: 0;
+}

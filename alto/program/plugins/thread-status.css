@@ -1,0 +1,44 @@
+.workspace-tab-thread-status {
+  width: 12px;
+  height: 12px;
+  display: inline-grid;
+  flex: 0 0 12px;
+  margin: 0 var(--space-1) 0 var(--space-2);
+  place-items: center;
+}
+
+.thread-status-indicator {
+  width: 12px;
+  height: 12px;
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+}
+
+.thread-status-indicator.running {
+  color: var(--dim);
+}
+
+.thread-status-indicator.running > svg {
+  animation: thread-status-spin 1.2s linear infinite;
+}
+
+.thread-status-indicator.finished {
+  color: var(--accent);
+}
+
+.thread-status-indicator.finished > i {
+  display: block;
+  box-sizing: border-box;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.72;
+}
+
+@keyframes thread-status-spin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .thread-status-indicator.running > svg { animation-duration: 2.4s; }
+}

@@ -1,0 +1,105 @@
+import { mkdir, mkdtemp, readFile, rename, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Authorization } from "./authorization.js";
+const directories: string[] = [];
+const origin = `chrome-extension://${"a".repeat(32)}`;
+async function open() { const dir = await mkdtemp(join(tmpdir(), "agentonweb-auth-")); directories.push(dir); return Authorization.open(dir); }
+afterEach(async () => { vi.useRealTimers(); await Promise.all(directories.splice(0).map((dir) => rm(dir, { recursive: true, force: true }))); });
+
+describe("connector host authorization", () => {
+  it("keeps a failed revocation visible and retryable, then durably revokes it", async () => {
+    const authority = await open();
+    const pending = authority.request(origin);
+    await authority.decide(pending.request.id, true);
+    const grant = await pending.result;
+    const revoked = vi.fn();
+    authority.onRevoke(revoked);
+    const file = join(authority.directory, "connections.json");
+    const backup = file + ".backup";
+    await rename(file, backup);
+    await mkdir(file); // Deterministic storage failure, including when tests run as root.
+    await expect(authority.revoke(grant.id)).rejects.toThrow();
+    expect(authority.snapshot().grants.map(item => item.id)).toEqual([grant.id]);
+    expect(revoked).not.toHaveBeenCalled();
+    await rm(file, { recursive: true });
+    await rename(backup, file);
+    await authority.revoke(grant.id);
+    expect(revoked).toHaveBeenCalledExactlyOnceWith(grant.id);
+    expect(() => authority.authenticate(origin, grant.credential)).toThrow();
+    expect((await Authorization.open(authority.directory)).snapshot().grants).toEqual([]);
+  });
+  it("issues no credential until approved; stores only a hash and binds the origin across restart", async () => {
+    const authority = await open();
+    const pending = authority.request(origin);
+    expect(authority.snapshot().grants).toHaveLength(0);
+    expect(authority.snapshot().pending).toEqual([pending.request]);
+    await authority.decide(pending.request.id, true);
+    const grant = await pending.result;
+    expect(authority.authenticate(origin, grant.credential)).toBe(grant.id);
+    const file = join(authority.directory, "connections.json");
+    expect(await readFile(file, "utf8")).not.toContain(grant.credential);
+    expect((await stat(file)).mode & 0o777).toBe(0o600);
+    const reopened = await Authorization.open(authority.directory);
+    expect(reopened.authenticate(origin, grant.credential)).toBe(grant.id);
+    expect(() => reopened.authenticate(`chrome-extension://${"b".repeat(32)}`, grant.credential)).toThrow();
+    expect(() => reopened.authenticate(origin, "wrong")).toThrow();
+    await reopened.revoke(grant.id);
+    expect(() => reopened.authenticate(origin, grant.credential)).toThrow();
+    expect((await Authorization.open(authority.directory)).snapshot().grants).toHaveLength(0);
+  });
+  it("supports decline, cancellation, bounded expiry, and no implicit approval", async () => {
+    const authority = await open();
+    for (const action of ["deny", "cancel", "expire"] as const) {
+      const pending = authority.request(origin);
+      const rejected = expect(pending.result).rejects.toThrow();
+      if (action === "deny") await authority.decide(pending.request.id, false);
+      if (action === "cancel") pending.cancel();
+      if (action === "expire") { vi.useFakeTimers(); /* Existing timers use wall time; exercise late decisions. */
+        vi.setSystemTime(Date.now() + 121_000);
+        await expect(authority.decide(pending.request.id, true)).rejects.toThrow("expired");
+        pending.cancel(); vi.useRealTimers(); }
+      await rejected;
+      expect(authority.snapshot().grants).toHaveLength(0);
+      expect(authority.snapshot().pending).toHaveLength(0);
+    }
+  });
+  it("rejects web origins and duplicate requests; shutdown cancels pending requests", async () => {
+    const authority = await open();
+    expect(() => authority.request("https://example.org")).toThrow();
+    const pending = authority.request(origin);
+    const rejected = expect(pending.result).rejects.toThrow("stopped");
+    expect(() => authority.request(origin)).toThrow("already pending");
+    authority.close(); await rejected;
+  });
+  it("accepts exact Chrome, Firefox, and Safari extension origins", async () => {
+    const authority = await open();
+    const origins = [
+      `chrome-extension://${"p".repeat(32)}`,
+      "moz-extension://123e4567-e89b-42d3-a456-426614174000",
+      "safari-web-extension://com.agentonweb.extension",
+    ];
+    for (const candidate of origins) {
+      const pending = authority.request(candidate);
+      pending.cancel();
+      await expect(pending.result).rejects.toThrow("cancelled");
+    }
+    for (const candidate of [
+      "https://example.org",
+      "moz-extension://not-a-uuid",
+      "safari-web-extension://com.agentonweb.extension/path",
+      `chrome-extension://${"z".repeat(32)}`,
+    ]) expect(() => authority.request(candidate)).toThrow("supported browser extension");
+  });
+  it("expires pending requests without any client or UI action", async () => {
+    const authority = await open();
+    vi.useFakeTimers();
+    const pending = authority.request(origin);
+    const rejected = expect(pending.result).rejects.toThrow("expired");
+    await vi.advanceTimersByTimeAsync(120_000);
+    await rejected;
+    expect(authority.snapshot()).toEqual({ pending: [], grants: [] });
+    await expect(authority.decide(pending.request.id, true)).rejects.toThrow("expired");
+  });
+});

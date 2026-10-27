@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish or retry
+        required: true
+        type: choice
+        options: [terminal-v0.4.3, terminal-v0.4.2, ext-v0.4.1, terminal-v0.4.1, dsh-v0.4.0, terminal-v0.4.0, ext-v0.4.0, dsh-v0.3.0, terminal-v0.3.0, ext-v0.3.0, dsh-v0.2.0, terminal-v0.2.0, terminal-v0.2.1, ext-v0.2.0, ext-v0.2.1]
+  push:
+    tags: ["ext-v*", "dsh-v*", "terminal-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.19.0
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm release:audit
+      - name: Verify extension tag version
+        if: startsWith(env.RELEASE_TAG, 'ext-v')
+        run: test "$RELEASE_TAG" = "ext-v$(node -p 'require("./release-contract.json").extensionVersion')"
+      - name: Verify DSH plugin tag version
+        if: startsWith(env.RELEASE_TAG, 'dsh-v')
+        run: test "$RELEASE_TAG" = "dsh-v$(node -p 'require("./release-contract.json").pluginVersion')"
+      - name: Verify terminal host tag version
+        if: startsWith(env.RELEASE_TAG, 'terminal-v')
+        run: test "$RELEASE_TAG" = "terminal-v$(node -p 'require("./release-contract.json").terminalHostVersion')"
+      - name: Publish terminal host to npm
+        if: startsWith(env.RELEASE_TAG, 'terminal-v')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN"
+          npm publish "./release/$(node -p 'require("./release-contract.json").artifacts.terminalHost')" --access public --ignore-scripts
+      - name: Publish DSH plugin to npm
+        if: startsWith(env.RELEASE_TAG, 'dsh-v')
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          test -n "$NODE_AUTH_TOKEN"
+          npm publish "./release/$(node -p 'require("./release-contract.json").artifacts.dshPlugin')" --access public --ignore-scripts
+      - name: Create extension GitHub release
+        if: startsWith(env.RELEASE_TAG, 'ext-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/package-browser-assets.mjs
+          gh release create "$RELEASE_TAG" release/agentonweb-extension-*.zip release/browser-SHA256SUMS --verify-tag --notes-file CHANGELOG.md
+      - name: Create DSH plugin GitHub release
+        if: startsWith(env.RELEASE_TAG, 'dsh-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          grep "agentonweb-dsh-surface-" release/SHA256SUMS > release/dsh-surface-SHA256SUMS
+          gh release create "$RELEASE_TAG" release/agentonweb-dsh-surface-*.tgz release/dsh-surface-SHA256SUMS --verify-tag --notes-file CHANGELOG.md
+      - name: Create terminal host GitHub release
+        if: startsWith(env.RELEASE_TAG, 'terminal-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          grep -E 'agentonweb-terminal-host-|  install.sh$' release/SHA256SUMS > release/terminal-host-SHA256SUMS
+          gh release create "$RELEASE_TAG" release/agentonweb-terminal-host-*.tgz release/install.sh release/terminal-host-SHA256SUMS --verify-tag --notes-file CHANGELOG.md

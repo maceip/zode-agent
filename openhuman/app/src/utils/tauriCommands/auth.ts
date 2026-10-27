@@ -1,0 +1,118 @@
+/**
+ * Authentication commands.
+ *
+ * Session *ownership* (login-token exchange, `/auth/me`, current user) lives
+ * in `services/session/sessionOwner` — the Tauri shell on the desktop, a thin
+ * browser equivalent elsewhere. The core only reports and holds the credential
+ * (`auth.get_state`, `auth.get_session_token`, provider credentials).
+ */
+import { callCoreRpc } from '../../services/coreRpcClient';
+import { logoutSession, storeSessionToken } from '../../services/session/sessionOwner';
+import { type CommandResponse } from './common';
+
+/**
+ * Get the current authentication state from Rust
+ */
+export async function getAuthState(): Promise<{ is_authenticated: boolean; user: object | null }> {
+  const response = await callCoreRpc<{ result: { isAuthenticated: boolean; user: object | null } }>(
+    { method: 'openhuman.auth_get_state' }
+  );
+
+  return { is_authenticated: response.result.isAuthenticated, user: response.result.user };
+}
+
+/**
+ * Get the session token from secure storage
+ */
+export async function getSessionToken(): Promise<string | null> {
+  const response = await callCoreRpc<{ result: { token: string | null } }>({
+    method: 'openhuman.auth_get_session_token',
+  });
+  return response.result.token;
+}
+
+/**
+ * Logout and clear session.
+ */
+export async function logout(): Promise<void> {
+  await logoutSession();
+}
+
+/**
+ * Install a session token through the session owner. A backend JWT is
+ * validated against `/auth/me` by the owner before the core stores it; a
+ * local (`.local`) token is stored as-is with `user`.
+ */
+export async function storeSession(token: string, user: object): Promise<void> {
+  await storeSessionToken(token, user);
+}
+
+export async function openhumanEncryptSecret(plaintext: string): Promise<CommandResponse<string>> {
+  return await callCoreRpc<CommandResponse<string>>({
+    method: 'openhuman.encrypt_secret',
+    params: { plaintext },
+  });
+}
+
+export async function openhumanDecryptSecret(ciphertext: string): Promise<CommandResponse<string>> {
+  return await callCoreRpc<CommandResponse<string>>({
+    method: 'openhuman.decrypt_secret',
+    params: { ciphertext },
+  });
+}
+
+/**
+ * Summary of one stored provider credential profile. Mirrors the Rust
+ * `credentials::responses::AuthProfileSummary` — no secret material is
+ * carried over the wire; only existence + metadata.
+ */
+export interface AuthProfileSummary {
+  id: string;
+  provider: string;
+  profile_name: string;
+  kind: 'token' | 'oauth';
+  account_id?: string | null;
+  workspace_id?: string | null;
+  has_token?: boolean;
+  metadata?: Record<string, string>;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/**
+ * Store an API key for a cloud LLM provider (or any other named provider).
+ * The token is encrypted at rest in `auth-profiles.json` under the workspace
+ * `.secret_key` — same scheme used by the Composio integration.
+ */
+export async function authStoreProviderCredentials(args: {
+  provider: string;
+  profile?: string;
+  token?: string;
+  fields?: Record<string, string>;
+  setActive?: boolean;
+}): Promise<CommandResponse<AuthProfileSummary>> {
+  return await callCoreRpc<CommandResponse<AuthProfileSummary>>({
+    method: 'openhuman.auth_store_provider_credentials',
+    params: args,
+  });
+}
+
+/** Remove a stored provider credential profile. */
+export async function authRemoveProviderCredentials(args: {
+  provider: string;
+  profile?: string;
+}): Promise<CommandResponse<{ removed: boolean; provider: string; profile: string }>> {
+  return await callCoreRpc<
+    CommandResponse<{ removed: boolean; provider: string; profile: string }>
+  >({ method: 'openhuman.auth_remove_provider_credentials', params: args });
+}
+
+/** List stored provider credential profiles, optionally filtered by provider. */
+export async function authListProviderCredentials(
+  provider?: string
+): Promise<CommandResponse<AuthProfileSummary[]>> {
+  return await callCoreRpc<CommandResponse<AuthProfileSummary[]>>({
+    method: 'openhuman.auth_list_provider_credentials',
+    params: provider ? { provider } : {},
+  });
+}

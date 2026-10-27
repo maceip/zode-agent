@@ -1,0 +1,298 @@
+import assert from "node:assert/strict";
+import { setTimeout as delay } from "node:timers/promises";
+import { afterEach, describe, test, vi } from "vitest";
+import { KILL_GRACE_MS, killGraceMs, spawnLineProcess } from "../packages/oar/src/shared/executable/index.js";
+import { readProcessTable } from "../packages/oar/src/shared/executable/process-tree.js";
+import { fakeAgent, gone, timed, withTreeProbe } from "./fixtures/process-tree.js";
+
+
+test("line buffering joins partial chunks and splits complete lines", async () => {
+  const child = spawnLineProcess(process.execPath, [
+    "-e",
+    String.raw`process.stdout.write("a\nb"); setTimeout(() => { process.stdout.write("c\nd\n"); }, 30);`,
+  ]);
+  const lines: string[] = [];
+  child.onLine((line) => {
+    lines.push(line);
+  });
+  const codes: (number | null)[] = [];
+  child.onExit((code) => {
+    codes.push(code);
+  });
+  await child.exited;
+  assert.deepEqual(lines, ["a", "bc", "d"]);
+  assert.deepEqual(codes, [0]);
+});
+
+test("line buffering preserves UTF-8 split across byte chunks", async () => {
+  // Regression transferred from Raft's runtimeSession test. A real child
+  // waits for acknowledgment of each byte, so the OS cannot merge the
+  // multibyte characters into one chunk and accidentally hide the defect.
+  const expected = JSON.stringify({ text: "hello 你好🌊" });
+  const child = spawnLineProcess(process.execPath, [
+    "-e",
+    String.raw`
+      const bytes = Buffer.from(JSON.stringify({ text: "hello 你好🌊" }) + "\n");
+      let offset = 0;
+      function sendNextByte() {
+        if (offset === bytes.length) {
+          process.stdin.destroy();
+          return;
+        }
+        process.stdout.write(bytes.subarray(offset, ++offset));
+      }
+      process.stdin.on("data", sendNextByte);
+      sendNextByte();
+    `,
+  ]);
+  const { promise: line, resolve } = Promise.withResolvers<string>();
+  child.onLine(resolve);
+  child.stdout.on("data", () => {
+    child.write("next\n");
+  });
+  try {
+    await child.spawned;
+    assert.equal(await line, expected);
+  } finally {
+    child.kill();
+    await child.exited;
+  }
+});
+
+test("exit fires exactly once with the exit code", async () => {
+  const child = spawnLineProcess(process.execPath, ["-e", "process.exit(3);"]);
+  const codes: (number | null)[] = [];
+  child.onExit((code) => {
+    codes.push(code);
+  });
+  await child.exited;
+  assert.deepEqual(codes, [3]);
+});
+
+test("a missing executable fails loudly and exits exactly once", async () => {
+  const child = spawnLineProcess("/nonexistent/oar-fixture-binary", []);
+  const codes: (number | null)[] = [];
+  child.onExit((code) => {
+    codes.push(code);
+  });
+  // Platform-honest: POSIX rejects `spawned` (ENOENT before a process
+  // exists); Windows under cross-spawn may start its shim wrapper first and
+  // surface the failure as a non-zero exit instead. Either way it must fail
+  // loudly, never look like a healthy process, and exit exactly once.
+  const spawnFailed = await child.spawned.then(() => false, () => true);
+  await child.exited;
+  assert.equal(codes.length, 1, "exit fires exactly once");
+  assert.ok(spawnFailed || codes[0] !== 0, "a missing executable must not look successful");
+});
+
+async function writeThenKill(
+  child: ReturnType<typeof spawnLineProcess>,
+  received: Promise<void>,
+): Promise<void> {
+  const timeout = setTimeout(() => { child.kill(); }, 3000);
+  try {
+    child.write("hello\n");
+    await Promise.race([received, child.exited]);
+  } finally {
+    clearTimeout(timeout);
+    child.kill();
+    await child.exited;
+  }
+}
+
+async function echoRoundTrip(): Promise<{ lines: string[]; exits: number }> {
+  const child = spawnLineProcess(process.execPath, [
+    "-e",
+    'process.stdin.on("data", (d) => process.stdout.write(d));',
+  ]);
+  await child.spawned;
+  const lines: string[] = [];
+  const received = Promise.withResolvers<void>();
+  let exits = 0;
+  child.onLine((line) => {
+    lines.push(line);
+    received.resolve();
+  });
+  child.onExit(() => {
+    exits += 1;
+  });
+  await writeThenKill(child, received.promise);
+  return { lines, exits };
+}
+
+test("write reaches stdin and kill tears the process down", async () => {
+  const { lines, exits } = await echoRoundTrip();
+  assert.deepEqual(lines, ["hello"]);
+  assert.equal(exits, 1);
+});
+
+test("the grace period is OAR_KILL_GRACE_MS when that holds a nonnegative number, else the default", () => {
+  const values = [undefined, "", " ", "250", "0", "-1", "soon", "Infinity"];
+  assert.deepEqual(
+    values.map((value) => killGraceMs(value === undefined ? {} : { OAR_KILL_GRACE_MS: value })),
+    [KILL_GRACE_MS, KILL_GRACE_MS, KILL_GRACE_MS, 250, 0, KILL_GRACE_MS, KILL_GRACE_MS, KILL_GRACE_MS],
+  );
+});
+
+/** Spawn the fake agent with a grandchild, kill it (twice: kill is idempotent), and report what happened. */
+async function killTree(ignoreSigterm: boolean): Promise<{ code: number | null; elapsed: number; gone: boolean[] }> {
+  return withTreeProbe({ ignoreSigterm }, async (probe) => {
+    const child = spawnLineProcess(process.execPath, [fakeAgent], { env: { ...process.env, ...probe.env } });
+    const tree = await probe.tree();
+    let code: number | null = null;
+    const elapsed = await timed(async () => {
+      child.kill();
+      child.kill();
+      code = await child.exited;
+    });
+    return { code, elapsed, gone: [await gone(tree.agent), await gone(tree.grandchild)] };
+  });
+}
+
+// Process groups are POSIX; on Windows kill() signals the child alone.
+describe.skipIf(process.platform === "win32")("kill takes down the child's process group", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  test("a child that stops on SIGTERM takes the process it started with it", async () => {
+    const killed = await killTree(false);
+    assert.deepEqual(killed.gone, [true, true], "the child and its grandchild are gone");
+  });
+
+  test("a child that ignores SIGTERM is SIGKILLed with its group once the grace period is over", async () => {
+    const graceMs = 300;
+    vi.stubEnv("OAR_KILL_GRACE_MS", String(graceMs));
+    const killed = await killTree(true);
+    assert.equal(killed.code, null, "a signal ended it");
+    assert.ok(killed.elapsed >= graceMs * 0.8 && killed.elapsed < graceMs + 2000, `the SIGTERM was ignored and the SIGKILL at the deadline ended it: ${killed.elapsed.toFixed(0)} ms`);
+    assert.deepEqual(killed.gone, [true, true], "the child and its grandchild are gone");
+  });
+
+  test("a kill after the child exited on its own signals nothing: its pid may already be reused", async () => {
+    // The child leaves a grandchild behind in its group and exits; a late
+    // kill must not reach the group through the reaped pid.
+    const child = spawnLineProcess(process.execPath, [
+      "-e",
+      String.raw`const tool = require("node:child_process").spawn("sleep", ["60"], { stdio: "ignore" }); tool.unref(); process.stdout.write(tool.pid + "\n");`,
+    ]);
+    const { promise: reported, resolve } = Promise.withResolvers<string>();
+    child.onLine(resolve);
+    const leftover = Number(await reported);
+    try {
+      assert.equal(await child.exited, 0);
+      child.kill();
+      assert.equal(await gone(leftover, 300), false, "the leftover was not signalled");
+    } finally {
+      process.kill(leftover, "SIGKILL");
+    }
+  });
+});
+
+// A tool in a session of its own (claude's Bash tool) is out of the group.
+describe.skipIf(process.platform === "win32")("kill with killTree also takes the descendants that left the group", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  test("a child that stops on SIGTERM: its tool goes as soon as the child is gone", async () => {
+    vi.stubEnv("OAR_KILL_GRACE_MS", "5000");
+    await withTreeProbe({ ignoreSigterm: false, detachTool: true }, async (probe) => {
+      const child = spawnLineProcess(process.execPath, [fakeAgent], { env: { ...process.env, ...probe.env }, killTree: true });
+      const tree = await probe.tree();
+      assert.equal(readProcessTable().get(tree.grandchild)?.pgid, tree.grandchild, "the tool leads a group of its own");
+      const elapsed = await timed(async () => {
+        child.kill();
+        await child.exited;
+      });
+      assert.ok(elapsed < 2000, `the child's own exit ended it, not the deadline: ${elapsed.toFixed(0)} ms`);
+      assert.deepEqual([await gone(tree.agent), await gone(tree.grandchild, 1000)], [true, true], "the child and its tool are gone");
+    });
+  });
+
+  test("a child that ignores SIGTERM: the SIGKILL takes its tools, one started after the kill began included", async () => {
+    vi.stubEnv("OAR_KILL_GRACE_MS", "300");
+    await withTreeProbe({ ignoreSigterm: true, detachTool: true, lateTool: true }, async (probe) => {
+      const child = spawnLineProcess(process.execPath, [fakeAgent], { env: { ...process.env, ...probe.env }, killTree: true });
+      const tree = await probe.tree();
+      child.kill();
+      const late = await probe.lateTool();
+      assert.equal(await child.exited, null, "a signal ended it");
+      assert.deepEqual([await gone(tree.agent), await gone(tree.grandchild, 1000), await gone(late, 1000)], [true, true, true],
+        "the child, its tool and the one started on SIGTERM are gone");
+    });
+  });
+});
+
+/** Run with a short kill grace, restoring the host's setting after. */
+async function withKillGrace(ms: number, run: () => Promise<void>): Promise<void> {
+  const previous = process.env.OAR_KILL_GRACE_MS;
+  process.env.OAR_KILL_GRACE_MS = String(ms);
+  try {
+    await run();
+  } finally {
+    if (previous === undefined) { delete process.env.OAR_KILL_GRACE_MS; } else { process.env.OAR_KILL_GRACE_MS = previous; }
+  }
+}
+
+test("a write after kill() ended stdin is dropped, not an unhandled error that takes the host down", async () => {
+  // A child that ignores SIGTERM: stdin ends at kill(), the exit comes at the SIGKILL.
+  await withKillGrace(300, async () => {
+    const child = spawnLineProcess(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"]);
+    await child.spawned;
+    child.kill();
+    child.write("late\n");
+    // An 'error' from the write would surface on the next turns of the loop.
+    await delay(50);
+    await child.exited;
+  });
+});
+
+// oxlint-disable-next-line eslint/max-statements -- One native shutdown interleaving verifies no second signal enters cleanup.
+test("stdin shutdown awaits the native cleanup once without reentering it through SIGTERM", async () => {
+  const lines: string[] = [];
+  const { promise: ready, resolve } = Promise.withResolvers<void>();
+  const child = spawnLineProcess(process.execPath, ["-e", String.raw`
+    let closing = false;
+    async function stop() {
+      if (closing) process.exit(93);
+      closing = true;
+      await new Promise(resolve => setTimeout(resolve, 40));
+      process.stdout.write("cleanup-complete\n");
+      process.exit(0);
+    }
+    process.stdin.resume();
+    process.stdin.on("end", stop);
+    process.on("SIGTERM", stop);
+    console.log("ready");
+  `], { killTree: true, shutdown: "stdin" });
+  child.onLine((line) => { lines.push(line); if (line === "ready") { resolve(); } });
+  try {
+    await ready;
+    child.kill();
+    child.kill();
+    assert.equal(await child.exited, 0);
+    assert.deepEqual(lines, ["ready", "cleanup-complete"]);
+  } finally { child.kill(); await child.exited; }
+});
+
+test("stdin shutdown force-ends a process that keeps running after EOF", async () => {
+  // oxlint-disable-next-line eslint/max-statements -- Native startup, timeout and process cleanup belong to one lifecycle.
+  await withKillGrace(300, async () => {
+    const { promise: ready, resolve } = Promise.withResolvers<void>();
+    const child = spawnLineProcess(process.execPath, ["-e", String.raw`
+      process.stdin.resume();
+      process.stdin.on("end", () => {});
+      setInterval(() => {}, 1000);
+      console.log("ready");
+    `], { shutdown: "stdin" });
+    child.onLine(() => { resolve(); });
+    try {
+      await ready;
+      const started = performance.now();
+      child.kill();
+      assert.notEqual(await child.exited, 0);
+      assert.ok(performance.now() - started < 5000);
+    } finally { child.kill(); await child.exited; }
+  });
+});

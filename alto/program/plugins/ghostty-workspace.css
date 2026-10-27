@@ -1,0 +1,32 @@
+.ghostty-workspace-pane {
+  width: 100%;
+  overflow: hidden;
+}
+
+.ghostty-workspace-surfaces {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 0;
+  overflow: hidden;
+}
+
+.ghostty-workspace-surface {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.ghostty-workspace-surface.is-active {
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.ghostty-workspace-problem {
+  margin: 0;
+  padding: var(--space-2) var(--space-4);
+  color: var(--muted);
+  font-size: var(--type-label);
+  overflow-wrap: anywhere;
+}

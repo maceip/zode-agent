@@ -1,0 +1,56 @@
+.seal-context {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* The user bubble is already a surface; the embedded selection needs no second box. */
+.activity-user .seal-context .cordis-code-block {
+  margin: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.activity-user .seal-context .cordis-code-block > figcaption {
+  padding: 0;
+}
+
+.activity-user .seal-context .cordis-code-block > pre {
+  padding: calc(var(--space-3) / 2) 0 0;
+}
+
+.seal-context figure > pre > code {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  overflow: hidden;
+}
+
+.seal-context pre:has(> code:empty) { display: none; }
+
+.seal-context-fallback {
+  margin: calc(var(--space-3) + var(--space-1) / 2) 0 calc(var(--space-2) * 2);
+}
+
+.seal-context-fallback figcaption {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--muted);
+  font: 11px/1.4 var(--sans);
+}
+
+.seal-context-fallback figcaption > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.seal-context-fallback pre,
+.seal-context-fallback code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: visible;
+}
