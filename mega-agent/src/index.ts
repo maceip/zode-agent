@@ -1,5 +1,7 @@
 export * from "./kernel/record-stream.ts";
 export * from "./control/runtime.ts";
+export * from "./control/litert-runtime.ts";
+export * from "./control/runtime-resolver.ts";
 export * from "./effects/spans.ts";
 export * from "./composition/agent.ts";
 export * from "./decision/approvals.ts";

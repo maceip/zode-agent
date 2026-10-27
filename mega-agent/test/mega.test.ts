@@ -119,6 +119,18 @@ test("L7 surface: reprogram commits, broken plugin rolls back, proposal needs ac
   assert.ok(ws.get("q"));
 });
 
+test("L2 oar adapter: module loads without oar installed; create() fails plainly or succeeds", async () => {
+  const { OarRuntimeAdapter } = await import("../src/control/oar-runtime.ts");
+  assert.equal(typeof OarRuntimeAdapter.create, "function");
+  try {
+    const a = await OarRuntimeAdapter.create("definitely-not-a-runtime-xyz");
+    await a.dispose();
+    assert.fail("unknown runtime must not create");
+  } catch (e) {
+    assert.match((e as Error).message, /oar|runtime/);
+  }
+});
+
 test("L7 attention: routes to exact session, cannot approve", async () => {
   const s = new MegaSession(new ScriptedRuntime(), { cwd: "." });
   const idx = new AttentionIndex();
@@ -129,4 +141,32 @@ test("L7 attention: routes to exact session, cannot approve", async () => {
   assert.ok(item && idx.route(item).includes(s.id));
   assert.equal(idx.canApprove, false);
   assert.equal(typeof (idx as unknown as { approve?: unknown }).approve, "undefined");
+});
+
+test("L2 litert-lm: native engine adapter and model discovery", async () => {
+  const { LiteRtLmRuntimeAdapter, getLocalLiteRtModels, findLiteRtBinary } = await import("../src/control/litert-runtime.ts");
+  assert.equal(typeof LiteRtLmRuntimeAdapter.isInstalled, "function");
+  assert.equal(typeof LiteRtLmRuntimeAdapter.listModels, "function");
+  const models = await LiteRtLmRuntimeAdapter.listModels();
+  assert.ok(Array.isArray(models));
+  if (findLiteRtBinary()) {
+    assert.equal(LiteRtLmRuntimeAdapter.isInstalled(), true);
+  }
+});
+
+test("L2 runtime resolver: live LLM default and installed agent auto-detection", async () => {
+  const { detectRuntimeInventory, resolveDefaultRuntime } = await import("../src/control/runtime-resolver.ts");
+  const inv = await detectRuntimeInventory();
+  assert.ok(Array.isArray(inv.installedAgents));
+  assert.equal(typeof inv.localLiteRt.installed, "boolean");
+
+  // Scripted fallback works explicitly
+  const scripted = await resolveDefaultRuntime({ scripted: true });
+  assert.equal(scripted.source, "scripted");
+  assert.equal(scripted.adapter.id, "scripted");
+
+  // Default resolution resolves a live runtime
+  const live = await resolveDefaultRuntime();
+  assert.ok(["installed-agent", "litert-lm", "scripted"].includes(live.source));
+  assert.ok(typeof live.adapter.runTurn === "function");
 });

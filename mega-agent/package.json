@@ -9,5 +9,8 @@
     "test": "node --test test/mega.test.ts",
     "check": "node --check src/cli.ts 2>/dev/null || node src/cli.ts --help"
   },
+  "dependencies": {
+    "@botiverse/oar": "file:../oar/packages/oar"
+  },
   "engines": { "node": ">=24" }
 }
