@@ -1,12 +1,16 @@
 #!/usr/bin/env node
-// Mega-Agent CLI — Live LLM runtime by default with native LiteRT-LM local engine
-// and auto-detection for user-installed agents (codex, claude, grok, kimi, opencode, pi).
+// Mega-Agent CLI. Every mode goes through MegaAgentSystem; the CLI does not
+// assemble kernel, tools, approvals, crew, context, or surface pieces itself.
+import { readFileSync } from "node:fs";
+import { basename, join } from "node:path";
+import { createInterface, type Interface } from "node:readline/promises";
 import {
-  MegaSession, ScriptedRuntime, deriveMessages, viewOf, createAgent, createHumanAgent,
-  buildFlowAgent, ApprovalGate, ParkedApprovalError, Crew, wakeParentOnReport,
-  runInIsolate, ContextStore, DeferredToolRegistry, WorkspaceProgram, AttentionIndex,
-  BudgetHook, CacheHook,
-  detectRuntimeInventory, resolveDefaultRuntime,
+  ScriptedRuntime,
+  createMegaAgent,
+  detectRuntimeInventory,
+  resolveRuntimeFleet,
+  type MegaTaskResult,
+  type StrategyDef,
 } from "./index.ts";
 
 function parseArg(flag: string): string | undefined {
@@ -17,28 +21,49 @@ function parseArg(flag: string): string | undefined {
   return match ? match.slice(prefix.length) : undefined;
 }
 
+function parseAllArgs(flag: string): string[] {
+  const values: string[] = [];
+  for (let i = 0; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg === flag && i + 1 < process.argv.length) values.push(process.argv[++i]);
+    else if (arg.startsWith(`${flag}=`)) values.push(arg.slice(flag.length + 1));
+  }
+  return values;
+}
+
 const hasFlag = (flag: string) => process.argv.includes(flag);
 
 if (hasFlag("--help") || hasFlag("-h")) {
   console.log(`Mega-Agent CLI
 
 Usage:
-  npm run demo                     Run full 8-layer stack using live LLM runtime by default
-  node src/cli.ts                  Run full 8-layer stack using live LLM runtime by default
-  node src/cli.ts --prompt "..."   Run prompt through active live runtime
-  node src/cli.ts --inventory      Inspect detected local LiteRT-LM and installed agent CLIs
+  node src/cli.ts                         Run the integrated system check
+  node src/cli.ts --prompt "..."          Run one task through MegaAgentSystem
+  node src/cli.ts --inventory             Inspect detected runtimes
 
 Flags:
-  --runtime <id>     Select engine: litert-lm | claude | codex | grok | kimi | opencode | pi | scripted
-  --model <id>       Select LiteRT-LM or agent model (e.g. vibethinker-3b-litertlm, gemma-4-E2B-it)
-  --local, --litert  Use native LiteRT-LM local on-device engine
-  --scripted         Run in deterministic offline mode (no network/agent CLI)
-  --prompt <text>    Send single prompt to session
+  --runtime <id>       litert-lm | claude | codex | grok | kimi | opencode | pi | scripted
+  --model <id>         LiteRT-LM or agent model
+  --local, --litert    Use native LiteRT-LM
+  --scripted           Deterministic offline demo runtime
+  --prompt <text>      Task prompt
+  --context-file <p>   Attach file contents through the context store
+  --record <path>      Shared record stream JSONL (default .mega-agent/records.jsonl)
+  --task-store <path>  Durable task journal (default .mega-agent/tasks.json)
+  --workspace <path>   Durable workspace plugins (default .mega-agent/workspace.json)
+  --plugin <path>      Install a workspace plugin JS file; may repeat
+  --strategy-file <p>  JSON StrategyDef or record of StrategyDefs
+  --strategy <name>    Run registered strategy before root task turn
+  --attention          List actionable attention routes from persisted state
+  --state-dir <path>   Directory for approvals/tasks/records/workspace (default .mega-agent)
+  --defer-approvals    Park approval-gated tools and exit; resolve in a later process
+  --resolve-approval <id> --decision allow|deny [--by <name>]
+                       Resolve a parked approval; a persisted task resumes to its final answer
+  --resume-task <id>   Resume a task waiting for idempotent tool recovery
 `);
   process.exit(0);
 }
 
-// 1. Discover active inventory
 const inventory = await detectRuntimeInventory();
 
 if (hasFlag("--inventory")) {
@@ -47,27 +72,40 @@ if (hasFlag("--inventory")) {
   console.log("  Installed:", inventory.localLiteRt.installed ? `yes (${inventory.localLiteRt.binary})` : "no");
   console.log("  Discovered Models:", inventory.localLiteRt.models.length ? inventory.localLiteRt.models.join(", ") : "none found in ~/.litert-lm/models");
   console.log("\nUser Installed Agent CLIs (via @botiverse/oar):");
-  if (inventory.installedAgents.length === 0) {
-    console.log("  No external agent CLIs detected.");
-  } else {
-    for (const a of inventory.installedAgents) {
-      console.log(`  • ${a.id}: ${a.version ?? a.via ?? "available"}${a.command ? ` (${a.command})` : ""}`);
-    }
+  if (inventory.installedAgents.length === 0) console.log("  No external agent CLIs detected.");
+  for (const a of inventory.installedAgents) {
+    console.log(`  • ${a.id}: ${a.version ?? a.via ?? "available"}${a.command ? ` (${a.command})` : ""}`);
   }
   process.exit(0);
 }
 
-// 2. Resolve default runtime
 const preferred = parseArg("--runtime") ?? (hasFlag("--local") || hasFlag("--litert") ? "litert-lm" : undefined);
 const model = parseArg("--model");
 const scripted = hasFlag("--scripted");
+const {
+  adapter: resolvedAdapter,
+  source,
+  additionalRuntimes,
+} = await resolveRuntimeFleet({ preferred, model, scripted });
 
-const { adapter, source } = await resolveDefaultRuntime({
-  preferred,
-  model,
-  scripted,
-});
+function createScriptedDemoAdapter(): ScriptedRuntime {
+  return new ScriptedRuntime((prompt) => {
+    if (prompt === "integrated-crew-check") return "crew verification passed";
+    if (prompt.includes("[tool_result ask_human]")) return "Integrated system check passed: context, crew, code result 42, and simulated operator input all reached the final answer.";
+    if (prompt.includes("[tool_result run_code]")) return JSON.stringify({ tool: "ask_human", args: { prompt: "Confirm the integrated system result" } });
+    if (prompt.includes("[tool_result delegate]")) return JSON.stringify({ tool: "run_code", args: { code: "return 40 + 2;" } });
+    if (prompt.includes("[tool_result search_tools]")) return JSON.stringify({ tool: "delegate", args: { runtime: "scripted", task: "integrated-crew-check", label: "crew" } });
+    if (prompt.includes("[tool_result expand_context]")) return JSON.stringify({ tool: "search_tools", args: { query: "delegate code human" } });
+    const handle = prompt.match(/ccr:\d+/)?.[0];
+    if (handle && prompt.includes("Run an integrated system check")) {
+      return JSON.stringify({ tool: "expand_context", args: { handle } });
+    }
+    const task = prompt.split("\nTask:\n").at(-1)?.trim() || prompt;
+    return `scripted answer to: ${task}`;
+  });
+}
 
+const adapter = scripted ? createScriptedDemoAdapter() : resolvedAdapter;
 console.log(`[mega-agent] Active engine: ${adapter.id} (source: ${source})`);
 if (inventory.localLiteRt.installed) {
   console.log(`[mega-agent] LiteRT-LM native engine ready: ${inventory.localLiteRt.models.length} local model(s) available`);
@@ -75,107 +113,178 @@ if (inventory.localLiteRt.installed) {
 if (inventory.installedAgents.length > 0) {
   console.log(`[mega-agent] Installed agents available: ${inventory.installedAgents.map((a) => a.id).join(", ")}`);
 }
+if (additionalRuntimes.size > 0) {
+  console.log(`[mega-agent] Crew runtimes provisioned: default, ${[...additionalRuntimes.keys()].join(", ")}`);
+}
 
-// 3. Single prompt mode
-const promptArg = parseArg("--prompt");
-if (promptArg) {
-  const session = new MegaSession(adapter, { cwd: process.cwd(), model });
-  console.log(`\n> ${promptArg}`);
-  const reply = await session.promptAndWait(promptArg);
-  console.log(`\n${reply}\n`);
-  console.log(`Records logged: ${session.stream.records.length} | Model messages: ${deriveMessages(session.stream).length}`);
-  session.dispose();
-  if ("dispose" in adapter && typeof (adapter as { dispose?: () => unknown }).dispose === "function") {
-    await (adapter as { dispose: () => unknown }).dispose();
+function loadStrategies(): Record<string, StrategyDef> {
+  const file = parseArg("--strategy-file");
+  if (!file) return {};
+  const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`strategy file must contain a StrategyDef or a record of StrategyDefs: ${file}`);
   }
-  process.exit(0);
+  const record = parsed as Record<string, unknown>;
+  const entries = "agents" in record && "flow" in record
+    ? [[String(record.name ?? "strategy"), record] as const]
+    : Object.entries(record);
+  const strategies: Record<string, StrategyDef> = {};
+  for (const [name, value] of entries) {
+    const def = value as Partial<StrategyDef>;
+    if (!def || typeof def !== "object" || !def.agents || !def.flow) {
+      throw new Error(`invalid StrategyDef for '${name}' in ${file}`);
+    }
+    strategies[name] = { ...def, name: def.name ?? name } as StrategyDef;
+  }
+  return strategies;
 }
 
-// 4. End-to-end multi-layer execution (Live LLM by default)
-console.log("\n--- Layer 1 & 2: Session Kernel + Honest Control ---");
-const parent = new MegaSession(adapter, { cwd: process.cwd(), model: model ?? "default" });
-const attention = new AttentionIndex();
-attention.watch(parent.id, parent.stream);
-
-// In demo/test turn, execute turn through the active adapter
-try {
-  const initialAnswer = await parent.promptAndWait("Identify repo health and summarize agent capabilities.");
-  console.log("L1/L2 response:", initialAnswer.slice(0, 160) + (initialAnswer.length > 160 ? "..." : ""));
-} catch (e) {
-  console.log("L1/L2 live turn note:", (e as Error).message);
+let readline: Interface | undefined;
+function getReadline(): Interface {
+  readline ??= createInterface({ input: process.stdin, output: process.stdout });
+  return readline;
 }
 
-console.log("  deliver with no active turn:", JSON.stringify(parent.deliver("late steer")));
-try {
-  new MegaSession(adapter, { cwd: ".", teleport: true });
-} catch (e) {
-  console.log("  refused option:", (e as Error).message);
-}
+const humanAsk = scripted
+  ? async (prompt: string) => `simulated operator response to: ${prompt}`
+  : process.stdin.isTTY
+    ? async (prompt: string) => getReadline().question(`\nHuman input requested: ${prompt}\n> `)
+    : undefined;
 
-console.log("\n--- Layer 6: Economics (CCR context handles + deferred tools) ---");
-const ctx = new ContextStore(100);
-const big = ctx.put("x".repeat(5000));
-const tools = new DeferredToolRegistry();
-tools.register({ name: "read_file", description: "read a file", schemaChars: 900 });
-tools.register({ name: "web_search", description: "search the web", schemaChars: 1200 });
-console.log(`L6 economics: context saved ${big.savedChars} chars (${big.inline}); tool index "${tools.indexForPrompt()}" vs ${tools.charsIfAllEager()} eager schema chars; search('file') ->`, tools.search("file").map(t => t.name).join(","));
-
-console.log("\n--- Layer 5: Substrate (Sandboxed Isolate) ---");
-const iso = await runInIsolate("console.log('from isolate'); return await cap('add', 6, 7);", {
-  capabilities: { add: (a, b) => Number(a) + Number(b) },
-  hooks: [new BudgetHook(500)],
+const stateDir = parseArg("--state-dir") ?? join(process.cwd(), ".mega-agent");
+const mega = createMegaAgent({
+  cwd: process.cwd(),
+  adapter,
+  additionalRuntimes,
+  sessionOptions: model ? { model } : {},
+  humanAsk,
+  strategies: loadStrategies(),
+  approvalStoreFile: join(stateDir, "approvals.json"),
+  recordFile: parseArg("--record") ?? join(stateDir, "records.jsonl"),
+  taskStoreFile: parseArg("--task-store") ?? join(stateDir, "tasks.json"),
+  workspaceStoreFile: parseArg("--workspace") ?? join(stateDir, "workspace.json"),
 });
-console.log(`L5 substrate: isolate value = ${iso.value} logs = ${iso.logs.join(";")} jail = ${iso.jail}`);
-try {
-  await runInIsolate("while (true) {}", { timeoutMs: 300 });
-} catch {
-  console.log("  infinite loop: child process killed by external budget");
+
+async function settle(result: MegaTaskResult): Promise<MegaTaskResult> {
+  let current = result;
+  while (current.status === "waiting_approval") {
+    console.log(`\nApproval needed before tool "${current.tool}" can run.`);
+    if (current.attentionRoute) console.log(`Attention route: ${current.attentionRoute}`);
+
+    if (hasFlag("--defer-approvals")) {
+      console.log("Approval deferred. The durable task can be resumed by a later process; the tool has not run.");
+      return current;
+    }
+
+    if (scripted) {
+      console.log("Scripted demo operator: allowing the tool for this offline demonstration.");
+      current = await mega.resolveApproval(current.approvalId, "allow", "scripted-demo-operator");
+      continue;
+    }
+
+    if (!process.stdin.isTTY) {
+      console.log("No interactive terminal is available, so the task remains parked. The tool has not run.");
+      return current;
+    }
+
+    const answer = (await getReadline().question("Allow? [y/N] ")).trim().toLowerCase();
+    current = await mega.resolveApproval(
+      current.approvalId,
+      answer === "y" || answer === "yes" ? "allow" : "deny",
+      "cli-operator",
+    );
+  }
+  return current;
 }
 
-console.log("\n--- Layer 3: Composition & Effects (Unified Agent/Human/Flow) ---");
-const echoSession = new MegaSession(adapter, { cwd: process.cwd() }, ["writer"]);
-const writer = createAgent("writer", echoSession);
-const human = createHumanAgent("reviewer", async (p) => `human approved draft (${p.slice(0, 20)}...)`);
-const flow = buildFlowAgent("pipeline", { type: "sequential", steps: ["writer", "reviewer"] }, new Map([["writer", writer], ["reviewer", human]]));
-const cache = new CacheHook();
-try {
-  console.log("L3 composition flow:", await flow.call("draft release notes"));
-} catch (e) {
-  console.log("L3 composition note:", (e as Error).message);
+function printResult(result: MegaTaskResult): void {
+  if (result.status === "completed") {
+    console.log(`\n${result.answer}\n`);
+    console.log(`Tools used: ${result.toolsUsed.join(", ") || "none"}`);
+    console.log(`Context saved by handle: ${result.contextSavedChars} chars`);
+  } else if (result.status === "waiting_approval") {
+    console.log(`Task ${result.taskId} is waiting for approval ${result.approvalId}.`);
+    process.exitCode = 2;
+  } else {
+    console.log(`Tool ${result.tool} completed with decision ${result.decision}: ${JSON.stringify(result.result)}`);
+  }
+
+  const snapshot = mega.snapshot();
+  console.log(`Records in shared stream: ${snapshot.recordCount}`);
+  console.log(`Persisted tasks: ${snapshot.persistedTasks.map((t) => `${t.id}:${t.status}`).join(", ") || "none"}`);
+  console.log(`Workspace revision: ${snapshot.workspaceRevision} | Plugins: ${snapshot.pluginIds.join(", ") || "none"}`);
+  console.log(`View: ${JSON.stringify(snapshot.view)}`);
 }
 
-console.log("\n--- Layer 8: Decision Plane (Fail-Closed Parked Approvals) ---");
-const gate = new ApprovalGate(parent.stream, []);
 try {
-  await gate.request({ tool: "bash", summary: "rm -rf build/", agentPath: [] });
-} catch (e) {
-  if (e instanceof ParkedApprovalError) {
-    console.log(`L8 decision: no answerer -> parked ${e.id}; attention:`, attention.pending().map(i => `${i.reason} @ ${attention.route(i)}`).join(" | "));
-    console.log("  resolved by human:", JSON.stringify(gate.resolveParked(e.id, "deny", "user")));
-  } else throw e;
-}
-console.log("  approval events model-visible?", deriveMessages(parent.stream).some(m => m.content.includes("rm -rf")), "(must be false)");
+  if (hasFlag("--attention")) {
+    const snapshot = mega.snapshot();
+    if (snapshot.attention.length === 0) {
+      console.log("No actionable attention items.");
+    }
+    for (const item of snapshot.attention) {
+      console.log(`${mega.attention.route(item)} | ${item.reason}${item.approvalId ? ` | approval: ${item.approvalId}` : ""}${item.requestId ? ` | request: ${item.requestId}` : ""}`);
+      if (item.approvalId) {
+        console.log(`Resolve with: node src/cli.ts --state-dir ${stateDir} --resolve-approval ${item.approvalId} --decision allow|deny`);
+      }
+    }
+    console.log(`Persisted tasks: ${snapshot.persistedTasks.map((t) => `${t.id}:${t.status}${t.resumable ? ":resumable" : ""}`).join(", ") || "none"}`);
+  }
 
-console.log("\n--- Layer 4: Crew Delegation ---");
-const crew = new Crew(new Map([["worker", adapter]]), 2);
-wakeParentOnReport(crew, parent);
-try {
-  const r = await crew.spawn("worker", "diff on branch main", "reviewer-1");
-  console.log("L4 crew result:", r.answer.slice(0, 100));
-} catch (e) {
-  console.log("L4 crew note:", (e as Error).message);
-}
+  const pluginPaths = parseAllArgs("--plugin");
+  for (const pluginPath of pluginPaths) {
+    const id = basename(pluginPath).replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]+/g, "-");
+    const install = await mega.installPlugin({ id, source: readFileSync(pluginPath, "utf8") });
+    if (!install.ok) throw new Error(`plugin ${pluginPath} failed to activate: ${install.error ?? "unknown error"}`);
+    console.log(`[mega-agent] Workspace plugin installed: ${id} (revision ${install.revision})`);
+  }
 
-console.log("\n--- Layer 7: Transactional Workspace Surface ---");
-const ws = new WorkspaceProgram();
-console.log("L7 surface:", JSON.stringify(ws.reprogram([{ id: "greeting", source: "globalThis.greeting = 'hello v1';" }])));
-console.log("  broken plugin:", JSON.stringify(ws.reprogram([{ id: "greeting", source: "throw new Error('boom')" }])), "| active still:", ws.get("greeting")?.source);
+  const resumeTaskId = hasFlag("--attention") ? undefined : parseArg("--resume-task");
+  if (resumeTaskId) {
+    const result = await settle(await mega.resumeInterruptedTask(resumeTaskId));
+    printResult(result);
+  }
 
-console.log("\n--- View & Session Log Summary ---");
-console.log("viewOf(parent):", JSON.stringify(viewOf(parent.stream)));
-console.log("deriveMessages(parent):", deriveMessages(parent.stream).length, "messages from", parent.stream.records.length, "records");
+  const approvalId = hasFlag("--attention") || resumeTaskId ? undefined : parseArg("--resolve-approval");
+  if (approvalId) {
+    const decision = parseArg("--decision");
+    if (decision !== "allow" && decision !== "deny") throw new Error("--resolve-approval requires --decision allow or --decision deny");
+    const result = await settle(await mega.resolveApproval(approvalId, decision, parseArg("--by") ?? "cli-operator"));
+    printResult(result);
+  }
 
-parent.dispose();
-if ("dispose" in adapter && typeof (adapter as { dispose?: () => unknown }).dispose === "function") {
-  await (adapter as { dispose: () => unknown }).dispose();
+  const promptArg = approvalId || resumeTaskId || hasFlag("--attention") ? undefined : parseArg("--prompt");
+  const contextFile = parseArg("--context-file");
+  const attachedContext = contextFile ? readFileSync(contextFile, "utf8") : undefined;
+
+  if (!approvalId && !resumeTaskId && !hasFlag("--attention") && promptArg) {
+    const result = await settle(await mega.runTask({
+      prompt: promptArg,
+      context: attachedContext,
+      strategy: parseArg("--strategy"),
+    }));
+    printResult(result);
+  } else if (!approvalId && !resumeTaskId && !hasFlag("--attention")) {
+    const install = pluginPaths.length === 0 && mega.workspace.ids().length === 0 ? await mega.installPlugin({
+      id: "integrated-check-planner",
+      source: `globalThis.__plugin = async () => {
+        const found = await cap("search_tools", "context");
+        return {
+          instructions: ["Use stored material, independent verification, a computed check, and human review. Plugin found: " + found.join(",")],
+          toolQuery: "context",
+        };
+      };`,
+    }) : { ok: true, revision: mega.workspace.revision, changed: [] as string[], error: undefined, rolledBack: false };
+    if (!install.ok) throw new Error(`integrated-check plugin failed to activate: ${install.error ?? "unknown error"}`);
+
+    const result = await settle(await mega.runTask({
+      prompt: "Run an integrated system check. Use stored material, independent verification, a computed check, and human review before the final verdict.",
+      context: attachedContext ?? `DEMO_EVIDENCE: ${"connected layer evidence ".repeat(80)}`,
+      maxToolIterations: 10,
+    }));
+    printResult(result);
+  }
+} finally {
+  readline?.close();
+  await mega.dispose();
 }

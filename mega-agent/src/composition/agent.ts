@@ -1,6 +1,7 @@
 // Layer 3 — Composition. Source: CommaAgents (Flow IS Agent, Human IS Agent,
 // declarative Strategy) with string break-signals replaced by a typed verdict.
-import { MegaSession, ScriptedRuntime } from "../control/runtime.ts";
+import { MegaSession, ScriptedRuntime, type RuntimeAdapter, type SessionOptions } from "../control/runtime.ts";
+import type { RecordStream } from "../kernel/record-stream.ts";
 import { runSpan, type Hook } from "../effects/spans.ts";
 
 export interface Agent {
@@ -40,18 +41,18 @@ export function buildFlowAgent(name: string, def: FlowDef, agents: Map<string, A
       return runSpan({ kind: "invoke", name, input }, async () => {
         if (def.type === "sequential") {
           let cur = input;
-          for (const s of def.steps) cur = await get(s).call(cur);
+          for (const s of def.steps) cur = await get(s).call(cur, hooks);
           return cur;
         }
         if (def.type === "broadcast") {
-          const parts = await Promise.all(def.steps.map((s) => get(s).call(input)));
+          const parts = await Promise.all(def.steps.map((s) => get(s).call(input, hooks)));
           return parts.map((p, i) => `[${def.steps[i]}] ${p}`).join("\n---\n");
         }
         // cycle: observer must return a JSON verdict — no substring break-signals.
         let cur = input;
         for (let i = 0; i < def.maxCycles; i++) {
-          for (const s of def.steps) cur = await get(s).call(cur);
-          const verdictRaw = await get(def.observer).call(cur);
+          for (const s of def.steps) cur = await get(s).call(cur, hooks);
+          const verdictRaw = await get(def.observer).call(cur, hooks);
           let verdict: { approved?: boolean };
           try { verdict = JSON.parse(verdictRaw); } catch { throw new Error(`observer ${def.observer} returned non-JSON verdict`); }
           if (verdict.approved === true) return cur;
@@ -62,12 +63,37 @@ export function buildFlowAgent(name: string, def: FlowDef, agents: Map<string, A
   };
 }
 
-export function buildStrategy(def: StrategyDef, humanAsk: (p: string) => Promise<string>): Agent {
+export interface BuildStrategyOptions {
+  runtime?: RuntimeAdapter;
+  runtimeFor?: (agentName: string) => RuntimeAdapter;
+  sessionFor?: (agentName: string, runtime: RuntimeAdapter) => MegaSession;
+  stream?: RecordStream;
+  cwd?: string;
+  sessionOptions?: Omit<SessionOptions, "cwd"> & { cwd?: string };
+  parentPath?: readonly string[];
+}
+
+export function buildStrategy(
+  def: StrategyDef,
+  humanAsk: (p: string) => Promise<string>,
+  options: BuildStrategyOptions = {},
+): Agent {
   const agents = new Map<string, Agent>();
   for (const [name, a] of Object.entries(def.agents)) {
-    if (a.type === "user") agents.set(name, createHumanAgent(name, humanAsk));
-    else if (a.type === "flow" && a.flow) agents.set(name, buildFlowAgent(name, a.flow, agents));
-    else agents.set(name, createAgent(name, new MegaSession(new ScriptedRuntime(), { cwd: process.cwd() }, [name])));
+    if (a.type === "user") {
+      agents.set(name, createHumanAgent(name, humanAsk));
+    } else if (a.type === "flow" && a.flow) {
+      agents.set(name, buildFlowAgent(name, a.flow, agents));
+    } else {
+      const runtime = options.runtimeFor?.(name) ?? options.runtime ?? new ScriptedRuntime();
+      const session = options.sessionFor?.(name, runtime) ?? new MegaSession(
+        runtime,
+        { cwd: options.cwd ?? process.cwd(), ...options.sessionOptions },
+        [...(options.parentPath ?? []), name],
+        { stream: options.stream },
+      );
+      agents.set(name, createAgent(name, session));
+    }
   }
   return buildFlowAgent(def.name, def.flow, agents);
 }

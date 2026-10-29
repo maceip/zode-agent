@@ -5,7 +5,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { MegaSession, RuntimeAdapter } from "./runtime.ts";
+import { LLM_RUNTIME_CAPABILITIES, type MegaSession, type RuntimeAdapter } from "./runtime.ts";
 
 export interface LiteRtLmOptions {
   model?: string;
@@ -60,6 +60,7 @@ export class LiteRtLmRuntimeAdapter implements RuntimeAdapter {
     "cwd", "model", "effort", "resume", "backend", "temperature", "maxTokens", "serverUrl", "autoServe",
   ] as const;
   readonly canSteer = false;
+  readonly capabilities = LLM_RUNTIME_CAPABILITIES;
 
   readonly model: string;
   readonly modelPath?: string;
@@ -152,11 +153,9 @@ export class LiteRtLmRuntimeAdapter implements RuntimeAdapter {
   async runTurn(session: MegaSession, prompt: string): Promise<string> {
     // If the server is alive, run via the OpenAI-compatible chat endpoint
     if (await this.#isServerAlive()) {
-      const history = session.messages();
-      const messages = [
-        ...history.map((m) => ({ role: m.role, content: m.content })),
-        { role: "user", content: prompt },
-      ];
+      // MegaSession logs the current user_message before runTurn, and
+      // messages() derives history from that shared log. Do not append prompt twice.
+      const messages = session.messages().map((m) => ({ role: m.role, content: m.content }));
 
       const res = await fetch(`${this.serverUrl}/v1/chat/completions`, {
         method: "POST",

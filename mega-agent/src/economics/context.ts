@@ -20,20 +20,42 @@ export class ContextStore {
     if (!v) throw new Error(`unknown context handle ${handle}`);
     return v;
   }
+  peek(handle: string): string | undefined { return this.#store.get(handle); }
+  restoreEntry(handle: string, text: string): void {
+    this.#store.set(handle, text);
+    const suffix = /^ccr:(\d+)$/.exec(handle)?.[1];
+    if (suffix) this.#n = Math.max(this.#n, Number(suffix));
+  }
   get size() { return this.#store.size; }
 }
 
-export interface ToolDef { name: string; description: string; schemaChars: number; }
+export interface ToolDef {
+  name: string;
+  description: string;
+  schemaChars: number;
+  schema?: Record<string, unknown>;
+  requiresApproval?: boolean;
+  idempotent?: boolean;
+}
 
 export class DeferredToolRegistry {
   #tools = new Map<string, ToolDef>();
   register(tool: ToolDef) { this.#tools.set(tool.name, tool); }
   get count() { return this.#tools.size; }
+  get(name: string): ToolDef | undefined { return this.#tools.get(name); }
+  list(): ToolDef[] { return [...this.#tools.values()]; }
   // Turn payload contains names only; full schemas load for searched tools only.
   indexForPrompt(): string { return [...this.#tools.keys()].join(", "); }
   search(query: string): ToolDef[] {
-    const q = query.toLowerCase();
-    return [...this.#tools.values()].filter((t) => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q));
+    const terms = query.toLowerCase().split(/[^a-z0-9_-]+/).filter(Boolean);
+    if (!terms.length) return [];
+    return [...this.#tools.values()].filter((t) => {
+      const haystack = `${t.name} ${t.description}`.toLowerCase();
+      return terms.some((term) => haystack.includes(term));
+    });
+  }
+  schemaForPrompt(tool: ToolDef): string {
+    return JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.schema ?? {}, requiresApproval: !!tool.requiresApproval });
   }
   charsIfAllEager(): number { return [...this.#tools.values()].reduce((a, t) => a + t.schemaChars, 0); }
 }

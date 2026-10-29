@@ -1,6 +1,7 @@
 // Layer 1 — Session kernel. Source: oar (record stream, agentPath, raw preserved)
 // + deepseek-harness rule: model-visible <=> logged, projections are pure folds.
-import { appendFileSync, readFileSync, existsSync } from "node:fs";
+import { appendFileSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 
 export type AgentPath = readonly string[];
 
@@ -8,7 +9,9 @@ export type RecordKind =
   | "session_opened" | "user_message" | "steer_spliced" | "text_delta"
   | "tool_call" | "tool_result" | "turn_ended" | "usage"
   | "approval_asked" | "approval_decided" // audit-only, never model-visible (dsh)
-  | "attention" | "crew_report" | "control_rejected" | "raw";
+  | "attention" | "crew_report" | "control_rejected" | "raw" | "native_event"
+  | "span" | "context_stored" | "plugin_applied" | "plugin_output"
+  | "task_started" | "task_waiting" | "task_completed" | "task_resumed" | "task_failed";
 
 export interface MegaRecord {
   seq: number;
@@ -32,6 +35,7 @@ export class RecordStream {
 
   constructor(file?: string) {
     this.#file = file;
+    if (file) mkdirSync(dirname(file), { recursive: true });
     if (file && existsSync(file)) {
       for (const line of readFileSync(file, "utf8").split("\n")) {
         if (line.trim()) this.records.push(JSON.parse(line) as MegaRecord);
@@ -64,7 +68,7 @@ export function deriveMessages(stream: RecordStream, agentPath: AgentPath = []):
   const flush = () => { if (buf) { msgs.push({ role: "assistant", content: buf }); buf = ""; } };
   for (const r of stream.records) {
     if (!r.modelVisible || JSON.stringify(r.agentPath) !== JSON.stringify(agentPath)) continue;
-    if (r.kind === "user_message" || r.kind === "steer_spliced" || r.kind === "crew_report") { flush(); msgs.push({ role: "user", content: r.text ?? "" }); }
+    if (r.kind === "user_message" || r.kind === "steer_spliced" || r.kind === "crew_report" || r.kind === "tool_result") { flush(); msgs.push({ role: "user", content: r.text ?? "" }); }
     else if (r.kind === "text_delta") buf += r.text ?? "";
     else if (r.kind === "turn_ended") flush();
   }

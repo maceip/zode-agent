@@ -43,6 +43,52 @@ export interface RuntimeResolutionOptions {
   timeoutMs?: number;
 }
 
+export interface ResolvedRuntimeFleet {
+  adapter: RuntimeAdapter;
+  source: "litert-lm" | "installed-agent" | "scripted";
+  additionalRuntimes: Map<string, RuntimeAdapter>;
+  inventory: RuntimeInventory;
+}
+
+/**
+ * Resolve the root adapter plus a crew registry. Detected runtimes that cannot
+ * currently instantiate an OAR adapter are omitted rather than advertised.
+ */
+export async function resolveRuntimeFleet(
+  options: RuntimeResolutionOptions = {},
+): Promise<ResolvedRuntimeFleet> {
+  const resolved = await resolveDefaultRuntime(options);
+  const inventory = await detectRuntimeInventory();
+  const additionalRuntimes = new Map<string, RuntimeAdapter>();
+
+  if (resolved.source === "scripted") {
+    return { ...resolved, additionalRuntimes, inventory };
+  }
+
+  const rootRuntimeId = resolved.adapter.id.startsWith("oar:")
+    ? resolved.adapter.id.slice("oar:".length)
+    : resolved.adapter.id;
+
+  for (const candidate of inventory.installedAgents) {
+    if (candidate.id === rootRuntimeId || additionalRuntimes.has(candidate.id)) continue;
+    try {
+      additionalRuntimes.set(candidate.id, await OarRuntimeAdapter.create(candidate.id, options.timeoutMs));
+    } catch {}
+  }
+
+  if (rootRuntimeId !== "litert-lm" && inventory.localLiteRt.installed && inventory.localLiteRt.models.length > 0) {
+    try {
+      additionalRuntimes.set("litert-lm", await LiteRtLmRuntimeAdapter.create({
+        model: options.model,
+        autoServe: false,
+        timeoutMs: options.timeoutMs,
+      }));
+    } catch {}
+  }
+
+  return { ...resolved, additionalRuntimes, inventory };
+}
+
 export async function resolveDefaultRuntime(
   options: RuntimeResolutionOptions = {}
 ): Promise<{ adapter: RuntimeAdapter; source: "litert-lm" | "installed-agent" | "scripted" }> {

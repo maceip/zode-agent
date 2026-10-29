@@ -60,11 +60,11 @@ export class ReturnTypeHook implements Hook {
 export class CacheHook implements Hook {
   #cache = new Map<string, unknown>();
   enter(span: Span): Effect {
-    const key = span.kind + ":" + JSON.stringify(span.input);
+    const key = `${span.kind}:${span.name}:` + JSON.stringify(span.input);
     return this.#cache.has(key) ? { kind: "supply", value: this.#cache.get(key) } : undefined;
   }
   complete(span: Span, output: unknown): Effect {
-    this.#cache.set(span.kind + ":" + JSON.stringify(span.input), output);
+    this.#cache.set(`${span.kind}:${span.name}:` + JSON.stringify(span.input), output);
     return undefined;
   }
 }

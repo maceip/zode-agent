@@ -10,3 +10,4 @@ export * from "./substrate/isolate.ts";
 export * from "./economics/context.ts";
 export * from "./surface/workspace.ts";
 export * from "./surface/attention.ts";
+export * from "./app/mega-agent.ts";

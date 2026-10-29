@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { RecordStream } from "../kernel/record-stream.ts";
 
-export interface ApprovalRequest { id: string; tool: string; summary: string; agentPath: readonly string[]; createdAt: number; }
+export interface ApprovalRequest { id: string; tool: string; summary: string; agentPath: readonly string[]; createdAt: number; data?: unknown; }
 export type ApprovalAnswer = { decision: "allow" | "deny"; by: string } | undefined; // undefined = pass to next answerer
 export type Answerer = (req: ApprovalRequest) => Promise<ApprovalAnswer> | ApprovalAnswer;
 
@@ -34,7 +34,7 @@ export class ApprovalGate {
   // Fail-closed: no answerer answering => request parks (durable), caller may resume later.
   async request(req: Omit<ApprovalRequest, "id" | "createdAt">): Promise<{ decision: "allow" | "deny"; by: string; id: string }> {
     const full: ApprovalRequest = { ...req, id: `a${++this.#n}-${Date.now()}`, createdAt: Date.now() };
-    this.stream.append("approval_asked", full.agentPath, { tool: full.tool, data: { id: full.id, summary: full.summary } });
+    this.stream.append("approval_asked", full.agentPath, { tool: full.tool, data: { id: full.id, summary: full.summary, request: full.data } });
     this.stream.append("attention", full.agentPath, { text: `approval needed: ${full.tool}`, data: { approvalId: full.id }, modelVisible: false });
     for (const a of this.answerers) {
       const ans = await a(full);
